@@ -867,12 +867,16 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			leftOverGas uint64
 			vmerr       error
 		)
-		if st.hasNoCode(target) {
+		callValue := new(uint256.Int)
+		if frame.Mode == types.FrameModeSender && frame.Value != nil {
+			callValue.Set(frame.Value)
+		}
+		if st.hasNoCode(target) && !(frame.Mode == types.FrameModeSender && target != msg.From) {
 			ret, leftOverGas, vmerr = vm.ExecuteDefaultCode(st.evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
 		} else if frame.Mode == types.FrameModeVerify {
 			ret, leftOverGas, vmerr = st.evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
 		} else {
-			ret, leftOverGas, vmerr = st.evm.Call(caller, target, frame.Data, frame.GasLimit, new(uint256.Int))
+			ret, leftOverGas, vmerr = st.evm.Call(caller, target, frame.Data, frame.GasLimit, callValue)
 		}
 		_ = ret
 

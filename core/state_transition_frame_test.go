@@ -48,6 +48,9 @@ var (
 
 	// Simple REVERT: PUSH1 0x00, PUSH1 0x00, REVERT(0xfd)
 	revertCode = []byte{0x60, 0x00, 0x60, 0x00, 0xfd}
+
+	// Store CALLVALUE at storage slot 0, then RETURN.
+	callValueStoreCode = []byte{0x34, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xf3}
 )
 
 // newFrameTestEnv creates a test EVM and state for frame transaction tests.
@@ -136,6 +139,143 @@ func TestFrameTxSimple(t *testing.T) {
 	// Verify nonce was incremented (payer approval increments nonce).
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+}
+
+func TestFrameTxSenderValueTransferAndCallValue(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+	value := uint256.NewInt(7)
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(target)
+	statedb.SetCode(target, callValueStoreCode, tracing.CodeChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: value, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got := statedb.GetBalance(target); got.Cmp(value) != 0 {
+		t.Fatalf("target balance: got %v, want %v", got, value)
+	}
+	wantCallValue := common.Hash{}
+	wantCallValue[31] = byte(value.Uint64())
+	if got := statedb.GetState(target, common.Hash{}); got != wantCallValue {
+		t.Fatalf("CALLVALUE storage: got %v, want %v", got, wantCallValue)
+	}
+}
+
+func TestFrameTxSenderValueTransferToEOATarget(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+	value := uint256.NewInt(7)
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: value, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if len(result.frameResults) != 2 || result.frameResults[1] == 0 {
+		t.Fatalf("frame results: got %v, want successful EOA target SENDER frame", result.frameResults)
+	}
+	if got := statedb.GetBalance(target); got.Cmp(value) != 0 {
+		t.Fatalf("target balance: got %v, want %v", got, value)
+	}
+}
+
+func TestFrameTxSenderValueInsufficientBalanceRevertsFrame(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+
+	statedb.CreateAccount(target)
+	statedb.SetCode(target, callValueStoreCode, tracing.CodeChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: uint256.NewInt(1), Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	maxCost := new(big.Int).SetUint64(msg.GasLimit)
+	maxCost.Mul(maxCost, msg.GasFeeCap)
+	maxCostU256, overflow := uint256.FromBig(maxCost)
+	if overflow {
+		t.Fatal("max cost overflow")
+	}
+	statedb.SetBalance(sender, maxCostU256, tracing.BalanceChangeUnspecified)
+
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if len(result.frameResults) != 2 || result.frameResults[0] == 0 || result.frameResults[1] != 0 {
+		t.Fatalf("frame results: got %v, want approve then reverted SENDER frame", result.frameResults)
+	}
+	if got := statedb.GetBalance(target); !got.IsZero() {
+		t.Fatalf("target balance: got %v, want zero", got)
+	}
+	if got := statedb.GetState(target, common.Hash{}); got != (common.Hash{}) {
+		t.Fatalf("target storage changed despite reverted frame: %v", got)
 	}
 }
 
