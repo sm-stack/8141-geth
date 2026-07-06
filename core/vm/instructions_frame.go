@@ -34,20 +34,20 @@ const (
 
 // FrameContext holds the context for executing a frame transaction (EIP-8141).
 // It is set on the EVM when processing a frame transaction and provides data
-// needed by the TXPARAM* opcodes. All fields are populated from the flattened
-// Message during executeFrames().
+// needed by the frame transaction introspection opcodes. All fields are
+// populated from the flattened Message during executeFrames().
 type FrameContext struct {
-	Sender       common.Address  // tx.sender
-	Nonce        uint64          // tx.nonce
-	Frames       []types.Frame   // tx.frames
-	GasTipCap    *uint256.Int    // max_priority_fee_per_gas
-	GasFeeCap    *uint256.Int    // max_fee_per_gas
-	BlobFeeCap   *uint256.Int    // max_fee_per_blob_gas
-	BlobHashes   []common.Hash   // blob_versioned_hashes
-	GasLimit     uint64          // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
-	SigHash      common.Hash     // Cached compute_sig_hash(tx).
-	FrameIndex   int             // Currently executing frame index.
-	FrameResults []uint8         // Status of each completed frame (0=fail, 1=success, 2-4=approve).
+	Sender       common.Address // tx.sender
+	Nonce        uint64         // tx.nonce
+	Frames       []types.Frame  // tx.frames
+	GasTipCap    *uint256.Int   // max_priority_fee_per_gas
+	GasFeeCap    *uint256.Int   // max_fee_per_gas
+	BlobFeeCap   *uint256.Int   // max_fee_per_blob_gas
+	BlobHashes   []common.Hash  // blob_versioned_hashes
+	GasLimit     uint64         // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
+	SigHash      common.Hash    // Cached compute_sig_hash(tx).
+	FrameIndex   int            // Currently executing frame index.
+	FrameResults []uint8        // Status of each completed frame (0=fail, 1=success, 2-4=approve).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -102,258 +102,284 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 
 // TXPARAM parameter selectors.
 const (
-	txParamTxType       = 0x00
-	txParamNonce        = 0x01
-	txParamSender       = 0x02
-	txParamGasTipCap    = 0x03
-	txParamGasFeeCap    = 0x04
-	txParamBlobFeeCap   = 0x05
-	txParamMaxCost      = 0x06
-	txParamBlobHashLen  = 0x07
-	txParamSigHash      = 0x08
-	txParamFrameCount   = 0x09
-	txParamFrameIdx     = 0x10
-	txParamFrameTarget  = 0x11
-	txParamFrameData    = 0x12
-	txParamFrameGas     = 0x13
-	txParamFrameMode    = 0x14
-	txParamFrameStatus  = 0x15
+	txParamTxType         = 0x00
+	txParamNonce          = 0x01
+	txParamSender         = 0x02
+	txParamGasTipCap      = 0x03
+	txParamGasFeeCap      = 0x04
+	txParamBlobFeeCap     = 0x05
+	txParamMaxCost        = 0x06
+	txParamBlobHashLen    = 0x07
+	txParamSigHash        = 0x08
+	txParamFrameCount     = 0x09
+	txParamFrameIndex     = 0x0a
+	txParamSignatureCount = 0x0b
 )
 
-// bytes32 converts a uint256 to a []byte slice via its Bytes32() method.
-func bytes32(v *uint256.Int) []byte {
-	b := v.Bytes32()
-	return b[:]
+// FRAMEPARAM parameter selectors.
+const (
+	frameParamTarget       = 0x00
+	frameParamGasLimit     = 0x01
+	frameParamMode         = 0x02
+	frameParamFlags        = 0x03
+	frameParamDataLen      = 0x04
+	frameParamStatus       = 0x05
+	frameParamAllowedScope = 0x06
+	frameParamAtomicBatch  = 0x07
+	frameParamValue        = 0x08
+)
+
+// SIGPARAM parameter selectors.
+const (
+	sigParamSigner       = 0x00
+	sigParamScheme       = 0x01
+	sigParamMsg          = 0x02
+	sigParamSignatureLen = 0x03
+)
+
+func invalidFrameOpcode(op OpCode) error {
+	return &ErrInvalidOpCode{opcode: op}
 }
 
-// getTxParam returns the byte slice for the given tx parameter.
-// For fixed 32-byte params, it returns a 32-byte big-endian value.
-// For dynamic params (frame data), it returns the raw bytes.
-func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
-	fc := evm.FrameCtx
-	if fc == nil {
-		return nil, ErrWriteProtection // Not in a frame tx context.
+func frameSelector(v *uint256.Int, op OpCode) (uint64, error) {
+	selector, overflow := v.Uint64WithOverflow()
+	if overflow {
+		return 0, invalidFrameOpcode(op)
+	}
+	return selector, nil
+}
+
+func requireFrameContext(evm *EVM, op OpCode) (*FrameContext, error) {
+	if evm.FrameCtx == nil {
+		return nil, invalidFrameOpcode(op)
+	}
+	return evm.FrameCtx, nil
+}
+
+func requireFrame(fc *FrameContext, frameIndex *uint256.Int, op OpCode) (*types.Frame, error) {
+	idx, err := frameSelector(frameIndex, op)
+	if err != nil {
+		return nil, err
+	}
+	if idx >= uint64(len(fc.Frames)) {
+		return nil, invalidFrameOpcode(op)
+	}
+	return &fc.Frames[int(idx)], nil
+}
+
+func setAddressWord(dst *uint256.Int, addr common.Address) {
+	var buf [32]byte
+	copy(buf[12:], addr[:])
+	dst.SetBytes32(buf[:])
+}
+
+func setUint256(dst, src *uint256.Int) {
+	if src == nil {
+		dst.Clear()
+		return
+	}
+	dst.Set(src)
+}
+
+func setMaxCost(dst *uint256.Int, fc *FrameContext) {
+	dst.Clear()
+	if fc.GasFeeCap == nil {
+		return
+	}
+	gasLimit := new(uint256.Int).SetUint64(fc.GasLimit)
+	dst.Mul(gasLimit, fc.GasFeeCap)
+	if len(fc.BlobHashes) == 0 || fc.BlobFeeCap == nil {
+		return
+	}
+	blobGas := new(uint256.Int).SetUint64(params.BlobTxBlobGasPerBlob * uint64(len(fc.BlobHashes)))
+	blobCost := new(uint256.Int).Mul(blobGas, fc.BlobFeeCap)
+	dst.Add(dst, blobCost)
+}
+
+func frameTarget(fc *FrameContext, frame *types.Frame) common.Address {
+	if frame.Target != nil {
+		return *frame.Target
+	}
+	return fc.Sender
+}
+
+// opTxParam implements TXPARAM (0xb0).
+// Stack: [param] -> [value]
+func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	fc, err := requireFrameContext(evm, TXPARAM)
+	if err != nil {
+		return nil, err
+	}
+	param := scope.Stack.peek()
+	selector, err := frameSelector(param, TXPARAM)
+	if err != nil {
+		return nil, err
 	}
 
-	// Per EIP-8141, in2 must be 0 for non-frame-indexed parameters (0x00-0x10).
-	// Frame-indexed parameters (0x11-0x15) use in2 as the frame index.
-	isFrameIndexed := in1 >= txParamFrameTarget && in1 <= txParamFrameStatus
-	if !isFrameIndexed && in2 != 0 {
-		return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-	}
-
-	switch in1 {
+	switch selector {
 	case txParamTxType:
-		v := new(uint256.Int).SetUint64(uint64(types.FrameTxType))
-		return bytes32(v), nil
-
+		param.SetUint64(uint64(types.FrameTxType))
 	case txParamNonce:
-		v := new(uint256.Int).SetUint64(fc.Nonce)
-		return bytes32(v), nil
-
+		param.SetUint64(fc.Nonce)
 	case txParamSender:
-		var buf [32]byte
-		copy(buf[12:], fc.Sender[:])
-		return buf[:], nil
-
+		setAddressWord(param, fc.Sender)
 	case txParamGasTipCap:
-		v := new(uint256.Int)
-		if fc.GasTipCap != nil {
-			v.Set(fc.GasTipCap)
-		}
-		return bytes32(v), nil
-
+		setUint256(param, fc.GasTipCap)
 	case txParamGasFeeCap:
-		v := new(uint256.Int)
-		if fc.GasFeeCap != nil {
-			v.Set(fc.GasFeeCap)
-		}
-		return bytes32(v), nil
-
+		setUint256(param, fc.GasFeeCap)
 	case txParamBlobFeeCap:
-		v := new(uint256.Int)
-		if fc.BlobFeeCap != nil {
-			v.Set(fc.BlobFeeCap)
-		}
-		return bytes32(v), nil
-
+		setUint256(param, fc.BlobFeeCap)
 	case txParamMaxCost:
-		// max cost = tx_gas_limit * max_fee_per_gas + blob_fees
-		gasLimit := new(uint256.Int).SetUint64(fc.GasLimit)
-		maxCost := new(uint256.Int).Mul(gasLimit, fc.GasFeeCap)
-		// Add blob cost: len(blob_hashes) * GAS_PER_BLOB * blob_fee_cap
-		if len(fc.BlobHashes) > 0 && fc.BlobFeeCap != nil {
-			blobGas := new(uint256.Int).SetUint64(params.BlobTxBlobGasPerBlob * uint64(len(fc.BlobHashes)))
-			blobCost := new(uint256.Int).Mul(blobGas, fc.BlobFeeCap)
-			maxCost.Add(maxCost, blobCost)
-		}
-		return bytes32(maxCost), nil
-
+		setMaxCost(param, fc)
 	case txParamBlobHashLen:
-		v := new(uint256.Int).SetUint64(uint64(len(fc.BlobHashes)))
-		return bytes32(v), nil
-
+		param.SetUint64(uint64(len(fc.BlobHashes)))
 	case txParamSigHash:
-		return fc.SigHash[:], nil
-
+		param.SetBytes32(fc.SigHash[:])
 	case txParamFrameCount:
-		v := new(uint256.Int).SetUint64(uint64(len(fc.Frames)))
-		return bytes32(v), nil
-
-	case txParamFrameIdx:
-		v := new(uint256.Int).SetUint64(uint64(fc.FrameIndex))
-		return bytes32(v), nil
-
-	case txParamFrameTarget:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		var buf [32]byte
-		f := &fc.Frames[idx]
-		if f.Target != nil {
-			copy(buf[12:], f.Target[:])
-		} else {
-			copy(buf[12:], fc.Sender[:])
-		}
-		return buf[:], nil
-
-	case txParamFrameData:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		f := &fc.Frames[idx]
-		// VERIFY frames return empty data.
-		if f.Mode == types.FrameModeVerify {
-			return nil, nil
-		}
-		return f.Data, nil
-
-	case txParamFrameGas:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(fc.Frames[int(in2)].GasLimit)
-		return bytes32(v), nil
-
-	case txParamFrameMode:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(uint64(fc.Frames[int(in2)].Mode))
-		return bytes32(v), nil
-
-	case txParamFrameStatus:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		// Cannot query current or future frame status.
-		if idx >= fc.FrameIndex {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(uint64(fc.FrameResults[idx]))
-		return bytes32(v), nil
-
+		param.SetUint64(uint64(len(fc.Frames)))
+	case txParamFrameIndex:
+		param.SetUint64(uint64(fc.FrameIndex))
+	case txParamSignatureCount:
+		param.Clear()
 	default:
-		return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
+		return nil, invalidFrameOpcode(TXPARAM)
 	}
-}
-
-// opTxParamLoad implements TXPARAMLOAD (0xb0).
-// Stack: [in1, in2, offset] → [value]
-func opTxParamLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.pop()
-	offset := scope.Stack.peek()
-
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
-	if err != nil {
-		return nil, err
-	}
-
-	off := int(offset.Uint64())
-	var word [32]byte
-	if off < len(data) {
-		end := off + 32
-		if end > len(data) {
-			end = len(data)
-		}
-		copy(word[:], data[off:end])
-	}
-	offset.SetBytes32(word[:])
 	return nil, nil
 }
 
-// opTxParamSize implements TXPARAMSIZE (0xb1).
-// Stack: [in1, in2] → [size]
-func opTxParamSize(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.peek()
-
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
+// opFrameDataLoad implements FRAMEDATALOAD (0xb1).
+// Stack: [offset, frameIndex] -> [value]
+func opFrameDataLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	fc, err := requireFrameContext(evm, FRAMEDATALOAD)
 	if err != nil {
 		return nil, err
 	}
-
-	in2.SetUint64(uint64(len(data)))
+	offset := scope.Stack.pop()
+	frameIndex := scope.Stack.peek()
+	frame, err := requireFrame(fc, frameIndex, FRAMEDATALOAD)
+	if err != nil {
+		return nil, err
+	}
+	if off, overflow := offset.Uint64WithOverflow(); !overflow {
+		frameIndex.SetBytes(getData(frame.Data, off, 32))
+	} else {
+		frameIndex.Clear()
+	}
 	return nil, nil
 }
 
-// opTxParamCopy implements TXPARAMCOPY (0xb2).
-// Stack: [in1, in2, destOffset, offset, size]
-func opTxParamCopy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.pop()
+// opFrameDataCopy implements FRAMEDATACOPY (0xb2).
+// Stack: [memOffset, dataOffset, length, frameIndex]
+func opFrameDataCopy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	fc, err := requireFrameContext(evm, FRAMEDATACOPY)
+	if err != nil {
+		return nil, err
+	}
 	memOffset := scope.Stack.pop()
 	dataOffset := scope.Stack.pop()
 	length := scope.Stack.pop()
-
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
+	frameIndex := scope.Stack.pop()
+	frame, err := requireFrame(fc, &frameIndex, FRAMEDATACOPY)
 	if err != nil {
 		return nil, err
 	}
 
-	dataOff64 := dataOffset.Uint64()
-	len64 := length.Uint64()
-
-	// Build the padded copy. Guard against dataOff64+len64 overflowing uint64.
-	var end uint64
-	if dataOff64 > ^uint64(0)-len64 {
-		end = uint64(len(data))
-	} else {
-		end = dataOff64 + len64
-		if end > uint64(len(data)) {
-			end = uint64(len(data))
-		}
+	dataOffset64, overflow := dataOffset.Uint64WithOverflow()
+	if overflow {
+		dataOffset64 = ^uint64(0)
 	}
-	var padded []byte
-	if dataOff64 < uint64(len(data)) {
-		padded = common.RightPadBytes(data[dataOff64:end], int(len64))
-	} else {
-		padded = make([]byte, len64)
-	}
-
-	scope.Memory.Set(memOffset.Uint64(), len64, padded)
+	length64 := length.Uint64()
+	scope.Memory.Set(memOffset.Uint64(), length64, getData(frame.Data, dataOffset64, length64))
 	return nil, nil
 }
 
-// memoryTxParamCopy returns the memory size required for TXPARAMCOPY.
-// Stack layout: [in1, in2, destOffset, offset, size]
-// destOffset is at Back(2), size at Back(4).
-func memoryTxParamCopy(stack *Stack) (uint64, bool) {
-	return calcMemSize64(stack.Back(2), stack.Back(4))
+// opFrameParam implements FRAMEPARAM (0xb3).
+// Stack: [frameIndex, param] -> [value]
+func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	fc, err := requireFrameContext(evm, FRAMEPARAM)
+	if err != nil {
+		return nil, err
+	}
+	frameIndex := scope.Stack.pop()
+	param := scope.Stack.peek()
+	selector, err := frameSelector(param, FRAMEPARAM)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := requireFrame(fc, &frameIndex, FRAMEPARAM)
+	if err != nil {
+		return nil, err
+	}
+
+	switch selector {
+	case frameParamTarget:
+		setAddressWord(param, frameTarget(fc, frame))
+	case frameParamGasLimit:
+		param.SetUint64(frame.GasLimit)
+	case frameParamMode:
+		param.SetUint64(uint64(frame.Mode))
+	case frameParamFlags:
+		param.Clear()
+	case frameParamDataLen:
+		param.SetUint64(uint64(len(frame.Data)))
+	case frameParamStatus:
+		idx := int(frameIndex.Uint64())
+		if idx >= fc.FrameIndex {
+			return nil, invalidFrameOpcode(FRAMEPARAM)
+		}
+		param.Clear()
+		if idx < len(fc.FrameResults) && fc.FrameResults[idx] != 0 {
+			param.SetUint64(1)
+		}
+	case frameParamAllowedScope:
+		param.Clear()
+	case frameParamAtomicBatch:
+		param.Clear()
+	case frameParamValue:
+		param.Clear()
+	default:
+		return nil, invalidFrameOpcode(FRAMEPARAM)
+	}
+	return nil, nil
 }
 
-// gasTxParamCopy calculates dynamic gas for TXPARAMCOPY.
-// Stack layout: [in1, in2, destOffset, offset, size] — size is Back(4).
-func gasTxParamCopy(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
+// opSigParam implements SIGPARAM (0xb4).
+// Stack: [signatureIndex, param] -> [value]
+func opSigParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	if _, err := requireFrameContext(evm, SIGPARAM); err != nil {
+		return nil, err
+	}
+	signatureIndex := scope.Stack.pop()
+	param := scope.Stack.peek()
+	if _, err := frameSelector(&signatureIndex, SIGPARAM); err != nil {
+		return nil, err
+	}
+	selector, err := frameSelector(param, SIGPARAM)
+	if err != nil {
+		return nil, err
+	}
+	switch selector {
+	case sigParamSigner, sigParamScheme, sigParamMsg, sigParamSignatureLen:
+		return nil, invalidFrameOpcode(SIGPARAM)
+	default:
+		return nil, invalidFrameOpcode(SIGPARAM)
+	}
+}
+
+// memoryFrameDataCopy returns the memory size required for FRAMEDATACOPY.
+// Stack layout: [memOffset, dataOffset, length, frameIndex].
+func memoryFrameDataCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(2))
+}
+
+// gasFrameDataCopy calculates dynamic gas for FRAMEDATACOPY.
+// Stack layout: [memOffset, dataOffset, length, frameIndex].
+func gasFrameDataCopy(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
 	gas, err := memoryGasCost(mem, memorySize)
 	if err != nil {
 		return 0, err
 	}
-	words, overflow := stack.Back(4).Uint64WithOverflow()
+	words, overflow := stack.Back(2).Uint64WithOverflow()
 	if overflow {
 		return 0, ErrGasUintOverflow
 	}

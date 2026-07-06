@@ -217,11 +217,13 @@ const (
 	APPROVE OpCode = 0xaa
 )
 
-// 0xb0 range - EIP-8141 transaction parameter operations.
+// 0xb0 range - EIP-8141 frame transaction introspection operations.
 const (
-	TXPARAMLOAD OpCode = 0xb0
-	TXPARAMSIZE OpCode = 0xb1
-	TXPARAMCOPY OpCode = 0xb2
+	TXPARAM       OpCode = 0xb0
+	FRAMEDATALOAD OpCode = 0xb1
+	FRAMEDATACOPY OpCode = 0xb2
+	FRAMEPARAM    OpCode = 0xb3
+	SIGPARAM      OpCode = 0xb4
 )
 
 // 0xd0 range - eof operations.
@@ -431,10 +433,12 @@ var opCodeToString = [256]string{
 	// 0xaa range - EIP-8141 approval operation.
 	APPROVE: "APPROVE",
 
-	// 0xb0 range - EIP-8141 transaction parameter operations.
-	TXPARAMLOAD: "TXPARAMLOAD",
-	TXPARAMSIZE: "TXPARAMSIZE",
-	TXPARAMCOPY: "TXPARAMCOPY",
+	// 0xb0 range - EIP-8141 frame transaction introspection operations.
+	TXPARAM:       "TXPARAM",
+	FRAMEDATALOAD: "FRAMEDATALOAD",
+	FRAMEDATACOPY: "FRAMEDATACOPY",
+	FRAMEPARAM:    "FRAMEPARAM",
+	SIGPARAM:      "SIGPARAM",
 
 	// 0xd range - eof ops.
 	DATALOAD:  "DATALOAD",
@@ -625,9 +629,11 @@ var stringToOp = map[string]OpCode{
 	"LOG3":            LOG3,
 	"LOG4":            LOG4,
 	"APPROVE":         APPROVE,
-	"TXPARAMLOAD":     TXPARAMLOAD,
-	"TXPARAMSIZE":     TXPARAMSIZE,
-	"TXPARAMCOPY":     TXPARAMCOPY,
+	"TXPARAM":         TXPARAM,
+	"FRAMEDATALOAD":   FRAMEDATALOAD,
+	"FRAMEDATACOPY":   FRAMEDATACOPY,
+	"FRAMEPARAM":      FRAMEPARAM,
+	"SIGPARAM":        SIGPARAM,
 	"DATALOAD":        DATALOAD,
 	"DATALOADN":       DATALOADN,
 	"DATASIZE":        DATASIZE,

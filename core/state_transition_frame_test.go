@@ -633,9 +633,9 @@ func TestFrameTxDeploymentFlow(t *testing.T) {
 	}
 }
 
-// TestFrameTxTxParamLoad tests that the TXPARAMLOAD opcode returns correct values.
+// TestFrameTxTxParam tests that the TXPARAM opcode returns correct values.
 // Verifies nonce, frame_count, and sender parameters.
-func TestFrameTxTxParamLoad(t *testing.T) {
+func TestFrameTxTxParam(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	sender := common.HexToAddress("0x1111")
@@ -645,18 +645,18 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	// Target code: TXPARAMLOAD(nonce) → SSTORE(0),
-	//              TXPARAMLOAD(frame_count) → SSTORE(1),
-	//              TXPARAMLOAD(sender) → SSTORE(2), RETURN
+	// Target code: TXPARAM(nonce) -> SSTORE(0),
+	//              TXPARAM(frame_count) -> SSTORE(1),
+	//              TXPARAM(sender) -> SSTORE(2), RETURN
 	txparamCode := []byte{
-		// TXPARAMLOAD(in1=0x01=nonce, in2=0, offset=0) → SSTORE(slot=0)
-		0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0xb0,
+		// TXPARAM(0x01=nonce) -> SSTORE(slot=0)
+		0x60, 0x01, 0xb0,
 		0x60, 0x00, 0x55,
-		// TXPARAMLOAD(in1=0x09=frame_count, in2=0, offset=0) → SSTORE(slot=1)
-		0x60, 0x00, 0x60, 0x00, 0x60, 0x09, 0xb0,
+		// TXPARAM(0x09=frame_count) -> SSTORE(slot=1)
+		0x60, 0x09, 0xb0,
 		0x60, 0x01, 0x55,
-		// TXPARAMLOAD(in1=0x02=sender, in2=0, offset=0) → SSTORE(slot=2)
-		0x60, 0x00, 0x60, 0x00, 0x60, 0x02, 0xb0,
+		// TXPARAM(0x02=sender) -> SSTORE(slot=2)
+		0x60, 0x02, 0xb0,
 		0x60, 0x02, 0x55,
 		// RETURN
 		0x60, 0x00, 0x60, 0x00, 0xf3,
@@ -694,7 +694,7 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	nonceHash[31] = byte(nonce)
 	got := statedb.GetState(target, common.Hash{})
 	if got != nonceHash {
-		t.Fatalf("TXPARAMLOAD nonce: got %v, want %v", got, nonceHash)
+		t.Fatalf("TXPARAM nonce: got %v, want %v", got, nonceHash)
 	}
 
 	// Verify frame_count at slot 1.
@@ -702,7 +702,7 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	frameCountHash[31] = 2
 	got = statedb.GetState(target, common.BytesToHash([]byte{0x01}))
 	if got != frameCountHash {
-		t.Fatalf("TXPARAMLOAD frame_count: got %v, want %v", got, frameCountHash)
+		t.Fatalf("TXPARAM frame_count: got %v, want %v", got, frameCountHash)
 	}
 
 	// Verify sender at slot 2. Sender is left-padded in 32-byte word.
@@ -710,7 +710,116 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	copy(senderHash[12:], sender[:])
 	got = statedb.GetState(target, common.BytesToHash([]byte{0x02}))
 	if got != senderHash {
-		t.Fatalf("TXPARAMLOAD sender: got %v, want %v", got, senderHash)
+		t.Fatalf("TXPARAM sender: got %v, want %v", got, senderHash)
+	}
+}
+
+// TestFrameTxFrameIntrospectionOpcodes verifies frame-level EIP-8141 introspection opcodes.
+func TestFrameTxFrameIntrospectionOpcodes(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+	frameData := []byte{0xde, 0xad, 0xbe, 0xef}
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	introspectionCode := []byte{
+		// FRAMEPARAM(0x00=target, frame=0) -> SSTORE(slot=0)
+		0x60, 0x00, 0x60, 0x00, 0xb3,
+		0x60, 0x00, 0x55,
+		// FRAMEPARAM(0x01=gas_limit, frame=0) -> SSTORE(slot=1)
+		0x60, 0x01, 0x60, 0x00, 0xb3,
+		0x60, 0x01, 0x55,
+		// FRAMEPARAM(0x04=len(data), frame=0) -> SSTORE(slot=2)
+		0x60, 0x04, 0x60, 0x00, 0xb3,
+		0x60, 0x02, 0x55,
+		// FRAMEPARAM(0x05=status, frame=0) -> SSTORE(slot=3)
+		0x60, 0x05, 0x60, 0x00, 0xb3,
+		0x60, 0x03, 0x55,
+		// FRAMEDATALOAD(offset=0, frame=0) -> SSTORE(slot=4)
+		0x60, 0x00, 0x60, 0x00, 0xb1,
+		0x60, 0x04, 0x55,
+		// FRAMEDATACOPY(mem=0, data=1, len=2, frame=0); MLOAD(0) -> SSTORE(slot=5)
+		0x60, 0x00, 0x60, 0x02, 0x60, 0x01, 0x60, 0x00, 0xb2,
+		0x60, 0x00, 0x51,
+		0x60, 0x05, 0x55,
+		// TXPARAM(0x0b=signature_count) -> SSTORE(slot=6)
+		0x60, 0x0b, 0xb0,
+		0x60, 0x06, 0x55,
+		// RETURN
+		0x60, 0x00, 0x60, 0x00, 0xf3,
+	}
+	statedb.CreateAccount(target)
+	statedb.SetCode(target, introspectionCode, tracing.CodeChangeUnspecified)
+
+	frameGas := uint64(50000)
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: frameGas, Data: frameData},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 300000, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("frame tx failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution failed: %v", result.Err)
+	}
+	if len(result.frameResults) != 2 || result.frameResults[1] == 0 {
+		t.Fatalf("frame results: got %v, want second frame success", result.frameResults)
+	}
+
+	var senderHash common.Hash
+	copy(senderHash[12:], sender[:])
+	if got := statedb.GetState(target, common.Hash{}); got != senderHash {
+		t.Fatalf("FRAMEPARAM target: got %v, want %v", got, senderHash)
+	}
+
+	gasHash := common.Hash{}
+	gasHash[30] = byte(frameGas >> 8)
+	gasHash[31] = byte(frameGas)
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x01})); got != gasHash {
+		t.Fatalf("FRAMEPARAM gas_limit: got %v, want %v", got, gasHash)
+	}
+
+	dataLenHash := common.Hash{}
+	dataLenHash[31] = byte(len(frameData))
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x02})); got != dataLenHash {
+		t.Fatalf("FRAMEPARAM data length: got %v, want %v", got, dataLenHash)
+	}
+
+	statusHash := common.Hash{}
+	statusHash[31] = 1
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x03})); got != statusHash {
+		t.Fatalf("FRAMEPARAM status: got %v, want %v", got, statusHash)
+	}
+
+	var loadHash common.Hash
+	copy(loadHash[:], common.RightPadBytes(frameData, 32))
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x04})); got != loadHash {
+		t.Fatalf("FRAMEDATALOAD: got %v, want %v", got, loadHash)
+	}
+
+	var copyHash common.Hash
+	copy(copyHash[:], []byte{0xad, 0xbe})
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x05})); got != copyHash {
+		t.Fatalf("FRAMEDATACOPY: got %v, want %v", got, copyHash)
+	}
+
+	if got := statedb.GetState(target, common.BytesToHash([]byte{0x06})); got != (common.Hash{}) {
+		t.Fatalf("TXPARAM signature count: got %v, want zero", got)
 	}
 }
 

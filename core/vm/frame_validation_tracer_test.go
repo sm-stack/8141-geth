@@ -195,7 +195,7 @@ func TestFrameValidationBannedOpcodes(t *testing.T) {
 // TestFrameValidationAllowedOpcodes verifies allowed opcodes pass.
 func TestFrameValidationAllowedOpcodes(t *testing.T) {
 	allowed := []OpCode{
-		APPROVE, TXPARAMLOAD, TXPARAMSIZE, TXPARAMCOPY,
+		APPROVE, TXPARAM, FRAMEDATALOAD, FRAMEDATACOPY, FRAMEPARAM, SIGPARAM,
 		STATICCALL, SLOAD, KECCAK256, PUSH1, POP, ADD, MLOAD, MSTORE,
 		RETURN, REVERT, STOP, JUMP, JUMPI, JUMPDEST, CALLDATALOAD,
 	}
