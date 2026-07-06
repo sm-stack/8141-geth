@@ -139,10 +139,11 @@ func (r *Receipt) UnmarshalJSON(input []byte) error {
 		r.FrameReceipts = make([]FrameReceipt, len(dec.FrameReceipts))
 		for i, fr := range dec.FrameReceipts {
 			if fr.Status != nil {
-				if *fr.Status > 4 {
+				status := uint64(*fr.Status)
+				if !validFrameReceiptStatus(status) {
 					return errors.New("invalid field 'frameReceipts.status' for Receipt")
 				}
-				r.FrameReceipts[i].Status = uint8(*fr.Status)
+				r.FrameReceipts[i].Status = uint8(status)
 			}
 			if fr.GasUsed != nil {
 				r.FrameReceipts[i].GasUsed = uint64(*fr.GasUsed)

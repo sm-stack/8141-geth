@@ -48,7 +48,7 @@ type FrameContext struct {
 	GasLimit     uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
 	SigHash      common.Hash   // Cached compute_sig_hash(tx).
 	FrameIndex   int           // Currently executing frame index.
-	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, VERIFY uses approve scope).
+	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, 3=skipped).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -334,7 +334,7 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 			return nil, invalidFrameOpcode(FRAMEPARAM)
 		}
 		param.Clear()
-		if idx < len(fc.FrameResults) && fc.FrameResults[idx] != 0 {
+		if idx < len(fc.FrameResults) && fc.FrameResults[idx] == types.FrameReceiptStatusSuccessful {
 			param.SetUint64(1)
 		}
 	case frameParamAllowedScope:

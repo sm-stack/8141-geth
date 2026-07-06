@@ -51,6 +51,28 @@ type frameLogRange struct {
 	end   int
 }
 
+type frameApprovalState struct {
+	senderApproved bool
+	payerApproved  bool
+	payer          common.Address
+}
+
+func emptyFrameLogRange() frameLogRange {
+	return frameLogRange{start: 1, end: 0}
+}
+
+func atomicBatchBounds(frames []types.Frame, index int) (int, int, bool) {
+	start := index
+	for start > 0 && frames[start-1].Flags&types.FrameFlagAtomicBatch != 0 {
+		start--
+	}
+	end := index
+	for end+1 < len(frames) && frames[end].Flags&types.FrameFlagAtomicBatch != 0 {
+		end++
+	}
+	return start, end, end > start
+}
+
 // Unwrap returns the internal evm error which allows us for further
 // analysis outside.
 func (result *ExecutionResult) Unwrap() error {
@@ -820,16 +842,33 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		frameGasUsed   = make([]uint64, len(msg.Frames))
 		frameResults   = make([]uint8, len(msg.Frames))
 		frameLogRanges = make([]frameLogRange, len(msg.Frames))
+		batchStart     = -1
+		batchEnd       = -1
+		batchSnapshot  int
+		batchApprovals frameApprovalState
 	)
 
-	for i, frame := range msg.Frames {
-		logStart := st.state.TxLogSize()
+	for i := 0; i < len(msg.Frames); i++ {
+		frame := msg.Frames[i]
 		frameCtx.FrameIndex = i
 
 		// Reset transient storage between frames (access list is shared).
 		if i > 0 {
 			st.state.ResetTransientStorage()
 		}
+		currentBatchStart, currentBatchEnd, inAtomicBatch := atomicBatchBounds(msg.Frames, i)
+		if currentBatchStart != batchStart || currentBatchEnd != batchEnd {
+			batchStart, batchEnd = currentBatchStart, currentBatchEnd
+			if inAtomicBatch {
+				batchSnapshot = st.state.Snapshot()
+				batchApprovals = frameApprovalState{
+					senderApproved: senderApproved,
+					payerApproved:  payerApproved,
+					payer:          payer,
+				}
+			}
+		}
+		logStart := st.state.TxLogSize()
 
 		// Determine target (nil → tx.sender).
 		target := msg.From
@@ -888,11 +927,40 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		approveStatus := st.evm.ApproveScope
 		st.evm.ApproveScope = vm.ApproveNone
 
+		frameReverted := false
+		skipBatch := false
+		revertFrame := func(senderChanged bool) {
+			frameReverted = true
+			if inAtomicBatch {
+				st.state.RevertToSnapshot(batchSnapshot)
+				senderApproved = batchApprovals.senderApproved
+				payerApproved = batchApprovals.payerApproved
+				payer = batchApprovals.payer
+				for j := batchStart; j <= i; j++ {
+					frameLogRanges[j] = emptyFrameLogRange()
+				}
+				for j := i + 1; j <= batchEnd; j++ {
+					frameCtx.FrameResults[j] = types.FrameReceiptStatusSkipped
+					frameResults[j] = types.FrameReceiptStatusSkipped
+					frameGasUsed[j] = 0
+					frameLogRanges[j] = emptyFrameLogRange()
+				}
+				skipBatch = true
+			} else {
+				st.state.RevertToSnapshot(snapshot)
+				if senderChanged {
+					senderApproved = false
+				}
+				frameLogRanges[i] = emptyFrameLogRange()
+			}
+			frameCtx.FrameResults[i] = types.FrameReceiptStatusFailed
+			frameResults[i] = types.FrameReceiptStatusFailed
+		}
+
 		// Determine frame result and handle approval logic.
 		if vmerr != nil {
 			// Frame execution failed — revert all state changes from this frame.
-			st.state.RevertToSnapshot(snapshot)
-			frameCtx.FrameResults[i] = 0
+			revertFrame(false)
 		} else if approveStatus != vm.ApproveNone {
 			// APPROVE was called. Process approval rules.
 			needRevert := false
@@ -929,28 +997,29 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			}
 
 			if needRevert {
-				st.state.RevertToSnapshot(snapshot)
-				frameCtx.FrameResults[i] = 0
-				if senderChanged {
-					senderApproved = false
-				}
+				revertFrame(senderChanged)
 			} else {
-				frameCtx.FrameResults[i] = approveStatus
+				frameCtx.FrameResults[i] = types.FrameReceiptStatusSuccessful
 			}
 		} else {
 			// Normal success (RETURN/STOP).
-			frameCtx.FrameResults[i] = 1
+			frameCtx.FrameResults[i] = types.FrameReceiptStatusSuccessful
 		}
-		frameResults[i] = frameCtx.FrameResults[i]
-		logEnd := st.state.TxLogSize()
-		frameLogRanges[i] = frameLogRange{start: logStart, end: logEnd}
+		if !frameReverted {
+			frameResults[i] = frameCtx.FrameResults[i]
+			logEnd := st.state.TxLogSize()
+			frameLogRanges[i] = frameLogRange{start: logStart, end: logEnd}
+		}
 
 		// VERIFY mode: must terminate with APPROVE.
 		if frame.Mode == types.FrameModeVerify {
 			status := frameCtx.FrameResults[i]
-			if status == vm.ApproveNone {
+			if approveStatus == vm.ApproveNone || status == types.FrameReceiptStatusFailed {
 				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: VERIFY frame %d did not APPROVE (status %d)", ErrFrameTxInvalid, i, status)
 			}
+		}
+		if skipBatch {
+			i = batchEnd
 		}
 	}
 
@@ -980,7 +1049,7 @@ func (st *stateTransition) hasNoCode(addr common.Address) bool {
 }
 
 // collectGasFromPayer charges the total transaction gas cost from the payer account.
-// This is called when a frame APPROVEs payment (status 3 or 4).
+// This is called when a frame APPROVEs payment.
 func (st *stateTransition) collectGasFromPayer(payer common.Address) error {
 	msg := st.msg
 

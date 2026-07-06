@@ -31,7 +31,7 @@ func TestMakeFrameReceipts(t *testing.T) {
 		{Address: common.HexToAddress("0x1003")},
 	}
 	result := &ExecutionResult{
-		frameResults: []uint8{1, 4, 0, 2},
+		frameResults: []uint8{1, 3, 0, 1},
 		frameGasUsed: []uint64{11, 22},
 		frameLogRange: []frameLogRange{
 			{start: 0, end: 1},
@@ -43,7 +43,7 @@ func TestMakeFrameReceipts(t *testing.T) {
 	if len(frames) != 4 {
 		t.Fatalf("frame receipt count mismatch: got %d want 4", len(frames))
 	}
-	if frames[0].Status != 1 || frames[1].Status != 4 || frames[2].Status != 0 || frames[3].Status != 2 {
+	if frames[0].Status != 1 || frames[1].Status != 3 || frames[2].Status != 0 || frames[3].Status != 1 {
 		t.Fatalf("unexpected frame statuses: %#v", frames)
 	}
 	if frames[0].GasUsed != 11 || frames[1].GasUsed != 22 || frames[2].GasUsed != 0 || frames[3].GasUsed != 0 {

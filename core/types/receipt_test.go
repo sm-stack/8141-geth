@@ -531,7 +531,7 @@ func TestFrameReceiptMarshalBinary(t *testing.T) {
 				},
 			},
 			{
-				Status:  4,
+				Status:  3,
 				GasUsed: 222,
 				Logs:    nil,
 			},
@@ -714,7 +714,7 @@ func TestFrameReceiptJSON(t *testing.T) {
 		Payer:             common.HexToAddress("0x7777"),
 		FrameReceipts: []FrameReceipt{
 			{
-				Status:  2,
+				Status:  3,
 				GasUsed: 21,
 				Logs: []*Log{
 					{
@@ -759,7 +759,7 @@ func TestFrameReceiptJSONZeroPayerIsPresent(t *testing.T) {
 		CumulativeGasUsed: 1,
 		Payer:             common.Address{},
 		FrameReceipts: []FrameReceipt{
-			{Status: 2, GasUsed: 1, Logs: []*Log{}},
+			{Status: 3, GasUsed: 1, Logs: []*Log{}},
 		},
 		Logs:    []*Log{},
 		GasUsed: 1,
@@ -799,7 +799,7 @@ func TestFrameReceiptJSONRejectsMissingPayer(t *testing.T) {
 		CumulativeGasUsed: 1,
 		Payer:             common.HexToAddress("0x1111"),
 		FrameReceipts: []FrameReceipt{
-			{Status: 2, GasUsed: 1, Logs: []*Log{}},
+			{Status: 3, GasUsed: 1, Logs: []*Log{}},
 		},
 		Logs:    []*Log{},
 		GasUsed: 1,
@@ -831,7 +831,7 @@ func TestFrameReceiptJSONRejectsInvalidStatus(t *testing.T) {
 		CumulativeGasUsed: 1,
 		Payer:             common.HexToAddress("0x1111"),
 		FrameReceipts: []FrameReceipt{
-			{Status: 2, GasUsed: 1, Logs: []*Log{}},
+			{Status: 1, GasUsed: 1, Logs: []*Log{}},
 		},
 		Logs:    []*Log{},
 		GasUsed: 1,
@@ -853,7 +853,7 @@ func TestFrameReceiptJSONRejectsInvalidStatus(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected frameReceipts[0] payload: %#v", frameReceipts[0])
 	}
-	first["status"] = "0x05"
+	first["status"] = "0x02"
 	mutated, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload error: %v", err)

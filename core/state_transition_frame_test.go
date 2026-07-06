@@ -51,6 +51,12 @@ var (
 
 	// Store CALLVALUE at storage slot 0, then RETURN.
 	callValueStoreCode = []byte{0x34, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xf3}
+
+	// Store 1 at storage slot 0, then RETURN.
+	storeOneCode = []byte{0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xf3}
+
+	// Store 2 at storage slot 1, then RETURN.
+	storeTwoCode = []byte{0x60, 0x02, 0x60, 0x01, 0x55, 0x60, 0x00, 0x60, 0x00, 0xf3}
 )
 
 // newFrameTestEnv creates a test EVM and state for frame transaction tests.
@@ -279,6 +285,45 @@ func TestFrameTxSenderValueInsufficientBalanceRevertsFrame(t *testing.T) {
 	}
 }
 
+func TestFrameTxAtomicBatchFailureRollsBackAndSkips(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	firstTarget := common.HexToAddress("0x2222")
+	failingTarget := common.HexToAddress("0x3333")
+	skippedTarget := common.HexToAddress("0x4444")
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(firstTarget)
+	statedb.SetCode(firstTarget, storeOneCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(failingTarget)
+	statedb.SetCode(failingTarget, revertCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(skippedTarget)
+	statedb.SetCode(skippedTarget, storeTwoCode, tracing.CodeChangeUnspecified)
+
+	tx := newFrameTx(config, 0, sender, []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+		{Mode: types.FrameModeSender, Flags: types.FrameFlagAtomicBatch, Target: &firstTarget, GasLimit: 100000, Data: nil},
+		{Mode: types.FrameModeSender, Flags: types.FrameFlagAtomicBatch, Target: &failingTarget, GasLimit: 50000, Data: nil},
+		{Mode: types.FrameModeSender, Target: &skippedTarget, GasLimit: 100000, Data: nil},
+	})
+	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
+
+	assertFrameStatuses(t, receipt, []uint8{1, 1, 0, 3})
+	if got := receipt.FrameReceipts[3].GasUsed; got != 0 {
+		t.Fatalf("skipped frame gas used: got %d want 0", got)
+	}
+	if got := statedb.GetState(firstTarget, common.Hash{}); got != (common.Hash{}) {
+		t.Fatalf("first atomic frame storage was not rolled back: got %v", got)
+	}
+	if got := statedb.GetState(skippedTarget, common.BytesToHash([]byte{0x01})); got != (common.Hash{}) {
+		t.Fatalf("skipped frame executed unexpectedly: storage[1] = %v", got)
+	}
+}
+
 // TestFrameTxSenderNotApproved tests that SENDER mode before sender approval fails.
 func TestFrameTxSenderNotApproved(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
@@ -380,6 +425,34 @@ func TestFrameTxVerifyFailure(t *testing.T) {
 		t.Fatal("expected error for VERIFY frame that did not APPROVE")
 	}
 	t.Logf("got expected error: %v", err)
+}
+
+func TestFrameTxVerifyReturnWithoutApproveFails(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, returnCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	_, err := applyFrameTx(evm, config, msg)
+	if err == nil {
+		t.Fatal("expected error for VERIFY frame that returned without APPROVE")
+	}
 }
 
 // TestFrameTxSponsoredTransaction tests a sponsored transaction where sender and payer are different.

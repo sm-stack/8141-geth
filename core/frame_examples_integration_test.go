@@ -161,7 +161,7 @@ func TestFrameTxExample1Integration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{3, 1})
+	assertFrameStatuses(t, receipt, []uint8{1, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}
@@ -192,7 +192,7 @@ func TestFrameTxExample1aIntegration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{3, 1})
+	assertFrameStatuses(t, receipt, []uint8{1, 1})
 	if got := statedb.GetBalance(recipient); got.Cmp(uint256.NewInt(1)) != 0 {
 		t.Fatalf("recipient balance mismatch: got %v want 1", got)
 	}
@@ -219,7 +219,7 @@ func TestFrameTxExample1bIntegration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{1, 3, 1})
+	assertFrameStatuses(t, receipt, []uint8{1, 1, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}
@@ -252,7 +252,7 @@ func TestFrameTxExample2Integration(t *testing.T) {
 	if receipt.Payer != sponsor {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sponsor)
 	}
-	assertFrameStatuses(t, receipt, []uint8{2, 1, 1, 1, 1})
+	assertFrameStatuses(t, receipt, []uint8{1, 1, 1, 1, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}

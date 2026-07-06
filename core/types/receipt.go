@@ -49,6 +49,23 @@ const (
 	ReceiptStatusSuccessful = uint64(1)
 )
 
+const (
+	// FrameReceiptStatusFailed means frame execution reverted.
+	FrameReceiptStatusFailed = uint8(0)
+
+	// FrameReceiptStatusSuccessful means frame execution completed successfully.
+	FrameReceiptStatusSuccessful = uint8(1)
+
+	// FrameReceiptStatusSkipped means frame execution was skipped by atomic batch rollback.
+	FrameReceiptStatusSkipped = uint8(3)
+)
+
+func validFrameReceiptStatus(status uint64) bool {
+	return status == uint64(FrameReceiptStatusFailed) ||
+		status == uint64(FrameReceiptStatusSuccessful) ||
+		status == uint64(FrameReceiptStatusSkipped)
+}
+
 // Receipt represents the results of a transaction.
 type Receipt struct {
 	// Consensus fields: These fields are defined by the Yellow Paper
