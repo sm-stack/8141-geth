@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -66,6 +67,37 @@ func testVRS(sig []byte) []byte {
 	copy(vrs[1:33], sig[0:32])
 	copy(vrs[33:65], sig[32:64])
 	return vrs
+}
+
+func testFrameTxSigHashVector() *FrameTx {
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	return &FrameTx{
+		ChainID:    uint256.NewInt(1),
+		Nonce:      7,
+		Sender:     common.HexToAddress("0x1111111111111111111111111111111111111111"),
+		GasTipCap:  uint256.NewInt(3),
+		GasFeeCap:  uint256.NewInt(100),
+		BlobFeeCap: uint256.NewInt(0),
+		BlobHashes: []common.Hash{common.HexToHash("0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")},
+		Frames: []Frame{
+			{Mode: FrameModeVerify, Flags: 3, GasLimit: 50000, Data: []byte{0xaa, 0xbb}},
+			{Mode: FrameModeSender, Flags: FrameFlagAtomicBatch, Target: &target, GasLimit: 70000, Value: uint256.NewInt(12345), Data: []byte{0xcc, 0xdd, 0xee}},
+			{Mode: FrameModeDefault, Target: &target, GasLimit: 30000, Data: []byte{0x99}},
+		},
+		Signatures: []TxSignature{
+			{
+				Scheme:    SignatureSchemeSecp256k1,
+				Signer:    common.HexToAddress("0x3333333333333333333333333333333333333333"),
+				Signature: common.Hex2Bytes("0011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222"),
+			},
+			{
+				Scheme:    SignatureSchemeP256,
+				Signer:    common.HexToAddress("0x4444444444444444444444444444444444444444"),
+				Msg:       common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").Bytes(),
+				Signature: common.Hex2Bytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+			},
+		},
+	}
 }
 
 func TestFrameTxType(t *testing.T) {
@@ -187,6 +219,33 @@ func TestFrameTxSigHashCommitsVerifyDataAndElidesEmptySignatureData(t *testing.T
 	hash4 := ftx4.sigHash(ftx4.chainID())
 	if hash1 == hash4 {
 		t.Error("sigHash should differ when explicit-msg raw signature bytes change")
+	}
+}
+
+func TestFrameTxSignatureGasConstants(t *testing.T) {
+	if params.SigGasSecp256k1 != 2800 {
+		t.Fatalf("SigGasSecp256k1 = %d, want 2800", params.SigGasSecp256k1)
+	}
+	if params.SigGasP256 != 6700 {
+		t.Fatalf("SigGasP256 = %d, want 6700", params.SigGasP256)
+	}
+}
+
+func TestFrameTxSigHashVector(t *testing.T) {
+	const (
+		wantSigHash = "0x8a6995cd49dc64c051cfed96ff9809e2ecfae14413127a51f76f43347da894b3"
+		wantRawTx   = "0x06f901a40107941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	)
+	tx := testFrameTxSigHashVector()
+	if got, want := tx.SigHash(tx.chainID()).Hex(), wantSigHash; got != want {
+		t.Fatalf("SigHash = %s, want %s", got, want)
+	}
+	typed, err := NewTx(tx).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary failed: %v", err)
+	}
+	if got, want := hexutil.Encode(typed), wantRawTx; got != want {
+		t.Fatalf("raw typed tx = %s, want %s", got, want)
 	}
 }
 

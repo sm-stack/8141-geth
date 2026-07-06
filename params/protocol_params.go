@@ -38,6 +38,8 @@ const (
 	TxGas                 uint64 = 21000 // Per transaction not creating a contract. NOTE: Not payable on data of calls between transactions.
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract. NOTE: Not payable on data of calls between transactions.
 	TxGasEIP8141          uint64 = 15000 // Per frame transaction (EIP-8141). NOTE: Not payable on data of calls between transactions.
+	SigGasSecp256k1       uint64 = 2800  // Per EIP-8141 secp256k1 transaction-level signature verification.
+	SigGasP256            uint64 = 6700  // Per EIP-8141 P256 transaction-level signature verification.
 	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions.
 	QuadCoeffDiv          uint64 = 512   // Divisor for the quadratic particle of the memory cost equation.
 	LogDataGas            uint64 = 8     // Per byte in a LOG* operation's data.
