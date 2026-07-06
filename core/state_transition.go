@@ -184,8 +184,9 @@ type Message struct {
 
 	// EIP-8141: flattened frame transaction fields.
 	Frames            []types.Frame // Frame list (nil for non-frame transactions).
-	FrameSigHash      common.Hash   // Pre-computed compute_sig_hash(tx).
-	FrameFloorDataGas uint64        // Pre-computed EIP-7623 floor data gas.
+	FrameSignatures   []types.TxSignature
+	FrameSigHash      common.Hash // Pre-computed compute_sig_hash(tx).
+	FrameFloorDataGas uint64      // Pre-computed EIP-7623 floor data gas.
 }
 
 // TransactionToMessage converts a transaction into a Message.
@@ -215,8 +216,15 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 	}
 	// EIP-8141: flatten frame transaction fields and adjust gas limit.
 	if ftx := tx.GetFrameTx(); ftx != nil {
+		if err := ftx.Validate(); err != nil {
+			return nil, err
+		}
 		msg.Frames = ftx.Frames
+		msg.FrameSignatures = ftx.Signatures
 		msg.FrameSigHash = ftx.SigHash(tx.ChainId())
+		if err := types.ValidateFrameTxSignatures(ftx, msg.FrameSigHash); err != nil {
+			return nil, err
+		}
 		floorDataGas, err := ftx.FloorDataGas()
 		if err != nil {
 			return nil, err
@@ -791,6 +799,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		Sender:       msg.From,
 		Nonce:        msg.Nonce,
 		Frames:       msg.Frames,
+		Signatures:   msg.FrameSignatures,
 		GasTipCap:    gasTipCap,
 		GasFeeCap:    gasFeeCap,
 		BlobFeeCap:   blobFeeCap,

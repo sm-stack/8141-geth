@@ -55,7 +55,10 @@ type eoaCallRLP struct {
 // appropriate action (signature verification, call execution, or revert).
 //
 // Returns the return data, leftover gas, and any error.
-func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, input []byte, gas uint64, _ uint8) ([]byte, uint64, error) {
+func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, input []byte, gas uint64, frameMode uint8) ([]byte, uint64, error) {
+	if frameMode == types.FrameModeVerify {
+		return executeDefaultVerify(evm, target, input, gas, 0)
+	}
 	if len(input) == 0 {
 		return nil, gas, ErrExecutionReverted
 	}
@@ -64,10 +67,11 @@ func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, 
 	scope := (firstByte >> 4) & 0x0F // high nibble: APPROVE scope
 	dataMode := firstByte & 0x0F     // low nibble: operation mode
 
-	switch dataMode {
-	case types.FrameModeVerify:
-		return executeDefaultVerify(evm, target, input, gas, scope)
+	switch frameMode {
 	case types.FrameModeSender:
+		if dataMode != types.FrameModeSender {
+			return nil, gas, ErrExecutionReverted
+		}
 		return executeDefaultSender(evm, target, input, gas, scope)
 	case types.FrameModeDefault:
 		return nil, gas, ErrExecutionReverted
@@ -83,6 +87,14 @@ func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uin
 	fc := evm.FrameCtx
 	if fc == nil {
 		return nil, gas, ErrExecutionReverted
+	}
+
+	if approveScope, ok := defaultCodeTxSignatureApproveScope(fc, target); ok {
+		if gas < defaultCodeBaseGas {
+			return nil, 0, ErrOutOfGas
+		}
+		gas -= defaultCodeBaseGas
+		return applyDefaultApprove(evm, target, approveScope, gas)
 	}
 
 	// frame.target must equal tx.sender for VERIFY default code.
@@ -111,6 +123,30 @@ func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uin
 	default:
 		return nil, gas, ErrExecutionReverted
 	}
+}
+
+func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address) (uint8, bool) {
+	if fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
+		return 0, false
+	}
+	allowedScope := fc.Frames[fc.FrameIndex].Flags & types.FrameFlagApproveScopeMask
+	var approveScope uint8
+	switch allowedScope {
+	case 0x1: // payment
+		approveScope = 1
+	case 0x2: // execution
+		approveScope = 0
+	case 0x3: // execution + payment
+		approveScope = 2
+	default:
+		return 0, false
+	}
+	for _, sig := range fc.Signatures {
+		if sig.Scheme == types.SignatureSchemeSecp256k1 && sig.Signer == target && len(sig.Msg) == 0 {
+			return approveScope, true
+		}
+	}
+	return 0, false
 }
 
 // verifySecp256k1 verifies an ECDSA secp256k1 signature for EOA default code.

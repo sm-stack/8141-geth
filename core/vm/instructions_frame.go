@@ -40,14 +40,15 @@ type FrameContext struct {
 	Sender       common.Address // tx.sender
 	Nonce        uint64         // tx.nonce
 	Frames       []types.Frame  // tx.frames
-	GasTipCap    *uint256.Int   // max_priority_fee_per_gas
-	GasFeeCap    *uint256.Int   // max_fee_per_gas
-	BlobFeeCap   *uint256.Int   // max_fee_per_blob_gas
-	BlobHashes   []common.Hash  // blob_versioned_hashes
-	GasLimit     uint64         // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
-	SigHash      common.Hash    // Cached compute_sig_hash(tx).
-	FrameIndex   int            // Currently executing frame index.
-	FrameResults []uint8        // Status of each completed frame (0=fail, 1=success, 2-4=approve).
+	Signatures   []types.TxSignature
+	GasTipCap    *uint256.Int  // max_priority_fee_per_gas
+	GasFeeCap    *uint256.Int  // max_fee_per_gas
+	BlobFeeCap   *uint256.Int  // max_fee_per_blob_gas
+	BlobHashes   []common.Hash // blob_versioned_hashes
+	GasLimit     uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
+	SigHash      common.Hash   // Cached compute_sig_hash(tx).
+	FrameIndex   int           // Currently executing frame index.
+	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, 2-4=approve).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -240,7 +241,7 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	case txParamFrameIndex:
 		param.SetUint64(uint64(fc.FrameIndex))
 	case txParamSignatureCount:
-		param.Clear()
+		param.SetUint64(uint64(len(fc.Signatures)))
 	default:
 		return nil, invalidFrameOpcode(TXPARAM)
 	}
@@ -319,7 +320,7 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	case frameParamMode:
 		param.SetUint64(uint64(frame.Mode))
 	case frameParamFlags:
-		param.Clear()
+		param.SetUint64(uint64(frame.Flags))
 	case frameParamDataLen:
 		param.SetUint64(uint64(len(frame.Data)))
 	case frameParamStatus:
@@ -332,11 +333,11 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 			param.SetUint64(1)
 		}
 	case frameParamAllowedScope:
-		param.Clear()
+		param.SetUint64(uint64(frame.Flags & types.FrameFlagApproveScopeMask))
 	case frameParamAtomicBatch:
-		param.Clear()
+		param.SetUint64(uint64((frame.Flags & types.FrameFlagAtomicBatch) >> 2))
 	case frameParamValue:
-		param.Clear()
+		setUint256(param, frame.Value)
 	default:
 		return nil, invalidFrameOpcode(FRAMEPARAM)
 	}
@@ -346,24 +347,44 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 // opSigParam implements SIGPARAM (0xb4).
 // Stack: [signatureIndex, param] -> [value]
 func opSigParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	if _, err := requireFrameContext(evm, SIGPARAM); err != nil {
+	fc, err := requireFrameContext(evm, SIGPARAM)
+	if err != nil {
 		return nil, err
 	}
 	signatureIndex := scope.Stack.pop()
 	param := scope.Stack.peek()
-	if _, err := frameSelector(&signatureIndex, SIGPARAM); err != nil {
+	idx, err := frameSelector(&signatureIndex, SIGPARAM)
+	if err != nil {
 		return nil, err
 	}
 	selector, err := frameSelector(param, SIGPARAM)
 	if err != nil {
 		return nil, err
 	}
-	switch selector {
-	case sigParamSigner, sigParamScheme, sigParamMsg, sigParamSignatureLen:
+	if idx >= uint64(len(fc.Signatures)) {
 		return nil, invalidFrameOpcode(SIGPARAM)
+	}
+	sig := &fc.Signatures[int(idx)]
+	switch selector {
+	case sigParamSigner:
+		setAddressWord(param, sig.Signer)
+	case sigParamScheme:
+		param.SetUint64(uint64(sig.Scheme))
+	case sigParamMsg:
+		switch len(sig.Msg) {
+		case 0:
+			param.Clear()
+		case common.HashLength:
+			param.SetBytes32(sig.Msg)
+		default:
+			return nil, invalidFrameOpcode(SIGPARAM)
+		}
+	case sigParamSignatureLen:
+		param.SetUint64(uint64(len(sig.Signature)))
 	default:
 		return nil, invalidFrameOpcode(SIGPARAM)
 	}
+	return nil, nil
 }
 
 // memoryFrameDataCopy returns the memory size required for FRAMEDATACOPY.

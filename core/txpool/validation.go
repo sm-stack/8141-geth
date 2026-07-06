@@ -103,6 +103,9 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 		if frameTx == nil {
 			return fmt.Errorf("%w: missing frame payload", core.ErrFrameTxInvalid)
 		}
+		if err := frameTx.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", core.ErrFrameTxInvalid, err)
+		}
 		if len(frameTx.Frames) == 0 {
 			return fmt.Errorf("%w: frame tx has no frames", core.ErrFrameTxInvalid)
 		}

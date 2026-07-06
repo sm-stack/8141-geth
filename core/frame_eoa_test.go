@@ -30,46 +30,6 @@ import (
 	"github.com/holiman/uint256"
 )
 
-// buildEOAVerifyData builds the frame.data for EOA default code VERIFY mode
-// with secp256k1 signature.
-//
-// Layout: [byte0, 0x00, v(1), r(32), s(32)] = 67 bytes
-// byte0: high nibble = scope, low nibble = mode (1 = VERIFY)
-func buildEOAVerifyData(scope uint8, sigHash common.Hash, key *ecdsa.PrivateKey) []byte {
-	// byte0: scope in high nibble, VERIFY (1) in low nibble.
-	byte0 := (scope << 4) | 0x01
-
-	// data_without_signature = [byte0, sig_type]
-	dataWithoutSig := []byte{byte0, 0x00}
-
-	// hash = keccak256(sig_hash || data_without_signature)
-	hashInput := make([]byte, 32+len(dataWithoutSig))
-	copy(hashInput, sigHash[:])
-	copy(hashInput[32:], dataWithoutSig)
-	hash := crypto.Keccak256(hashInput)
-
-	// Sign the hash.
-	sig, err := crypto.Sign(hash, key)
-	if err != nil {
-		panic(err)
-	}
-
-	// sig = [r(32), s(32), v(1)]
-	v := sig[64]
-	r := sig[0:32]
-	s := sig[32:64]
-
-	// Build frame data: [byte0, 0x00, v, r..., s...]
-	data := make([]byte, 67)
-	data[0] = byte0
-	data[1] = 0x00 // secp256k1
-	data[2] = v
-	copy(data[3:35], r)
-	copy(data[35:67], s)
-
-	return data
-}
-
 // buildEOASenderData builds the frame.data for EOA default code SENDER mode.
 //
 // Layout: [byte0, RLP-encoded [[target, value, data], ...]]
@@ -102,6 +62,24 @@ func buildEOASenderData(calls []struct {
 	return result
 }
 
+func addEOADefaultSignature(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
+	signer := crypto.PubkeyToAddress(key.PublicKey)
+	ftx.Signatures = append(ftx.Signatures, types.TxSignature{
+		Scheme: types.SignatureSchemeSecp256k1,
+		Signer: signer,
+	})
+	sigHash := ftx.SigHash(chainID)
+	sig, err := crypto.Sign(sigHash[:], key)
+	if err != nil {
+		panic(err)
+	}
+	vrs := make([]byte, 65)
+	vrs[0] = sig[64]
+	copy(vrs[1:33], sig[0:32])
+	copy(vrs[33:65], sig[32:64])
+	ftx.Signatures[len(ftx.Signatures)-1].Signature = vrs
+}
+
 // TestEOADefaultCodeSimple tests the simplest EOA frame transaction:
 // VERIFY with ECDSA signature + SENDER with a simple ETH transfer.
 // This replicates Example 1 from EIP-8141 but with an EOA sender.
@@ -126,8 +104,8 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},       // placeholder
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},        // placeholder
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -143,13 +121,7 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 		{Target: recipient, Value: big.NewInt(1e15), Data: nil},
 	})
 	ftx.Frames[1].Data = senderData
-
-	// Compute sig hash (VERIFY frame data is elided).
-	sigHash := ftx.SigHash(config.ChainID)
-
-	// Build VERIFY frame data with APPROVE(0x2) scope.
-	verifyData := buildEOAVerifyData(2, sigHash, key)
-	ftx.Frames[0].Data = verifyData
+	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
@@ -188,15 +160,13 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
 		BlobFeeCap: new(uint256.Int),
 	}
-
-	sigHash := ftx.SigHash(config.ChainID)
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, key)
+	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
@@ -227,16 +197,13 @@ func TestEOADefaultCodeWrongSigner(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
 		BlobFeeCap: new(uint256.Int),
 	}
-
-	sigHash := ftx.SigHash(config.ChainID)
-	// Sign with wrong key — ecrecover will return a different address.
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, wrongKey)
+	addEOADefaultSignature(ftx, config.ChainID, wrongKey)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	_, err := applyFrameTx(evm, config, msg)
@@ -350,9 +317,9 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},         // EOA VERIFY
-			{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 100000, Data: nil},    // Sponsor VERIFY
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},          // SENDER call
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil}, // EOA VERIFY
+			{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 100000, Data: nil},      // Sponsor VERIFY
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},           // SENDER call
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -368,11 +335,7 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 		{Target: recipient, Value: big.NewInt(1e15), Data: nil},
 	})
 	ftx.Frames[2].Data = senderData
-
-	sigHash := ftx.SigHash(config.ChainID)
-
-	// EOA VERIFY with APPROVE(0x0) — execution only.
-	ftx.Frames[0].Data = buildEOAVerifyData(0, sigHash, key)
+	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
@@ -439,7 +402,7 @@ func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 			{Mode: types.FrameModeSender, Target: nil, GasLimit: 200000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
@@ -457,9 +420,7 @@ func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
 		{Target: recipient2, Value: big.NewInt(2e15), Data: nil},
 	})
 	ftx.Frames[1].Data = senderData
-
-	sigHash := ftx.SigHash(config.ChainID)
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, key)
+	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)

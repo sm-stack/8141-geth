@@ -69,8 +69,8 @@ type FramePool struct {
 	chainconfig *params.ChainConfig
 	signer      types.Signer
 
-	gasTip      uint256.Int
-	currentHead *types.Header
+	gasTip       uint256.Int
+	currentHead  *types.Header
 	currentState *state.StateDB
 
 	reserver txpool.Reserver
@@ -321,16 +321,21 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 	head := p.currentHead
 	rules := p.chainconfig.Rules(head.Number, head.Difficulty.Sign() == 0, head.Time)
 	precompiles := vm.ActivePrecompiles(rules)
+	sigHash := frameTx.SigHash(p.chainconfig.ChainID)
+	if err := types.ValidateFrameTxSignatures(frameTx, sigHash); err != nil {
+		return err
+	}
 
 	// Build FrameContext (mirrors state_transition.go:806-821).
 	frameCtx := &vm.FrameContext{
 		Sender:       frameTx.Sender,
 		Nonce:        frameTx.Nonce,
 		Frames:       frameTx.Frames,
+		Signatures:   frameTx.Signatures,
 		GasTipCap:    new(uint256.Int).Set(frameTx.GasTipCap),
 		GasFeeCap:    new(uint256.Int).Set(frameTx.GasFeeCap),
 		GasLimit:     frameTx.TotalGas(),
-		SigHash:      frameTx.SigHash(p.chainconfig.ChainID),
+		SigHash:      sigHash,
 		FrameIndex:   0,
 		FrameResults: make([]uint8, len(frameTx.Frames)),
 	}

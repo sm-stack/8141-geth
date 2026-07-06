@@ -20,6 +20,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -42,5 +44,49 @@ func TestSigParamWithoutSignaturesHalts(t *testing.T) {
 	}
 	if invalid.opcode != SIGPARAM {
 		t.Fatalf("invalid opcode: got %s, want %s", invalid.opcode, SIGPARAM)
+	}
+}
+
+func TestSigParamReturnsSignatureMetadata(t *testing.T) {
+	signer := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	msg := common.HexToHash("0x1234").Bytes()
+	sigBytes := make([]byte, 65)
+	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+	evm.FrameCtx = &FrameContext{
+		Signatures: []types.TxSignature{
+			{
+				Scheme:    types.SignatureSchemeSecp256k1,
+				Signer:    signer,
+				Msg:       msg,
+				Signature: sigBytes,
+			},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		param uint64
+		want  *uint256.Int
+	}{
+		{"signer", sigParamSigner, new(uint256.Int).SetBytes(signer.Bytes())},
+		{"scheme", sigParamScheme, new(uint256.Int).SetUint64(uint64(types.SignatureSchemeSecp256k1))},
+		{"msg", sigParamMsg, new(uint256.Int).SetBytes(msg)},
+		{"signature_len", sigParamSignatureLen, new(uint256.Int).SetUint64(uint64(len(sigBytes)))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stack := newstack()
+			defer returnStack(stack)
+			stack.push(new(uint256.Int).SetUint64(tt.param))
+			stack.push(new(uint256.Int).SetUint64(0))
+
+			pc := uint64(0)
+			if _, err := opSigParam(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err != nil {
+				t.Fatalf("opSigParam failed: %v", err)
+			}
+			if got := stack.pop(); !got.Eq(tt.want) {
+				t.Fatalf("got %x, want %x", got.Bytes32(), tt.want.Bytes32())
+			}
+		})
 	}
 }

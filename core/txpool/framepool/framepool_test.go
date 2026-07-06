@@ -38,8 +38,8 @@ type testChain struct {
 	head    *types.Header
 }
 
-func (c *testChain) Config() *params.ChainConfig        { return c.config }
-func (c *testChain) CurrentBlock() *types.Header         { return c.head }
+func (c *testChain) Config() *params.ChainConfig                 { return c.config }
+func (c *testChain) CurrentBlock() *types.Header                 { return c.head }
 func (c *testChain) StateAt(common.Hash) (*state.StateDB, error) { return c.statedb, nil }
 
 // reserver implements txpool.Reserver for tests.
@@ -196,6 +196,29 @@ func TestFramePoolValidFrameTx(t *testing.T) {
 	// Should be in pool.
 	if pending, _ := pool.Stats(); pending != 1 {
 		t.Fatalf("expected 1 pending, got %d", pending)
+	}
+}
+
+func TestFramePoolRejectsInvalidTxSignature(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+	ftx.Signatures = []types.TxSignature{{
+		Scheme:    types.SignatureSchemeSecp256k1,
+		Signer:    sender,
+		Signature: make([]byte, 65),
+	}}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for invalid tx-level signature")
 	}
 }
 
@@ -373,7 +396,7 @@ func TestFramePoolDefaultFrameSkipsValidation(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // VERIFY on sender (valid)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},      // VERIFY on sender (valid)
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}}, // DEFAULT on target (no opcode restrictions)
 	}
 
@@ -486,8 +509,8 @@ func TestScopeOrderingExecThenPay(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},      // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},    // payer → pay
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → pay
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
 	}
 
@@ -510,8 +533,8 @@ func TestScopeOrderingPayBeforeExec(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → pay (before exec!)
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → pay (before exec!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -537,9 +560,9 @@ func TestScopeOrderingDoublePayer(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},       // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payerA, GasLimit: 50000, Data: []byte{0x01}},   // payerA → pay
-		{Mode: types.FrameModeVerify, Target: &payerB, GasLimit: 50000, Data: []byte{0x01}},   // payerB → pay (duplicate!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payerA, GasLimit: 50000, Data: []byte{0x01}}, // payerA → pay
+		{Mode: types.FrameModeVerify, Target: &payerB, GasLimit: 50000, Data: []byte{0x01}}, // payerB → pay (duplicate!)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -562,8 +585,8 @@ func TestScopeOrderingBothAfterExec(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → both (exec already done!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → both (exec already done!)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -584,7 +607,7 @@ func TestScopeOrderingNoPayer(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},        // sender → exec only
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}}, // sender → exec only
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
 	}
 
@@ -611,8 +634,8 @@ func TestApproveCallerNonSenderExec(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec ✓
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},   // payer → exec ✗ (ADDRESS != sender)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec ✓
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → exec ✗ (ADDRESS != sender)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
