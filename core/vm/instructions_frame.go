@@ -24,12 +24,12 @@ import (
 	"github.com/holiman/uint256"
 )
 
-// Approval status codes as returned by APPROVE and observable via call status.
+// Approval scope bitmask values as returned by APPROVE.
 const (
 	ApproveNone      uint8 = 0 // No approval (normal RETURN or not set).
-	ApproveExecution uint8 = 2 // APPROVE(0x0): sender approved execution.
-	ApprovePayment   uint8 = 3 // APPROVE(0x1): payer approved payment.
-	ApproveBoth      uint8 = 4 // APPROVE(0x2): both execution and payment.
+	ApprovePayment   uint8 = 1 // APPROVE(0x1): payer approved payment.
+	ApproveExecution uint8 = 2 // APPROVE(0x2): sender approved execution.
+	ApproveBoth      uint8 = 3 // APPROVE(0x3): both execution and payment.
 )
 
 // FrameContext holds the context for executing a frame transaction (EIP-8141).
@@ -48,7 +48,7 @@ type FrameContext struct {
 	GasLimit     uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
 	SigHash      common.Hash   // Cached compute_sig_hash(tx).
 	FrameIndex   int           // Currently executing frame index.
-	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, 2-4=approve).
+	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, VERIFY uses approve scope).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -60,17 +60,18 @@ type FrameContext struct {
 //   - ADDRESS == frame.target: only the frame target contract can call APPROVE.
 //     This prevents subcalls from issuing approvals. DELEGATECALL preserves
 //     ADDRESS, so delegate patterns still work.
-//   - Scope 0x0/0x2 (execution approval): frame.target must equal tx.sender,
-//     since only the sender contract can approve execution.
+//   - scope must be a non-zero subset of frame.flags' allowed-scope bits.
+//   - Scope with execution approval: frame.target must equal tx.sender, since
+//     only the sender contract can approve execution.
 //
 // Stack: [offset, length, scope]
 func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	offset, size := scope.Stack.pop(), scope.Stack.pop()
 	scopeVal := scope.Stack.pop()
 
-	// Validate scope: must be 0, 1, or 2.
+	// Validate scope: must be a non-zero PAYMENT/EXECUTION bitmask.
 	s := scopeVal.Uint64()
-	if s > 2 {
+	if s == 0 || s > uint64(ApproveBoth) {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
@@ -89,13 +90,17 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
-	// Scope 0x0/0x2 (execution approval): frame.target must be tx.sender.
-	if (s == 0 || s == 2) && frameTarget != evm.FrameCtx.Sender {
+	allowedScope := currentFrame.Flags & types.FrameFlagApproveScopeMask
+	if uint8(s)&^allowedScope != 0 {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
-	// Map scope operand to approval status code: scope + 2.
-	evm.ApproveScope = uint8(s) + 2
+	// Execution approval can only come from tx.sender.
+	if uint8(s)&ApproveExecution != 0 && frameTarget != evm.FrameCtx.Sender {
+		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+	}
+
+	evm.ApproveScope = uint8(s)
 
 	ret := scope.Memory.GetCopy(offset.Uint64(), size.Uint64())
 	return ret, errStopToken

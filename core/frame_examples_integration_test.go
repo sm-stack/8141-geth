@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	integrationApproveBothCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	integrationApproveBothCode = []byte{0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 	integrationReturnCode      = []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
 )
 
@@ -120,7 +120,7 @@ func approveIfCalldataElseReturn(scope byte) []byte {
 }
 
 // approveIfEntryPointElseTransferOneWei returns code that:
-// - caller == ENTRY_POINT: APPROVE(0x2)
+// - caller == ENTRY_POINT: APPROVE(0x3)
 // - otherwise: transfer 1 wei to recipient, then RETURN(0,0)
 func approveIfEntryPointElseTransferOneWei(entryPoint, recipient common.Address) []byte {
 	code := []byte{0x33, 0x73}
@@ -134,7 +134,7 @@ func approveIfEntryPointElseTransferOneWei(entryPoint, recipient common.Address)
 	code = append(code,
 		0x5a, 0xf1, 0x50,
 		0x60, 0x00, 0x60, 0x00, 0xf3,
-		0x5b, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa,
+		0x5b, 0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa,
 	)
 	return code
 }
@@ -150,7 +150,7 @@ func TestFrameTxExample1Integration(t *testing.T) {
 	createContract(statedb, target, integrationReturnCode, uint256.NewInt(0))
 
 	tx := newFrameTx(config, 0, sender, []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
 		{Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Data: []byte("call")},
 	})
 	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
@@ -161,7 +161,7 @@ func TestFrameTxExample1Integration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{4, 1})
+	assertFrameStatuses(t, receipt, []uint8{3, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}
@@ -184,7 +184,7 @@ func TestFrameTxExample1aIntegration(t *testing.T) {
 	statedb.SetBalance(recipient, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
 
 	tx := newFrameTx(config, 0, sender, []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
 		{Mode: types.FrameModeSender, Target: nil, GasLimit: 120_000, Data: append(recipient.Bytes(), []byte{1}...)},
 	})
 	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
@@ -192,7 +192,7 @@ func TestFrameTxExample1aIntegration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{4, 1})
+	assertFrameStatuses(t, receipt, []uint8{3, 1})
 	if got := statedb.GetBalance(recipient); got.Cmp(uint256.NewInt(1)) != 0 {
 		t.Fatalf("recipient balance mismatch: got %v want 1", got)
 	}
@@ -207,11 +207,11 @@ func TestFrameTxExample1bIntegration(t *testing.T) {
 	deployer := common.HexToAddress("0x4444")
 
 	createContract(statedb, deployer, integrationReturnCode, uint256.NewInt(0))
-	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x2), uint256.NewInt(1e18))
+	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x3), uint256.NewInt(1e18))
 
 	tx := newFrameTx(config, 0, sender, []types.Frame{
 		{Mode: types.FrameModeDefault, Target: &deployer, GasLimit: 50_000, Data: []byte("initcode+salt")},
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
 		{Mode: types.FrameModeSender, Target: nil, GasLimit: 70_000, Data: []byte("execution")},
 	})
 	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
@@ -219,7 +219,7 @@ func TestFrameTxExample1bIntegration(t *testing.T) {
 	if receipt.Payer != sender {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sender)
 	}
-	assertFrameStatuses(t, receipt, []uint8{1, 4, 1})
+	assertFrameStatuses(t, receipt, []uint8{1, 3, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}
@@ -234,15 +234,15 @@ func TestFrameTxExample2Integration(t *testing.T) {
 	erc20 := common.HexToAddress("0x5555")
 	target := common.HexToAddress("0x2222")
 
-	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x0), uint256.NewInt(1e15))
+	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x2), uint256.NewInt(1e15))
 	createContract(statedb, sponsor, approveIfCalldataElseReturn(0x1), uint256.NewInt(1e18))
 	createContract(statedb, erc20, integrationReturnCode, uint256.NewInt(0))
 	createContract(statedb, target, integrationReturnCode, uint256.NewInt(0))
 
 	sponsorBefore := statedb.GetBalance(sponsor).Clone()
 	tx := newFrameTx(config, 0, sender, []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
-		{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 60_000, Data: []byte("sponsor-data")},
+		{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 60_000, Data: []byte("signature")},
+		{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 60_000, Data: []byte("sponsor-data")},
 		{Mode: types.FrameModeSender, Target: &erc20, GasLimit: 70_000, Data: make([]byte, 68)},
 		{Mode: types.FrameModeSender, Target: &target, GasLimit: 70_000, Data: []byte("user-call")},
 		{Mode: types.FrameModeDefault, Target: &sponsor, GasLimit: 50_000, Data: nil},
@@ -252,7 +252,7 @@ func TestFrameTxExample2Integration(t *testing.T) {
 	if receipt.Payer != sponsor {
 		t.Fatalf("payer mismatch: got %s want %s", receipt.Payer, sponsor)
 	}
-	assertFrameStatuses(t, receipt, []uint8{2, 3, 1, 1, 1})
+	assertFrameStatuses(t, receipt, []uint8{2, 1, 1, 1, 1})
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce mismatch: got %d want 1", got)
 	}

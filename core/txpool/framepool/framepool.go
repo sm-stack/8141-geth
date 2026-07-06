@@ -458,7 +458,7 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 
 		// Check that APPROVE was called and record scope.
 		scope := evm.ApproveScope
-		if scope < vm.ApproveExecution || scope > vm.ApproveBoth {
+		if scope == vm.ApproveNone {
 			if vmerr != nil {
 				return fmt.Errorf("VERIFY frame %d execution failed: %v", i, vmerr)
 			}
@@ -548,12 +548,11 @@ func validateScopeOrdering(frames []types.Frame, sender common.Address, results 
 			continue
 		}
 
-		senderApprovedBefore := senderApproved
 		scope := result.approveScope
 		target := result.target
 
-		// Execution approval (mirrors state_transition.go:887-896).
-		if scope == vm.ApproveExecution || scope == vm.ApproveBoth {
+		// Execution approval (mirrors state_transition.go).
+		if scope&vm.ApproveExecution != 0 {
 			if target == sender {
 				if senderApproved {
 					return fmt.Errorf("VERIFY frame %d: execution re-approval", i)
@@ -562,13 +561,10 @@ func validateScopeOrdering(frames []types.Frame, sender common.Address, results 
 			}
 		}
 
-		// Payment approval (mirrors state_transition.go:899-914).
-		if scope == vm.ApprovePayment || scope == vm.ApproveBoth {
-			if !senderApprovedBefore && scope == vm.ApprovePayment {
+		// Payment approval (mirrors state_transition.go).
+		if scope&vm.ApprovePayment != 0 {
+			if !senderApproved {
 				return fmt.Errorf("VERIFY frame %d: payment approval without prior execution approval", i)
-			}
-			if senderApprovedBefore && scope == vm.ApproveBoth {
-				return fmt.Errorf("VERIFY frame %d: ApproveBoth after separate execution approval", i)
 			}
 			if payerApproved {
 				return fmt.Errorf("VERIFY frame %d: duplicate payer approval", i)

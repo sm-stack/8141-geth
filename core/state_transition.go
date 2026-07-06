@@ -889,17 +889,15 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			// Frame execution failed — revert all state changes from this frame.
 			st.state.RevertToSnapshot(snapshot)
 			frameCtx.FrameResults[i] = 0
-		} else if approveStatus >= vm.ApproveExecution && approveStatus <= vm.ApproveBoth {
+		} else if approveStatus != vm.ApproveNone {
 			// APPROVE was called. Process approval rules.
-			senderApprovedBefore := senderApproved
-
 			needRevert := false
 			senderChanged := false
 
-			// Rule for status 2 (execution approval).
-			// Note: opApprove already ensures target == sender for scope 0/2,
+			// Rule for execution approval.
+			// Note: opApprove already ensures target == sender for execution scope,
 			// but we keep this check as defense-in-depth.
-			if approveStatus == vm.ApproveExecution || approveStatus == vm.ApproveBoth {
+			if approveStatus&vm.ApproveExecution != 0 {
 				if target == msg.From {
 					if senderApproved {
 						needRevert = true
@@ -910,11 +908,9 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 				}
 			}
 
-			// Rule for status 3 (payment approval).
-			if !needRevert && (approveStatus == vm.ApprovePayment || approveStatus == vm.ApproveBoth) {
-				if !senderApprovedBefore && approveStatus == vm.ApprovePayment {
-					needRevert = true
-				} else if senderApprovedBefore && approveStatus == vm.ApproveBoth {
+			// Rule for payment approval.
+			if !needRevert && approveStatus&vm.ApprovePayment != 0 {
+				if !senderApproved {
 					needRevert = true
 				} else if payerApproved {
 					needRevert = true
@@ -948,7 +944,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		// VERIFY mode: must terminate with APPROVE.
 		if frame.Mode == types.FrameModeVerify {
 			status := frameCtx.FrameResults[i]
-			if status < vm.ApproveExecution || status > vm.ApproveBoth {
+			if status == vm.ApproveNone {
 				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: VERIFY frame %d did not APPROVE (status %d)", ErrFrameTxInvalid, i, status)
 			}
 		}

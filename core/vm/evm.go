@@ -132,8 +132,8 @@ type EVM struct {
 	returnData []byte // Last CALL's return data for subsequent reuse
 
 	// EIP-8141: Frame transaction context.
-	FrameCtx      *FrameContext // Set when executing a frame transaction.
-	ApproveScope  uint8        // Set by APPROVE opcode (0=not set, 2/3/4=approval status).
+	FrameCtx     *FrameContext // Set when executing a frame transaction.
+	ApproveScope uint8         // Set by APPROVE opcode (0=not set, 1/2/3=approval scope bitmask).
 }
 
 // NewEVM constructs an EVM instance with the supplied block context, state

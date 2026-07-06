@@ -130,20 +130,12 @@ func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address)
 		return 0, false
 	}
 	allowedScope := fc.Frames[fc.FrameIndex].Flags & types.FrameFlagApproveScopeMask
-	var approveScope uint8
-	switch allowedScope {
-	case 0x1: // payment
-		approveScope = 1
-	case 0x2: // execution
-		approveScope = 0
-	case 0x3: // execution + payment
-		approveScope = 2
-	default:
+	if allowedScope == ApproveNone {
 		return 0, false
 	}
 	for _, sig := range fc.Signatures {
 		if sig.Scheme == types.SignatureSchemeSecp256k1 && sig.Signer == target && len(sig.Msg) == 0 {
-			return approveScope, true
+			return allowedScope, true
 		}
 	}
 	return 0, false
@@ -274,8 +266,8 @@ func verifyP256(evm *EVM, target common.Address, input []byte, gas uint64, scope
 // applyDefaultApprove sets the APPROVE status on the EVM, mirroring what
 // the APPROVE opcode does but from the default code path.
 func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint64) ([]byte, uint64, error) {
-	// Validate scope: must be 0, 1, or 2.
-	if scope > 2 {
+	// Validate scope: must be a non-zero PAYMENT/EXECUTION bitmask.
+	if scope == 0 || scope > ApproveBoth {
 		return nil, gas, ErrExecutionReverted
 	}
 
@@ -284,13 +276,11 @@ func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint6
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// For scope 0x0/0x2 (execution approval): target must be tx.sender.
-	if (scope == 0 || scope == 2) && target != fc.Sender {
+	if scope&ApproveExecution != 0 && target != fc.Sender {
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// Map scope operand to approval status code: scope + 2.
-	evm.ApproveScope = scope + 2
+	evm.ApproveScope = scope
 	return nil, gas, nil
 }
 

@@ -145,7 +145,7 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 	t.Logf("recipient balance: %s", recipientBal)
 }
 
-// TestEOADefaultCodeVerifyOnly tests EOA VERIFY with APPROVE(0x2) and no SENDER frame.
+// TestEOADefaultCodeVerifyOnly tests EOA VERIFY with APPROVE(0x3) and no SENDER frame.
 func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
@@ -213,6 +213,35 @@ func TestEOADefaultCodeWrongSigner(t *testing.T) {
 	t.Logf("got expected error: %v", err)
 }
 
+func TestEOADefaultCodeTxSignatureRequiresAllowedScope(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	key, _ := crypto.GenerateKey()
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	addEOADefaultSignature(ftx, config.ChainID, key)
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	_, err := applyFrameTx(evm, config, msg)
+	if err == nil {
+		t.Fatal("expected error when tx-level signature has no allowed APPROVE scope")
+	}
+}
+
 // TestEOADefaultCodeInvalidDataLength tests that wrong data length for ECDSA fails.
 func TestEOADefaultCodeInvalidDataLength(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
@@ -265,7 +294,7 @@ func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			// DEFAULT mode frame targeting an EOA — should revert (non-fatal).
 			{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000,
 				// byte0: high nibble=0, low nibble=0 (DEFAULT mode)
@@ -289,7 +318,7 @@ func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
 }
 
 // TestEOADefaultCodeSplitApproval tests EOA with split approval:
-// Frame 0: VERIFY with APPROVE(0x0) — execution only
+// Frame 0: VERIFY with APPROVE(0x2) — execution only
 // Frame 1: VERIFY with APPROVE(0x1) — payment only (using a contract)
 // Frame 2: SENDER — execute a call
 func TestEOADefaultCodeSplitApproval(t *testing.T) {
@@ -317,9 +346,9 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil}, // EOA VERIFY
-			{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 100000, Data: nil},      // Sponsor VERIFY
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},           // SENDER call
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil},      // EOA VERIFY
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 100000, Data: nil}, // Sponsor VERIFY
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},                // SENDER call
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
