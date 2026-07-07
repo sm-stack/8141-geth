@@ -18,6 +18,7 @@ package types
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,21 @@ const (
 	FrameFlagApproveScopeMask uint8 = 0x03
 	FrameFlagAtomicBatch      uint8 = 0x04
 )
+
+// IsFrameExpiryVerifier reports whether the frame is the canonical expiry verifier
+// VERIFY frame after target resolution.
+func IsFrameExpiryVerifier(frame Frame, resolvedTarget common.Address) bool {
+	return frame.Mode == FrameModeVerify && resolvedTarget == params.FrameExpiryVerifierAddress
+}
+
+// DecodeFrameExpiryDeadline decodes the expiry verifier's 8-byte big-endian
+// deadline calldata.
+func DecodeFrameExpiryDeadline(data []byte) (uint64, bool) {
+	if len(data) != params.FrameExpiryDataLength {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(data), true
+}
 
 // Transaction signature scheme constants as defined in EIP-8141.
 const (
@@ -394,7 +410,11 @@ func (tx *FrameTx) Validate() error {
 		if totalFrameGas, overflow = commonmath.SafeAdd(totalFrameGas, frame.GasLimit); overflow {
 			return errFrameGasUintOverflow
 		}
-		if frame.Target != nil && *frame.Target == params.FrameExpiryVerifierAddress && frame.Mode == FrameModeVerify {
+		target := tx.Sender
+		if frame.Target != nil {
+			target = *frame.Target
+		}
+		if IsFrameExpiryVerifier(frame, target) {
 			expiryFrames++
 			if frame.Flags != 0 {
 				return fmt.Errorf("expiry verifier frame %d has nonzero flags", i)
@@ -402,8 +422,8 @@ func (tx *FrameTx) Validate() error {
 			if !value.IsZero() {
 				return fmt.Errorf("expiry verifier frame %d has nonzero value", i)
 			}
-			if len(frame.Data) != 8 {
-				return fmt.Errorf("expiry verifier frame %d has data length %d, want 8", i, len(frame.Data))
+			if len(frame.Data) != params.FrameExpiryDataLength {
+				return fmt.Errorf("expiry verifier frame %d has data length %d, want %d", i, len(frame.Data), params.FrameExpiryDataLength)
 			}
 			if expiryFrames > 1 {
 				return errors.New("frame tx has multiple expiry verifier frames")

@@ -875,6 +875,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		if frame.Target != nil {
 			target = *frame.Target
 		}
+		isExpiryVerifier := types.IsFrameExpiryVerifier(frame, target)
 
 		if frame.Mode > types.FrameModeSender {
 			return common.Address{}, nil, nil, nil, fmt.Errorf("%w: frame %d has invalid mode %d", ErrFrameTxInvalid, i, frame.Mode)
@@ -910,7 +911,12 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		if frame.Mode == types.FrameModeSender && frame.Value != nil {
 			callValue.Set(frame.Value)
 		}
-		if st.hasNoCode(target) && !(frame.Mode == types.FrameModeSender && target != msg.From) {
+		if isExpiryVerifier {
+			if !bytes.Equal(st.state.GetCode(target), params.FrameExpiryVerifierCode) {
+				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: expiry verifier frame %d missing canonical code", ErrFrameTxInvalid, i)
+			}
+			ret, leftOverGas, vmerr = st.evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
+		} else if st.hasNoCode(target) && !(frame.Mode == types.FrameModeSender && target != msg.From) {
 			ret, leftOverGas, vmerr = vm.ExecuteDefaultCode(st.evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
 		} else if frame.Mode == types.FrameModeVerify {
 			ret, leftOverGas, vmerr = st.evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
@@ -1011,10 +1017,14 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			frameLogRanges[i] = frameLogRange{start: logStart, end: logEnd}
 		}
 
-		// VERIFY mode: must terminate with APPROVE.
+		// VERIFY mode must terminate with APPROVE, except for the expiry verifier.
 		if frame.Mode == types.FrameModeVerify {
 			status := frameCtx.FrameResults[i]
-			if approveStatus == vm.ApproveNone || status == types.FrameReceiptStatusFailed {
+			if isExpiryVerifier {
+				if status == types.FrameReceiptStatusFailed {
+					return common.Address{}, nil, nil, nil, fmt.Errorf("%w: expiry verifier frame %d failed", ErrFrameTxInvalid, i)
+				}
+			} else if approveStatus == vm.ApproveNone || status == types.FrameReceiptStatusFailed {
 				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: VERIFY frame %d did not APPROVE (status %d)", ErrFrameTxInvalid, i, status)
 			}
 		}

@@ -221,6 +221,20 @@ func TestGenesisCommit(t *testing.T) {
 	}
 }
 
+func TestDeveloperGenesisIncludesFrameExpiryVerifier(t *testing.T) {
+	genesis := DeveloperGenesisBlock(0, nil)
+	account, ok := genesis.Alloc[params.FrameExpiryVerifierAddress]
+	if !ok {
+		t.Fatal("developer genesis missing frame expiry verifier predeploy")
+	}
+	if account.Nonce != 1 {
+		t.Fatalf("expiry verifier nonce: got %d want 1", account.Nonce)
+	}
+	if !bytes.Equal(account.Code, params.FrameExpiryVerifierCode) {
+		t.Fatalf("expiry verifier code mismatch: got %x want %x", account.Code, params.FrameExpiryVerifierCode)
+	}
+}
+
 func TestReadWriteGenesisAlloc(t *testing.T) {
 	var (
 		db    = rawdb.NewMemoryDatabase()

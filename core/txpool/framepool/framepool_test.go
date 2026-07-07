@@ -17,6 +17,7 @@
 package framepool
 
 import (
+	"encoding/binary"
 	"math/big"
 	"sync"
 	"testing"
@@ -151,6 +152,12 @@ func baseFTX(sender common.Address, nonce uint64, config *params.ChainConfig) *t
 	}
 }
 
+func expiryFrameData(deadline uint64) []byte {
+	data := make([]byte, params.FrameExpiryDataLength)
+	binary.BigEndian.PutUint64(data, deadline)
+	return data
+}
+
 // --- Tests ---
 
 func TestFramePoolFilter(t *testing.T) {
@@ -240,6 +247,52 @@ func TestFramePoolBannedOpcode(t *testing.T) {
 		t.Fatal("expected rejection for banned opcode TIMESTAMP")
 	}
 	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolExpiryVerifierFrame(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	expiry := params.FrameExpiryVerifierAddress
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 1_000_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected valid expiry verifier frame to be accepted, got: %v", errs[0])
+	}
+}
+
+func TestFramePoolExpiryVerifierExpiredDeadline(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	expiry := params.FrameExpiryVerifierAddress
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50000, Data: expiryFrameData(pool.currentHead.Time + 11)},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected expired expiry verifier frame to be rejected")
+	}
 }
 
 func TestFramePoolGasRule(t *testing.T) {

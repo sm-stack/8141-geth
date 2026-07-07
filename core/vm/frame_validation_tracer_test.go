@@ -33,6 +33,7 @@ import (
 // mockStateDB implements StateDB for tracer tests.
 type mockStateDB struct {
 	codeSize map[common.Address]int
+	code     map[common.Address][]byte
 	state    map[common.Address]map[common.Hash]common.Hash // For GetState (STO-021)
 	exists   map[common.Address]bool                        // For Exist (STO-021)
 }
@@ -40,23 +41,23 @@ type mockStateDB struct {
 func (m *mockStateDB) GetCodeSize(addr common.Address) int { return m.codeSize[addr] }
 
 // Boilerplate — unused by the tracer.
-func (m *mockStateDB) CreateAccount(common.Address)    {}
-func (m *mockStateDB) CreateContract(common.Address)   {}
+func (m *mockStateDB) CreateAccount(common.Address)  {}
+func (m *mockStateDB) CreateContract(common.Address) {}
 func (m *mockStateDB) SubBalance(common.Address, *uint256.Int, tracing.BalanceChangeReason) uint256.Int {
 	return uint256.Int{}
 }
 func (m *mockStateDB) AddBalance(common.Address, *uint256.Int, tracing.BalanceChangeReason) uint256.Int {
 	return uint256.Int{}
 }
-func (m *mockStateDB) GetBalance(common.Address) *uint256.Int                     { return new(uint256.Int) }
-func (m *mockStateDB) GetNonce(common.Address) uint64                             { return 0 }
-func (m *mockStateDB) SetNonce(common.Address, uint64, tracing.NonceChangeReason) {}
-func (m *mockStateDB) GetCodeHash(common.Address) common.Hash                    { return common.Hash{} }
-func (m *mockStateDB) GetCode(common.Address) []byte                             { return nil }
+func (m *mockStateDB) GetBalance(common.Address) *uint256.Int                          { return new(uint256.Int) }
+func (m *mockStateDB) GetNonce(common.Address) uint64                                  { return 0 }
+func (m *mockStateDB) SetNonce(common.Address, uint64, tracing.NonceChangeReason)      {}
+func (m *mockStateDB) GetCodeHash(common.Address) common.Hash                          { return common.Hash{} }
+func (m *mockStateDB) GetCode(addr common.Address) []byte                              { return m.code[addr] }
 func (m *mockStateDB) SetCode(common.Address, []byte, tracing.CodeChangeReason) []byte { return nil }
-func (m *mockStateDB) AddRefund(uint64)                                           {}
-func (m *mockStateDB) SubRefund(uint64)                                           {}
-func (m *mockStateDB) GetRefund() uint64                                          { return 0 }
+func (m *mockStateDB) AddRefund(uint64)                                                {}
+func (m *mockStateDB) SubRefund(uint64)                                                {}
+func (m *mockStateDB) GetRefund() uint64                                               { return 0 }
 func (m *mockStateDB) GetStateAndCommittedState(common.Address, common.Hash) (common.Hash, common.Hash) {
 	return common.Hash{}, common.Hash{}
 }
@@ -76,32 +77,34 @@ func (m *mockStateDB) GetTransientState(common.Address, common.Hash) common.Hash
 	return common.Hash{}
 }
 func (m *mockStateDB) SetTransientState(common.Address, common.Hash, common.Hash) {}
-func (m *mockStateDB) ResetTransientStorage()                                      {}
+func (m *mockStateDB) ResetTransientStorage()                                     {}
 func (m *mockStateDB) SelfDestruct(common.Address) uint256.Int                    { return uint256.Int{} }
-func (m *mockStateDB) HasSelfDestructed(common.Address) bool                       { return false }
-func (m *mockStateDB) SelfDestruct6780(common.Address) (uint256.Int, bool)        { return uint256.Int{}, false }
+func (m *mockStateDB) HasSelfDestructed(common.Address) bool                      { return false }
+func (m *mockStateDB) SelfDestruct6780(common.Address) (uint256.Int, bool) {
+	return uint256.Int{}, false
+}
 func (m *mockStateDB) Exist(addr common.Address) bool {
 	if m.exists != nil {
 		return m.exists[addr]
 	}
 	return false
 }
-func (m *mockStateDB) Empty(common.Address) bool                                   { return true }
-func (m *mockStateDB) AddressInAccessList(common.Address) bool                     { return false }
-func (m *mockStateDB) SlotInAccessList(common.Address, common.Hash) (bool, bool)   { return false, false }
-func (m *mockStateDB) AddAddressToAccessList(common.Address)                       {}
-func (m *mockStateDB) AddSlotToAccessList(common.Address, common.Hash)             {}
-func (m *mockStateDB) PointCache() *utils.PointCache                               { return nil }
+func (m *mockStateDB) Empty(common.Address) bool                                 { return true }
+func (m *mockStateDB) AddressInAccessList(common.Address) bool                   { return false }
+func (m *mockStateDB) SlotInAccessList(common.Address, common.Hash) (bool, bool) { return false, false }
+func (m *mockStateDB) AddAddressToAccessList(common.Address)                     {}
+func (m *mockStateDB) AddSlotToAccessList(common.Address, common.Hash)           {}
+func (m *mockStateDB) PointCache() *utils.PointCache                             { return nil }
 func (m *mockStateDB) Prepare(params.Rules, common.Address, common.Address, *common.Address, []common.Address, types.AccessList) {
 }
-func (m *mockStateDB) RevertToSnapshot(int)        {}
-func (m *mockStateDB) Snapshot() int               { return 0 }
-func (m *mockStateDB) AddLog(*types.Log)           {}
-func (m *mockStateDB) AddPreimage(common.Hash, []byte) {}
-func (m *mockStateDB) TxLogSize() int              { return 0 }
-func (m *mockStateDB) Witness() *stateless.Witness { return nil }
+func (m *mockStateDB) RevertToSnapshot(int)              {}
+func (m *mockStateDB) Snapshot() int                     { return 0 }
+func (m *mockStateDB) AddLog(*types.Log)                 {}
+func (m *mockStateDB) AddPreimage(common.Hash, []byte)   {}
+func (m *mockStateDB) TxLogSize() int                    { return 0 }
+func (m *mockStateDB) Witness() *stateless.Witness       { return nil }
 func (m *mockStateDB) AccessEvents() *state.AccessEvents { return nil }
-func (m *mockStateDB) Finalise(bool)               {}
+func (m *mockStateDB) Finalise(bool)                     {}
 
 // mockScope implements tracing.OpContext for tests.
 type mockScope struct {
@@ -189,6 +192,38 @@ func TestFrameValidationBannedOpcodes(t *testing.T) {
 				t.Fatalf("expected rule %s, got %s", tc.rule, v.Rule)
 			}
 		})
+	}
+}
+
+func TestFrameValidationExpiryVerifierAllowsTimestamp(t *testing.T) {
+	state := &mockStateDB{
+		codeSize: map[common.Address]int{
+			params.FrameExpiryVerifierAddress: len(params.FrameExpiryVerifierCode),
+		},
+		code: map[common.Address][]byte{
+			params.FrameExpiryVerifierAddress: params.FrameExpiryVerifierCode,
+		},
+	}
+	tracer := NewFrameValidationTracer(state, testSender, params.FrameExpiryVerifierAddress, []common.Address{testPrecompile1})
+	tracer.OnOpcode(0, byte(TIMESTAMP), 100000, 2, emptyScope(), nil, 1, nil)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for canonical expiry verifier TIMESTAMP: %s", v)
+	}
+}
+
+func TestFrameValidationExpiryVerifierRejectsTimestampWithoutCanonicalCode(t *testing.T) {
+	state := &mockStateDB{
+		codeSize: map[common.Address]int{
+			params.FrameExpiryVerifierAddress: 1,
+		},
+		code: map[common.Address][]byte{
+			params.FrameExpiryVerifierAddress: []byte{byte(STOP)},
+		},
+	}
+	tracer := NewFrameValidationTracer(state, testSender, params.FrameExpiryVerifierAddress, []common.Address{testPrecompile1})
+	tracer.OnOpcode(0, byte(TIMESTAMP), 100000, 2, emptyScope(), nil, 1, nil)
+	if v := tracer.Violation(); v == nil {
+		t.Fatal("expected TIMESTAMP violation without canonical expiry verifier code")
 	}
 }
 

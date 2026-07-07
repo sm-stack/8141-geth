@@ -230,4 +230,6 @@ var (
 	// EIP-8141 - Frame Transaction
 	FrameEntryPointAddress     = common.HexToAddress("0x00000000000000000000000000000000000000aa")
 	FrameExpiryVerifierAddress = common.HexToAddress("0x0000000000000000000000000000000000008141")
+	FrameExpiryVerifierCode    = common.FromHex("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd")
+	FrameExpiryDataLength      = 8
 )

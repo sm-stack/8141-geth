@@ -17,6 +17,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"errors"
 	"math"
 	"math/big"
@@ -98,6 +99,12 @@ func makeFrameMsg(ftx *types.FrameTx, config *params.ChainConfig, baseFee *big.I
 		panic(err)
 	}
 	return msg
+}
+
+func expiryFrameData(deadline uint64) []byte {
+	data := make([]byte, params.FrameExpiryDataLength)
+	binary.BigEndian.PutUint64(data, deadline)
+	return data
 }
 
 // TestFrameTxSimple tests the simplest frame transaction: VERIFY(APPROVE 0x3) + SENDER(RETURN).
@@ -282,6 +289,79 @@ func TestFrameTxSenderValueInsufficientBalanceRevertsFrame(t *testing.T) {
 	}
 	if got := statedb.GetState(target, common.Hash{}); got != (common.Hash{}) {
 		t.Fatalf("target storage changed despite reverted frame: %v", got)
+	}
+}
+
+func TestFrameTxExpiryVerifierValidDeadline(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	evm.Context.Time = 100
+
+	sender := common.HexToAddress("0x1111")
+	expiry := params.FrameExpiryVerifierAddress
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50000, Data: expiryFrameData(100)},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got, want := result.frameResults, []uint8{types.FrameReceiptStatusSuccessful, types.FrameReceiptStatusSuccessful}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("frame results: got %v want %v", got, want)
+	}
+}
+
+func TestFrameTxExpiryVerifierExpiredDeadlineFails(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	evm.Context.Time = 100
+
+	sender := common.HexToAddress("0x1111")
+	expiry := params.FrameExpiryVerifierAddress
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50000, Data: expiryFrameData(99)},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	if _, err := applyFrameTx(evm, config, msg); err == nil {
+		t.Fatal("expected expired expiry verifier frame to fail")
 	}
 }
 

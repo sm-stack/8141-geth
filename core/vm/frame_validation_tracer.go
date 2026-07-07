@@ -25,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // FrameValidationError represents a specific ERC-7562 rule violation detected
@@ -72,13 +73,14 @@ type storageAccess struct {
 // validated post-execution since associated storage detection requires keccak
 // preimage matching.
 type FrameValidationTracer struct {
-	stateDB     StateDB            // For GetCodeSize (OP-041) and GetState (STO-021)
-	sender      common.Address     // tx.sender — exempt from OP-041, owns storage (STO-010)
-	frameTarget common.Address     // VERIFY frame target — exempt from STO-021 (entity's own storage)
+	stateDB     StateDB        // For GetCodeSize (OP-041) and GetState (STO-021)
+	sender      common.Address // tx.sender — exempt from OP-041, owns storage (STO-010)
+	frameTarget common.Address // VERIFY frame target — exempt from STO-021 (entity's own storage)
 	precompiles map[common.Address]bool
 
-	lastOp      OpCode // Previous opcode for GAS rule (OP-012)
-	lastOpValid bool   // Whether lastOp is meaningful
+	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
+	lastOpValid    bool   // Whether lastOp is meaningful
+	allowTimestamp bool
 
 	violation *FrameValidationError // First violation (nil = no violation)
 
@@ -106,6 +108,7 @@ func NewFrameValidationTracer(stateDB StateDB, sender common.Address, frameTarge
 		sender:          sender,
 		frameTarget:     frameTarget,
 		precompiles:     pm,
+		allowTimestamp:  frameTarget == params.FrameExpiryVerifierAddress && bytes.Equal(stateDB.GetCode(frameTarget), params.FrameExpiryVerifierCode),
 		keccakPreimages: make(map[string]struct{}),
 	}
 }
@@ -149,6 +152,11 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 
 	// [OP-011, OP-080] Check banned opcodes.
 	if bannedOpcodes[opcode] {
+		if opcode == TIMESTAMP && t.allowTimestamp {
+			t.lastOp = opcode
+			t.lastOpValid = true
+			return
+		}
 		rule := "OP-011"
 		if opcode == BALANCE || opcode == SELFBALANCE {
 			rule = "OP-080"

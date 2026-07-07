@@ -19,6 +19,7 @@
 package framepool
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"sync"
@@ -409,6 +410,27 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 			continue
 		}
 
+		// Determine target.
+		target := frameTx.Sender
+		if frame.Target != nil {
+			target = *frame.Target
+		}
+
+		if types.IsFrameExpiryVerifier(frame, target) {
+			if !bytes.Equal(baseState.GetCode(target), params.FrameExpiryVerifierCode) {
+				return fmt.Errorf("expiry verifier frame %d missing canonical code", i)
+			}
+			deadline, ok := types.DecodeFrameExpiryDeadline(frame.Data)
+			if !ok {
+				return fmt.Errorf("expiry verifier frame %d has invalid data length", i)
+			}
+			if blockCtx.Time > deadline {
+				return fmt.Errorf("expiry verifier frame %d expired: timestamp %d > deadline %d", i, blockCtx.Time, deadline)
+			}
+			frameCtx.FrameResults[i] = types.FrameReceiptStatusSuccessful
+			continue
+		}
+
 		// Gas cap check.
 		if frame.GasLimit > verifyFrameGasCap {
 			return fmt.Errorf("VERIFY frame %d gas %d exceeds cap %d", i, frame.GasLimit, verifyFrameGasCap)
@@ -417,12 +439,6 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		// Use a copy of baseState (which includes DEFAULT frame effects) to avoid
 		// polluting the pool's state and to isolate VERIFY frames from each other.
 		simState := baseState.Copy()
-
-		// Determine target.
-		target := frameTx.Sender
-		if frame.Target != nil {
-			target = *frame.Target
-		}
 
 		// Create validation tracer.
 		tracer := vm.NewFrameValidationTracer(simState, frameTx.Sender, target, precompiles)
