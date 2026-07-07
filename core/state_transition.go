@@ -255,7 +255,7 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 			msg.GasPrice = msg.GasFeeCap
 		}
 	}
-	// EIP-8141: flatten frame transaction fields and adjust gas limit.
+	// EIP-8141: flatten frame transaction fields and cache floor data gas.
 	if ftx := tx.GetFrameTx(); ftx != nil {
 		if err := ftx.Validate(); err != nil {
 			return nil, err
@@ -271,11 +271,6 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 			return nil, err
 		}
 		msg.FrameFloorDataGas = floorDataGas
-		calldataGas, err := ftx.CalldataGas()
-		if err != nil {
-			return nil, err
-		}
-		msg.GasLimit += calldataGas
 	}
 	var err error
 	msg.From, err = types.Sender(s, tx)

@@ -708,7 +708,7 @@ func TestFrameTxGasAccounting(t *testing.T) {
 	}
 
 	// The actual gas used by the APPROVE bytecode is small (~30 gas for 3 PUSH1 + APPROVE).
-	// The intrinsic gas (TxGasEIP8141 + calldataCost) is the bulk.
+	// The intrinsic metadata gas (base + per-frame + calldata) is the bulk.
 	// Total = intrinsicGas + frameGasUsed
 	t.Logf("total gas used: %d, gas limit: %d", result.UsedGas, msg.GasLimit)
 }

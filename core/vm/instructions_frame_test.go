@@ -26,6 +26,29 @@ import (
 	"github.com/holiman/uint256"
 )
 
+func TestFrameOpcodeNames(t *testing.T) {
+	tests := map[OpCode]string{
+		TXPARAM:       "TXPARAM",
+		FRAMEDATALOAD: "FRAMEDATALOAD",
+		FRAMEDATACOPY: "FRAMEDATACOPY",
+		FRAMEPARAM:    "FRAMEPARAM",
+		SIGPARAM:      "SIGPARAM",
+	}
+	for op, name := range tests {
+		if got := op.String(); got != name {
+			t.Fatalf("%#x String() = %q, want %q", byte(op), got, name)
+		}
+		if got, ok := stringToOp[name]; !ok || got != op {
+			t.Fatalf("stringToOp[%q] = %v, %t; want %v, true", name, got, ok, op)
+		}
+	}
+	for _, old := range []string{"TXPARAMLOAD", "TXPARAMSIZE", "TXPARAMCOPY"} {
+		if op, ok := stringToOp[old]; ok {
+			t.Fatalf("old opcode %s still registered as %v", old, op)
+		}
+	}
+}
+
 func TestSigParamWithoutSignaturesHalts(t *testing.T) {
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
 	evm.FrameCtx = &FrameContext{}
@@ -44,6 +67,62 @@ func TestSigParamWithoutSignaturesHalts(t *testing.T) {
 	}
 	if invalid.opcode != SIGPARAM {
 		t.Fatalf("invalid opcode: got %s, want %s", invalid.opcode, SIGPARAM)
+	}
+}
+
+func TestFrameParamStatusOnlyPastFrames(t *testing.T) {
+	run := func(frameIndex, currentIndex uint64, results []uint8) (uint256.Int, error) {
+		evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+		evm.FrameCtx = &FrameContext{
+			Frames:       make([]types.Frame, 3),
+			FrameIndex:   int(currentIndex),
+			FrameResults: results,
+		}
+		stack := newstack()
+		defer returnStack(stack)
+		stack.push(new(uint256.Int).SetUint64(frameParamStatus))
+		stack.push(new(uint256.Int).SetUint64(frameIndex))
+
+		pc := uint64(0)
+		_, err := opFrameParam(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack})
+		if err != nil {
+			return uint256.Int{}, err
+		}
+		return stack.pop(), nil
+	}
+
+	got, err := run(0, 2, []uint8{types.FrameReceiptStatusSuccessful, types.FrameReceiptStatusSkipped})
+	if err != nil {
+		t.Fatalf("past successful status failed: %v", err)
+	}
+	if !got.Eq(uint256.NewInt(1)) {
+		t.Fatalf("past successful status = %d, want 1", got.Uint64())
+	}
+	got, err = run(1, 2, []uint8{types.FrameReceiptStatusSuccessful, types.FrameReceiptStatusSkipped})
+	if err != nil {
+		t.Fatalf("past skipped status failed: %v", err)
+	}
+	if !got.IsZero() {
+		t.Fatalf("past skipped status = %d, want 0", got.Uint64())
+	}
+	for _, tt := range []struct {
+		name         string
+		frameIndex   uint64
+		currentIndex uint64
+	}{
+		{"current", 1, 1},
+		{"future", 2, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := run(tt.frameIndex, tt.currentIndex, []uint8{types.FrameReceiptStatusSuccessful})
+			var invalid *ErrInvalidOpCode
+			if !errors.As(err, &invalid) {
+				t.Fatalf("expected ErrInvalidOpCode, got %v", err)
+			}
+			if invalid.opcode != FRAMEPARAM {
+				t.Fatalf("invalid opcode: got %s, want %s", invalid.opcode, FRAMEPARAM)
+			}
+		})
 	}
 }
 

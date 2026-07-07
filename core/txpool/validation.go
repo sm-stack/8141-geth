@@ -136,15 +136,7 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 			}
 		}
 	}
-	// For frame transactions, the effective gas limit includes calldata gas.
 	txGasLimit := tx.Gas()
-	if frameTx != nil {
-		calldataGas, err := frameTx.CalldataGas()
-		if err != nil {
-			return fmt.Errorf("%w: %v", core.ErrFrameTxInvalid, err)
-		}
-		txGasLimit += calldataGas
-	}
 	if rules.IsOsaka && txGasLimit > params.MaxTxGas {
 		return fmt.Errorf("%w (cap: %d, tx: %d)", core.ErrGasLimitTooHigh, params.MaxTxGas, txGasLimit)
 	}
@@ -174,11 +166,10 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	// Ensure the transaction has more gas than the bare minimum needed to cover
 	// the transaction metadata
 	if frameTx != nil {
-		calldataGas, err := frameTx.CalldataGas()
+		intrGas, err := frameTx.IntrinsicGas()
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrFrameTxInvalid, err)
 		}
-		intrGas := params.TxGasEIP8141 + calldataGas
 		if txGasLimit < intrGas {
 			return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrIntrinsicGas, txGasLimit, intrGas)
 		}

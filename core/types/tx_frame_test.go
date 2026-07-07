@@ -100,6 +100,44 @@ func testFrameTxSigHashVector() *FrameTx {
 	}
 }
 
+func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
+	var tokens uint64
+	for _, chunk := range [][]byte{ftx.rlpFramesData(), ftx.rlpSignaturesData()} {
+		for _, b := range chunk {
+			if b == 0 {
+				tokens++
+			} else {
+				tokens += params.TxTokenPerNonZeroByte
+			}
+		}
+	}
+	return tokens * params.TxCostFloorPerToken
+}
+
+func expectedFrameTxSignatureGas(t *testing.T, ftx *FrameTx) uint64 {
+	t.Helper()
+	var gas uint64
+	for _, sig := range ftx.Signatures {
+		switch sig.Scheme {
+		case SignatureSchemeSecp256k1:
+			gas += params.SigGasSecp256k1
+		case SignatureSchemeP256:
+			gas += params.SigGasP256
+		default:
+			t.Fatalf("unsupported signature scheme %d", sig.Scheme)
+		}
+	}
+	return gas
+}
+
+func expectedFrameTxIntrinsicGas(t *testing.T, ftx *FrameTx) uint64 {
+	t.Helper()
+	return params.TxGasEIP8141 +
+		uint64(len(ftx.Frames))*params.FrameTxPerFrameGas +
+		expectedFrameTxCalldataGas(ftx) +
+		expectedFrameTxSignatureGas(t, ftx)
+}
+
 func TestFrameTxType(t *testing.T) {
 	ftx := testFrameTx()
 	if ftx.txType() != FrameTxType {
@@ -112,7 +150,10 @@ func TestFrameTxType(t *testing.T) {
 
 func TestFrameTxTotalGas(t *testing.T) {
 	ftx := testFrameTx()
-	want := uint64(params.TxGasEIP8141) + 100_000 + 200_000
+	want := expectedFrameTxIntrinsicGas(t, ftx)
+	for _, frame := range ftx.Frames {
+		want += frame.GasLimit
+	}
 	if got := ftx.TotalGas(); got != want {
 		t.Errorf("TotalGas() = %d, want %d", got, want)
 	}
@@ -223,11 +264,31 @@ func TestFrameTxSigHashCommitsVerifyDataAndElidesEmptySignatureData(t *testing.T
 }
 
 func TestFrameTxSignatureGasConstants(t *testing.T) {
+	if params.FrameTxPerFrameGas != 475 {
+		t.Fatalf("FrameTxPerFrameGas = %d, want 475", params.FrameTxPerFrameGas)
+	}
 	if params.SigGasSecp256k1 != 2800 {
 		t.Fatalf("SigGasSecp256k1 = %d, want 2800", params.SigGasSecp256k1)
 	}
 	if params.SigGasP256 != 6700 {
 		t.Fatalf("SigGasP256 = %d, want 6700", params.SigGasP256)
+	}
+}
+
+func TestFrameTxSignatureGas(t *testing.T) {
+	ftx := testFrameTx()
+	want := expectedFrameTxSignatureGas(t, ftx)
+	got, err := ftx.SignatureGas()
+	if err != nil {
+		t.Fatalf("SignatureGas() unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("SignatureGas() = %d, want %d", got, want)
+	}
+
+	ftx.Signatures = append(ftx.Signatures, TxSignature{Scheme: 0xff})
+	if _, err := ftx.SignatureGas(); err == nil {
+		t.Fatal("SignatureGas() accepted unsupported scheme")
 	}
 }
 
@@ -505,8 +566,20 @@ func TestFrameTxTotalGasOverflow(t *testing.T) {
 	}
 }
 
-// TestFrameTxCalldataGas verifies CalldataGas() returns (uint64, nil) on normal input
-// and that the gas value is proportional to the frame data size.
+func TestFrameTxIntrinsicGas(t *testing.T) {
+	ftx := testFrameTx()
+	want := expectedFrameTxIntrinsicGas(t, ftx)
+	got, err := ftx.IntrinsicGas()
+	if err != nil {
+		t.Fatalf("IntrinsicGas() unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("IntrinsicGas() = %d, want %d", got, want)
+	}
+}
+
+// TestFrameTxCalldataGas verifies CalldataGas() returns the EIP-7623 token cost
+// of the RLP-encoded frames and signatures.
 func TestFrameTxCalldataGas(t *testing.T) {
 	// Normal tx with frame data: should return a positive gas value with no error.
 	ftx := testFrameTx()
@@ -516,6 +589,9 @@ func TestFrameTxCalldataGas(t *testing.T) {
 	}
 	if gas == 0 {
 		t.Error("CalldataGas() returned 0 for a tx with non-empty frame data")
+	}
+	if want := expectedFrameTxCalldataGas(ftx); gas != want {
+		t.Fatalf("CalldataGas() = %d, want %d", gas, want)
 	}
 	ftxNoSignatures := ftx.copy().(*FrameTx)
 	ftxNoSignatures.Signatures = nil
@@ -539,22 +615,25 @@ func TestFrameTxCalldataGas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CalldataGas() for empty frames unexpected error: %v", err)
 	}
+	if want := expectedFrameTxCalldataGas(ftxEmpty); gasEmpty != want {
+		t.Fatalf("CalldataGas() empty = %d, want %d", gasEmpty, want)
+	}
 	// Empty frame list RLP is minimal; gas from non-empty frames should be higher.
 	if gasEmpty >= gas {
 		t.Errorf("empty frames CalldataGas %d should be < non-empty frames CalldataGas %d", gasEmpty, gas)
 	}
 }
 
-// TestFrameTxFloorDataGas verifies FloorDataGas() returns (uint64, nil) on normal input
-// and that the result is at least TxGasEIP8141.
+// TestFrameTxFloorDataGas verifies FloorDataGas() returns the full EIP-8141
+// intrinsic metadata cost for a frame transaction.
 func TestFrameTxFloorDataGas(t *testing.T) {
 	ftx := testFrameTx()
 	floor, err := ftx.FloorDataGas()
 	if err != nil {
 		t.Fatalf("FloorDataGas() unexpected error: %v", err)
 	}
-	if floor < uint64(params.TxGasEIP8141) {
-		t.Errorf("FloorDataGas() = %d, want >= TxGasEIP8141 (%d)", floor, params.TxGasEIP8141)
+	if want := expectedFrameTxIntrinsicGas(t, ftx); floor != want {
+		t.Errorf("FloorDataGas() = %d, want %d", floor, want)
 	}
 	ftxNoSignatures := ftx.copy().(*FrameTx)
 	ftxNoSignatures.Signatures = nil
@@ -566,7 +645,7 @@ func TestFrameTxFloorDataGas(t *testing.T) {
 		t.Errorf("FloorDataGas() with signatures = %d, want > without signatures %d", floor, noSigFloor)
 	}
 
-	// Empty frames: floor = TxGasEIP8141 + cost of minimal RLP list.
+	// Empty frames: floor still includes base gas and minimal RLP list costs.
 	ftxEmpty := &FrameTx{
 		ChainID:    uint256.NewInt(1),
 		Sender:     common.Address{},
@@ -578,8 +657,8 @@ func TestFrameTxFloorDataGas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FloorDataGas() for empty frames unexpected error: %v", err)
 	}
-	if floorEmpty < uint64(params.TxGasEIP8141) {
-		t.Errorf("FloorDataGas() empty = %d, want >= TxGasEIP8141 (%d)", floorEmpty, params.TxGasEIP8141)
+	if want := expectedFrameTxIntrinsicGas(t, ftxEmpty); floorEmpty != want {
+		t.Errorf("FloorDataGas() empty = %d, want %d", floorEmpty, want)
 	}
 }
 

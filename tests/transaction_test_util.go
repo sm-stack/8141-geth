@@ -81,7 +81,12 @@ func (tt *TransactionTest) Run() error {
 			return
 		}
 		// Intrinsic gas
-		requiredGas, err = core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		frameTx := tx.GetFrameTx()
+		if frameTx != nil {
+			requiredGas, err = frameTx.IntrinsicGas()
+		} else {
+			requiredGas, err = core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		}
 		if err != nil {
 			return
 		}
@@ -91,7 +96,11 @@ func (tt *TransactionTest) Run() error {
 
 		if rules.IsPrague {
 			var floorDataGas uint64
-			floorDataGas, err = core.FloorDataGas(tx.Data())
+			if frameTx != nil {
+				floorDataGas, err = frameTx.FloorDataGas()
+			} else {
+				floorDataGas, err = core.FloorDataGas(tx.Data())
+			}
 			if err != nil {
 				return
 			}

@@ -156,23 +156,6 @@ type FrameTx struct {
 	BlobHashes []common.Hash // blob_versioned_hashes
 }
 
-// TotalGas returns the total gas limit of the frame transaction as defined in
-// EIP-8141: FRAME_TX_INTRINSIC_COST + calldata_cost(rlp(frames)) + sum(frame.gas_limit).
-// The calldata cost is not included here as it requires the encoded frame data;
-// this method returns the sum of frame gas limits plus intrinsic cost.
-// On overflow, math.MaxUint64 is returned; callers relying on this value for
-// gas pool or block limit checks will reject the transaction appropriately.
-func (tx *FrameTx) TotalGas() uint64 {
-	total := uint64(params.TxGasEIP8141)
-	for _, f := range tx.Frames {
-		if f.GasLimit > math.MaxUint64-total {
-			return math.MaxUint64
-		}
-		total += f.GasLimit
-	}
-	return total
-}
-
 // copy creates a deep copy of the transaction data and initializes all fields.
 func (tx *FrameTx) copy() TxData {
 	cpy := &FrameTx{
@@ -302,25 +285,55 @@ func countZeroNonZero(chunks ...[]byte) (uint64, uint64) {
 	return z, nz
 }
 
-// CalldataGas returns the calldata cost of the RLP-encoded frames and signatures.
-// Per EIP-8141: calldata_cost(rlp(tx.frames)) + calldata_cost(rlp(tx.signatures)).
-// Returns errFrameGasUintOverflow if the result would exceed uint64.
-func (tx *FrameTx) CalldataGas() (uint64, error) {
-	z, nz := countZeroNonZero(tx.frameTxCalldataBytes()...)
-	if nz > 0 && (math.MaxUint64/params.TxDataNonZeroGasEIP2028) < nz {
-		return 0, errFrameGasUintOverflow
+// SignatureGas returns the transaction-level signature verification gas.
+func (tx *FrameTx) SignatureGas() (uint64, error) {
+	var total uint64
+	for _, sig := range tx.Signatures {
+		var gas uint64
+		switch sig.Scheme {
+		case SignatureSchemeSecp256k1:
+			gas = params.SigGasSecp256k1
+		case SignatureSchemeP256:
+			gas = params.SigGasP256
+		default:
+			return 0, fmt.Errorf("unsupported signature scheme %d", sig.Scheme)
+		}
+		var overflow bool
+		if total, overflow = commonmath.SafeAdd(total, gas); overflow {
+			return 0, errFrameGasUintOverflow
+		}
 	}
-	nzGas := nz * params.TxDataNonZeroGasEIP2028
-	if z > 0 && (math.MaxUint64-nzGas)/params.TxDataZeroGas < z {
-		return 0, errFrameGasUintOverflow
-	}
-	return nzGas + z*params.TxDataZeroGas, nil
+	return total, nil
 }
 
-// FloorDataGas returns the EIP-7623 floor data gas for a frame transaction.
-// floor = TxGasEIP8141 + tokens * TxCostFloorPerToken
+func (tx *FrameTx) fixedGas() (uint64, error) {
+	total := params.TxGasEIP8141
+	frameGas, overflow := commonmath.SafeMul(uint64(len(tx.Frames)), params.FrameTxPerFrameGas)
+	if overflow {
+		return 0, errFrameGasUintOverflow
+	}
+	if total, overflow = commonmath.SafeAdd(total, frameGas); overflow {
+		return 0, errFrameGasUintOverflow
+	}
+	signatureGas, err := tx.SignatureGas()
+	if err != nil {
+		return 0, err
+	}
+	if total, overflow = commonmath.SafeAdd(total, signatureGas); overflow {
+		return 0, errFrameGasUintOverflow
+	}
+	return total, nil
+}
+
+// CalldataGas returns the EIP-7623 calldata cost of the RLP-encoded frames and
+// signatures.
+//
+// Per EIP-8141:
+//
+//	calldata_cost(rlp(tx.frames)) + calldata_cost(rlp(tx.signatures))
+//
 // Returns errFrameGasUintOverflow if the result would exceed uint64.
-func (tx *FrameTx) FloorDataGas() (uint64, error) {
+func (tx *FrameTx) CalldataGas() (uint64, error) {
 	z, nz := countZeroNonZero(tx.frameTxCalldataBytes()...)
 	if nz > 0 && (math.MaxUint64/params.TxTokenPerNonZeroByte) < nz {
 		return 0, errFrameGasUintOverflow
@@ -333,11 +346,64 @@ func (tx *FrameTx) FloorDataGas() (uint64, error) {
 	if tokens > 0 && (math.MaxUint64/params.TxCostFloorPerToken) < tokens {
 		return 0, errFrameGasUintOverflow
 	}
-	floorGas := tokens * params.TxCostFloorPerToken
-	if floorGas > math.MaxUint64-params.TxGasEIP8141 {
+	return tokens * params.TxCostFloorPerToken, nil
+}
+
+// IntrinsicGas returns the non-frame-execution gas charged by a frame
+// transaction:
+//
+//	FRAME_TX_INTRINSIC_COST
+//	+ len(frames) * FRAME_TX_PER_FRAME_COST
+//	+ calldata_cost(rlp(signatures))
+//	+ calldata_cost(rlp(frames))
+//	+ signature_verification_cost
+func (tx *FrameTx) IntrinsicGas() (uint64, error) {
+	total, err := tx.fixedGas()
+	if err != nil {
+		return 0, err
+	}
+	calldataGas, err := tx.CalldataGas()
+	if err != nil {
+		return 0, err
+	}
+	var overflow bool
+	if total, overflow = commonmath.SafeAdd(total, calldataGas); overflow {
 		return 0, errFrameGasUintOverflow
 	}
-	return params.TxGasEIP8141 + floorGas, nil
+	return total, nil
+}
+
+// TotalGas returns the total gas limit of the frame transaction as defined in
+// EIP-8141:
+//
+//	FRAME_TX_INTRINSIC_COST
+//	+ len(frames) * FRAME_TX_PER_FRAME_COST
+//	+ calldata_cost(rlp(signatures))
+//	+ calldata_cost(rlp(frames))
+//	+ signature_verification_cost
+//	+ sum(frame.gas_limit)
+//
+// On overflow, math.MaxUint64 is returned; callers relying on this value for
+// gas pool or block limit checks will reject the transaction appropriately.
+func (tx *FrameTx) TotalGas() uint64 {
+	total, err := tx.IntrinsicGas()
+	if err != nil {
+		return math.MaxUint64
+	}
+	for _, f := range tx.Frames {
+		var overflow bool
+		if total, overflow = commonmath.SafeAdd(total, f.GasLimit); overflow {
+			return math.MaxUint64
+		}
+	}
+	return total
+}
+
+// FloorDataGas returns the EIP-7623 floor data gas for a frame transaction.
+// EIP-8141 charges frame calldata with EIP-7623 rules up front, so the floor
+// matches the full intrinsic metadata gas.
+func (tx *FrameTx) FloorDataGas() (uint64, error) {
+	return tx.IntrinsicGas()
 }
 
 // SigHash returns the exported signature hash for the frame transaction.

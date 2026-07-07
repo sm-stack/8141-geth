@@ -134,7 +134,13 @@ func Transaction(ctx *cli.Context) error {
 		}
 		// Check intrinsic gas
 		rules := chainConfig.Rules(common.Big0, true, 0)
-		gas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		frameTx := tx.GetFrameTx()
+		var gas uint64
+		if frameTx != nil {
+			gas, err = frameTx.IntrinsicGas()
+		} else {
+			gas, err = core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		}
 		if err != nil {
 			r.Error = err
 			results = append(results, r)
@@ -148,7 +154,12 @@ func Transaction(ctx *cli.Context) error {
 		}
 		// For Prague txs, validate the floor data gas.
 		if rules.IsPrague {
-			floorDataGas, err := core.FloorDataGas(tx.Data())
+			var floorDataGas uint64
+			if frameTx != nil {
+				floorDataGas, err = frameTx.FloorDataGas()
+			} else {
+				floorDataGas, err = core.FloorDataGas(tx.Data())
+			}
 			if err != nil {
 				r.Error = err
 				results = append(results, r)
