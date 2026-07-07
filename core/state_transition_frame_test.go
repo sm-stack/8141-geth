@@ -404,6 +404,77 @@ func TestFrameTxAtomicBatchFailureRollsBackAndSkips(t *testing.T) {
 	}
 }
 
+func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	sponsor := common.HexToAddress("0x2222")
+	failingTarget := common.HexToAddress("0x3333")
+	successTarget := common.HexToAddress("0x4444")
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e15), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(sponsor)
+	statedb.SetCode(sponsor, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sponsor, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	statedb.CreateAccount(failingTarget)
+	statedb.SetCode(failingTarget, revertCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(successTarget)
+	statedb.SetCode(successTarget, storeTwoCode, tracing.CodeChangeUnspecified)
+
+	sponsorBalBefore := statedb.GetBalance(sponsor).Clone()
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 2, Target: nil, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 1, Target: &sponsor, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeSender, Target: &failingTarget, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeSender, Target: &successTarget, GasLimit: 100000, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	wantResults := []uint8{
+		types.FrameReceiptStatusSuccessful,
+		types.FrameReceiptStatusSuccessful,
+		types.FrameReceiptStatusFailed,
+		types.FrameReceiptStatusSuccessful,
+	}
+	if got := result.frameResults; len(got) != len(wantResults) {
+		t.Fatalf("frame results length: got %d want %d (%v)", len(got), len(wantResults), got)
+	} else {
+		for i := range got {
+			if got[i] != wantResults[i] {
+				t.Fatalf("frame results: got %v want %v", got, wantResults)
+			}
+		}
+	}
+	if got := statedb.GetNonce(sender); got != 1 {
+		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+	if sponsorBalAfter := statedb.GetBalance(sponsor); sponsorBalAfter.Cmp(sponsorBalBefore) >= 0 {
+		t.Fatalf("sponsor balance should have paid gas: before=%s after=%s", sponsorBalBefore, sponsorBalAfter)
+	}
+	if got, want := statedb.GetState(successTarget, common.BytesToHash([]byte{0x01})), common.BytesToHash([]byte{0x02}); got != want {
+		t.Fatalf("post-batch SENDER frame storage: got %v, want %v", got, want)
+	}
+}
+
 // TestFrameTxSenderNotApproved tests that SENDER mode before sender approval fails.
 func TestFrameTxSenderNotApproved(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()

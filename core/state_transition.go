@@ -55,6 +55,14 @@ type frameApprovalState struct {
 	senderApproved bool
 	payerApproved  bool
 	payer          common.Address
+	paymentEffect  *framePaymentEffect
+}
+
+type framePaymentEffect struct {
+	frameIndex       int
+	payer            common.Address
+	gasCharge        *uint256.Int
+	senderNonceAfter uint64
 }
 
 func emptyFrameLogRange() frameLogRange {
@@ -71,6 +79,17 @@ func atomicBatchBounds(frames []types.Frame, index int) (int, int, bool) {
 		end++
 	}
 	return start, end, end > start
+}
+
+// reapplyPaymentEffect restores tx-scoped payment approval effects after an
+// atomic batch rollback reverts the StateDB journal entries that applied them.
+func (a *frameApprovalState) reapplyPaymentEffect(st *stateTransition, batchStart, rollbackEnd int) {
+	effect := a.paymentEffect
+	if effect == nil || effect.frameIndex < batchStart || effect.frameIndex > rollbackEnd {
+		return
+	}
+	st.state.SubBalance(effect.payer, new(uint256.Int).Set(effect.gasCharge), tracing.BalanceDecreaseGasBuy)
+	st.state.SetNonce(st.msg.From, effect.senderNonceAfter, tracing.NonceChangeEoACall)
 }
 
 // Unwrap returns the internal evm error which allows us for further
@@ -835,9 +854,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 	defer func() { st.evm.FrameCtx = nil }()
 
 	var (
-		senderApproved bool
-		payerApproved  bool
-		payer          common.Address
+		approvals      frameApprovalState
 		totalGasUsed   uint64
 		frameGasUsed   = make([]uint64, len(msg.Frames))
 		frameResults   = make([]uint8, len(msg.Frames))
@@ -845,7 +862,6 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		batchStart     = -1
 		batchEnd       = -1
 		batchSnapshot  int
-		batchApprovals frameApprovalState
 	)
 
 	for i := 0; i < len(msg.Frames); i++ {
@@ -861,11 +877,6 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			batchStart, batchEnd = currentBatchStart, currentBatchEnd
 			if inAtomicBatch {
 				batchSnapshot = st.state.Snapshot()
-				batchApprovals = frameApprovalState{
-					senderApproved: senderApproved,
-					payerApproved:  payerApproved,
-					payer:          payer,
-				}
 			}
 		}
 		logStart := st.state.TxLogSize()
@@ -887,7 +898,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		case types.FrameModeDefault, types.FrameModeVerify:
 			caller = params.FrameEntryPointAddress
 		case types.FrameModeSender:
-			if !senderApproved {
+			if !approvals.senderApproved {
 				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: SENDER mode in frame %d before sender approved", ErrFrameTxInvalid, i)
 			}
 			caller = msg.From
@@ -939,9 +950,10 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			frameReverted = true
 			if inAtomicBatch {
 				st.state.RevertToSnapshot(batchSnapshot)
-				senderApproved = batchApprovals.senderApproved
-				payerApproved = batchApprovals.payerApproved
-				payer = batchApprovals.payer
+				if senderChanged {
+					approvals.senderApproved = false
+				}
+				approvals.reapplyPaymentEffect(st, batchStart, i)
 				for j := batchStart; j <= i; j++ {
 					frameLogRanges[j] = emptyFrameLogRange()
 				}
@@ -955,7 +967,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			} else {
 				st.state.RevertToSnapshot(snapshot)
 				if senderChanged {
-					senderApproved = false
+					approvals.senderApproved = false
 				}
 				frameLogRanges[i] = emptyFrameLogRange()
 			}
@@ -977,10 +989,10 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			// but we keep this check as defense-in-depth.
 			if approveStatus&vm.ApproveExecution != 0 {
 				if target == msg.From {
-					if senderApproved {
+					if approvals.senderApproved {
 						needRevert = true
 					} else {
-						senderApproved = true
+						approvals.senderApproved = true
 						senderChanged = true
 					}
 				}
@@ -988,17 +1000,25 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 
 			// Rule for payment approval.
 			if !needRevert && approveStatus&vm.ApprovePayment != 0 {
-				if !senderApproved {
+				if !approvals.senderApproved {
 					needRevert = true
-				} else if payerApproved {
+				} else if approvals.payerApproved {
 					needRevert = true
 				} else {
-					if err := st.collectGasFromPayer(target); err != nil {
+					gasCharge, err := st.collectGasFromPayer(target)
+					if err != nil {
 						return common.Address{}, nil, nil, nil, err
 					}
-					payer = target
-					payerApproved = true
-					st.state.SetNonce(msg.From, st.state.GetNonce(msg.From)+1, tracing.NonceChangeEoACall)
+					approvals.payer = target
+					approvals.payerApproved = true
+					senderNonceAfter := st.state.GetNonce(msg.From) + 1
+					st.state.SetNonce(msg.From, senderNonceAfter, tracing.NonceChangeEoACall)
+					approvals.paymentEffect = &framePaymentEffect{
+						frameIndex:       i,
+						payer:            target,
+						gasCharge:        gasCharge,
+						senderNonceAfter: senderNonceAfter,
+					}
 				}
 			}
 
@@ -1033,14 +1053,14 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		}
 	}
 
-	if !payerApproved {
+	if !approvals.payerApproved {
 		return common.Address{}, nil, nil, nil, ErrFrameTxPayerNotApproved
 	}
 
 	// Subtract total frame gas usage from remaining gas.
 	st.gasRemaining -= totalGasUsed
 
-	return payer, frameResults, frameGasUsed, frameLogRanges, nil
+	return approvals.payer, frameResults, frameGasUsed, frameLogRanges, nil
 }
 
 // hasNoCode returns true if the given address has no code (is an EOA).
@@ -1060,7 +1080,7 @@ func (st *stateTransition) hasNoCode(addr common.Address) bool {
 
 // collectGasFromPayer charges the total transaction gas cost from the payer account.
 // This is called when a frame APPROVEs payment.
-func (st *stateTransition) collectGasFromPayer(payer common.Address) error {
+func (st *stateTransition) collectGasFromPayer(payer common.Address) (*uint256.Int, error) {
 	msg := st.msg
 
 	// Calculate actual charge: gasLimit * effectiveGasPrice.
@@ -1086,13 +1106,13 @@ func (st *stateTransition) collectGasFromPayer(payer common.Address) error {
 
 	balanceCheckU256, overflow := uint256.FromBig(balanceCheck)
 	if overflow {
-		return fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
+		return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
 	}
 	if have, want := st.state.GetBalance(payer), balanceCheckU256; have.Cmp(want) < 0 {
-		return fmt.Errorf("%w: payer %v have %v want %v", ErrInsufficientFunds, payer.Hex(), have, want)
+		return nil, fmt.Errorf("%w: payer %v have %v want %v", ErrInsufficientFunds, payer.Hex(), have, want)
 	}
 
 	mgvalU256, _ := uint256.FromBig(mgval)
 	st.state.SubBalance(payer, mgvalU256, tracing.BalanceDecreaseGasBuy)
-	return nil
+	return mgvalU256, nil
 }
