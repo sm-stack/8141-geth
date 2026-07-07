@@ -26,50 +26,26 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
 )
 
-// buildEOASenderData builds the frame.data for EOA default code SENDER mode.
-//
-// Layout: [byte0, RLP-encoded [[target, value, data], ...]]
-// byte0: 0x02 (high nibble = 0, low nibble = SENDER mode = 2)
-func buildEOASenderData(calls []struct {
-	Target common.Address
-	Value  *big.Int
-	Data   []byte
-}) []byte {
-	type eoaCall struct {
-		Target common.Address
-		Value  *big.Int
-		Data   []byte
-	}
-
-	encoded := make([]eoaCall, len(calls))
-	for i, c := range calls {
-		encoded[i] = eoaCall{Target: c.Target, Value: c.Value, Data: c.Data}
-	}
-
-	rlpData, err := rlp.EncodeToBytes(encoded)
-	if err != nil {
-		panic(err)
-	}
-
-	// byte0: high nibble = 0, low nibble = 2 (SENDER)
-	result := make([]byte, 1+len(rlpData))
-	result[0] = 0x02
-	copy(result[1:], rlpData)
-	return result
+func addEOADefaultSignature(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
+	addEOADefaultSignatureForMsg(ftx, chainID, key, nil)
 }
 
-func addEOADefaultSignature(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
+func addEOADefaultSignatureForMsg(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey, msg []byte) {
 	signer := crypto.PubkeyToAddress(key.PublicKey)
 	ftx.Signatures = append(ftx.Signatures, types.TxSignature{
 		Scheme: types.SignatureSchemeSecp256k1,
 		Signer: signer,
+		Msg:    common.CopyBytes(msg),
 	})
-	sigHash := ftx.SigHash(chainID)
-	sig, err := crypto.Sign(sigHash[:], key)
+	signingMsg := msg
+	if len(signingMsg) == 0 {
+		sigHash := ftx.SigHash(chainID)
+		signingMsg = sigHash[:]
+	}
+	sig, err := crypto.Sign(signingMsg, key)
 	if err != nil {
 		panic(err)
 	}
@@ -97,30 +73,21 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 
 	// Recipient exists.
 	statedb.CreateAccount(recipient)
+	transfer := uint256.NewInt(1_000_000_000_000_000)
 
-	// Build the frame transaction (data will be filled after sig hash).
 	ftx := &types.FrameTx{
 		ChainID: uint256.NewInt(config.ChainID.Uint64()),
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeSender, Target: &recipient, GasLimit: 100000, Value: transfer, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
 		BlobFeeCap: new(uint256.Int),
 	}
 
-	// Build sender frame data: send 1 ETH to recipient.
-	senderData := buildEOASenderData([]struct {
-		Target common.Address
-		Value  *big.Int
-		Data   []byte
-	}{
-		{Target: recipient, Value: big.NewInt(1e15), Data: nil},
-	})
-	ftx.Frames[1].Data = senderData
 	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
@@ -139,10 +106,9 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 
 	// Verify recipient received ETH.
 	recipientBal := statedb.GetBalance(recipient)
-	if recipientBal.IsZero() {
-		t.Fatal("recipient should have received ETH")
+	if recipientBal.Cmp(transfer) != 0 {
+		t.Fatalf("recipient balance: got %s, want %s", recipientBal, transfer)
 	}
-	t.Logf("recipient balance: %s", recipientBal)
 }
 
 // TestEOADefaultCodeVerifyOnly tests EOA VERIFY with APPROVE(0x3) and no SENDER frame.
@@ -242,8 +208,9 @@ func TestEOADefaultCodeTxSignatureRequiresAllowedScope(t *testing.T) {
 	}
 }
 
-// TestEOADefaultCodeInvalidDataLength tests that wrong data length for ECDSA fails.
-func TestEOADefaultCodeInvalidDataLength(t *testing.T) {
+// TestEOADefaultCodeRejectsFrameDataSignature tests that old VERIFY frame-data
+// signatures are ignored; approval requires a matching tx.signatures entry.
+func TestEOADefaultCodeRejectsFrameDataSignature(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	key, _ := crypto.GenerateKey()
@@ -257,9 +224,9 @@ func TestEOADefaultCodeInvalidDataLength(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000,
-				// byte0 = 0x21 (scope=2, mode=VERIFY), sig_type=0x00, then only 10 bytes of garbage
-				Data: append([]byte{0x21, 0x00}, make([]byte, 10)...)},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000,
+				// Old layout: byte0, sig_type=secp256k1, v, r, s. This must not be parsed.
+				Data: append([]byte{0x21, 0x00}, make([]byte, 65)...)},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -269,13 +236,14 @@ func TestEOADefaultCodeInvalidDataLength(t *testing.T) {
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	_, err := applyFrameTx(evm, config, msg)
 	if err == nil {
-		t.Fatal("expected error for invalid data length")
+		t.Fatal("expected error for old frame-data signature without tx-level signature")
 	}
 	t.Logf("got expected error: %v", err)
 }
 
-// TestEOADefaultCodeDefaultModeReverts tests that DEFAULT mode always reverts for EOAs.
-func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
+// TestEOADefaultCodeDefaultModeSucceeds tests that DEFAULT mode on an EOA
+// behaves like a call to empty code.
+func TestEOADefaultCodeDefaultModeSucceeds(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	key, _ := crypto.GenerateKey()
@@ -295,9 +263,7 @@ func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
 		Sender:  sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
-			// DEFAULT mode frame targeting an EOA — should revert (non-fatal).
 			{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000,
-				// byte0: high nibble=0, low nibble=0 (DEFAULT mode)
 				Data: []byte{0x00}},
 		},
 		GasTipCap:  uint256.NewInt(1),
@@ -310,10 +276,11 @@ func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
-	// The transaction should succeed overall (payer approved in frame 0).
-	// Frame 1 (DEFAULT on EOA) should have reverted, but that's non-fatal.
 	if result.Failed() {
 		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got := result.frameResults; len(got) != 2 || got[1] != types.FrameReceiptStatusSuccessful {
+		t.Fatalf("frame results: got %v, want DEFAULT EOA frame success", got)
 	}
 }
 
@@ -340,30 +307,22 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 
 	// Recipient exists.
 	statedb.CreateAccount(recipient)
+	transfer := uint256.NewInt(1_000_000_000_000_000)
 
 	ftx := &types.FrameTx{
 		ChainID: uint256.NewInt(config.ChainID.Uint64()),
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil},      // EOA VERIFY
-			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 100000, Data: nil}, // Sponsor VERIFY
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},                // SENDER call
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil},               // EOA VERIFY
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 100000, Data: nil},          // Sponsor VERIFY
+			{Mode: types.FrameModeSender, Target: &recipient, GasLimit: 100000, Value: transfer, Data: nil}, // SENDER call
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
 		BlobFeeCap: new(uint256.Int),
 	}
 
-	// Build SENDER data: send ETH to recipient.
-	senderData := buildEOASenderData([]struct {
-		Target common.Address
-		Value  *big.Int
-		Data   []byte
-	}{
-		{Target: recipient, Value: big.NewInt(1e15), Data: nil},
-	})
-	ftx.Frames[2].Data = senderData
 	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
@@ -376,13 +335,14 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 	}
 
 	// Verify recipient got ETH.
-	if statedb.GetBalance(recipient).IsZero() {
-		t.Fatal("recipient should have received ETH")
+	if got := statedb.GetBalance(recipient); got.Cmp(transfer) != 0 {
+		t.Fatalf("recipient balance: got %s, want %s", got, transfer)
 	}
 }
 
-// TestEOADefaultCodeEmptyData tests that empty frame data reverts for EOA.
-func TestEOADefaultCodeEmptyData(t *testing.T) {
+// TestEOADefaultCodeMissingTxSignature tests that VERIFY fails without a
+// matching tx-level signature even when frame data is empty.
+func TestEOADefaultCodeMissingTxSignature(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	key, _ := crypto.GenerateKey()
@@ -396,8 +356,7 @@ func TestEOADefaultCodeEmptyData(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			// Empty data on an EOA VERIFY frame — should fail.
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: []byte{}},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: []byte{}},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -407,24 +366,19 @@ func TestEOADefaultCodeEmptyData(t *testing.T) {
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	_, err := applyFrameTx(evm, config, msg)
 	if err == nil {
-		t.Fatal("expected error for empty data on EOA VERIFY frame")
+		t.Fatal("expected error for missing tx-level signature")
 	}
 	t.Logf("got expected error: %v", err)
 }
 
-// TestEOADefaultCodeSenderMultipleCalls tests SENDER mode with multiple calls.
-func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
+func TestEOADefaultCodeRequiresEmptyMsgSignature(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	key, _ := crypto.GenerateKey()
 	sender := crypto.PubkeyToAddress(key.PublicKey)
-	recipient1 := common.HexToAddress("0x2222")
-	recipient2 := common.HexToAddress("0x3333")
 
 	statedb.CreateAccount(sender)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
-	statedb.CreateAccount(recipient1)
-	statedb.CreateAccount(recipient2)
 
 	ftx := &types.FrameTx{
 		ChainID: uint256.NewInt(config.ChainID.Uint64()),
@@ -432,23 +386,47 @@ func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
 		Sender:  sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 200000, Data: nil},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	msg32 := make([]byte, 32)
+	msg32[31] = 1
+	addEOADefaultSignatureForMsg(ftx, config.ChainID, key, msg32)
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	_, err := applyFrameTx(evm, config, msg)
+	if err == nil {
+		t.Fatal("expected error for explicit-msg tx-level signature")
+	}
+	t.Logf("got expected error: %v", err)
+}
+
+// TestEOADefaultCodeSenderModeSucceedsAsEmptyCall tests that SENDER mode
+// targeting the EOA itself ignores calldata and succeeds like empty code.
+func TestEOADefaultCodeSenderModeSucceedsAsEmptyCall(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	key, _ := crypto.GenerateKey()
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 200000, Data: []byte{0xff, 0xee}},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
 		BlobFeeCap: new(uint256.Int),
 	}
 
-	// Build SENDER data with 2 calls.
-	senderData := buildEOASenderData([]struct {
-		Target common.Address
-		Value  *big.Int
-		Data   []byte
-	}{
-		{Target: recipient1, Value: big.NewInt(1e15), Data: nil},
-		{Target: recipient2, Value: big.NewInt(2e15), Data: nil},
-	})
-	ftx.Frames[1].Data = senderData
 	addEOADefaultSignature(ftx, config.ChainID, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
@@ -459,12 +437,7 @@ func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
 	if result.Failed() {
 		t.Fatalf("execution result failed: %v", result.Err)
 	}
-
-	// Both recipients should have received ETH.
-	bal1 := statedb.GetBalance(recipient1)
-	bal2 := statedb.GetBalance(recipient2)
-	if bal1.IsZero() || bal2.IsZero() {
-		t.Fatalf("recipients should have received ETH: bal1=%s, bal2=%s", bal1, bal2)
+	if got := result.frameResults; len(got) != 2 || got[1] != types.FrameReceiptStatusSuccessful {
+		t.Fatalf("frame results: got %v, want SENDER EOA frame success", got)
 	}
-	t.Logf("recipient1: %s, recipient2: %s", bal1, bal2)
 }

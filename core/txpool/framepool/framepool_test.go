@@ -17,6 +17,7 @@
 package framepool
 
 import (
+	"crypto/ecdsa"
 	"encoding/binary"
 	"math/big"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -158,6 +160,33 @@ func expiryFrameData(deadline uint64) []byte {
 	return data
 }
 
+func addFramePoolEOASignature(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
+	addFramePoolEOASignatureForMsg(ftx, chainID, key, nil)
+}
+
+func addFramePoolEOASignatureForMsg(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey, msg []byte) {
+	signer := crypto.PubkeyToAddress(key.PublicKey)
+	ftx.Signatures = append(ftx.Signatures, types.TxSignature{
+		Scheme: types.SignatureSchemeSecp256k1,
+		Signer: signer,
+		Msg:    common.CopyBytes(msg),
+	})
+	signingMsg := msg
+	if len(signingMsg) == 0 {
+		sigHash := ftx.SigHash(chainID)
+		signingMsg = sigHash[:]
+	}
+	sig, err := crypto.Sign(signingMsg, key)
+	if err != nil {
+		panic(err)
+	}
+	vrs := make([]byte, 65)
+	vrs[0] = sig[64]
+	copy(vrs[1:33], sig[0:32])
+	copy(vrs[33:65], sig[32:64])
+	ftx.Signatures[len(ftx.Signatures)-1].Signature = vrs
+}
+
 // --- Tests ---
 
 func TestFramePoolFilter(t *testing.T) {
@@ -226,6 +255,78 @@ func TestFramePoolRejectsInvalidTxSignature(t *testing.T) {
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected rejection for invalid tx-level signature")
+	}
+}
+
+func TestFramePoolEOADefaultCodeUsesTxSignatures(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
+	}
+	addFramePoolEOASignature(ftx, config.ChainID, key)
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected EOA default VERIFY with tx-level signature to be accepted, got: %v", errs[0])
+	}
+}
+
+func TestFramePoolEOADefaultCodeRejectsFrameDataSignature(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000,
+			// Old default-code frame signature layout must not approve validation.
+			Data: append([]byte{0x21, 0x00}, make([]byte, 65)...)},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for old frame-data signature without tx-level signature")
+	}
+}
+
+func TestFramePoolEOADefaultCodeRejectsExplicitMsgSignature(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
+	}
+	msg32 := make([]byte, 32)
+	msg32[31] = 1
+	addFramePoolEOASignatureForMsg(ftx, config.ChainID, key, msg32)
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for explicit-msg tx-level signature")
 	}
 }
 
