@@ -122,12 +122,15 @@ func TestNewRPCTransactionFrameTx(t *testing.T) {
 	t.Parallel()
 
 	config := params.AllEthashProtocolChanges
+	sender := common.HexToAddress("0xabcd")
 	target := common.HexToAddress("0x1234")
+	signature := bytes.Repeat([]byte{0x11}, 65)
 	ftx := &types.FrameTx{
 		ChainID:    uint256.MustFromBig(config.ChainID),
 		Nonce:      7,
-		Sender:     common.HexToAddress("0xabcd"),
-		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50_000, Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Data: []byte("call")}},
+		Sender:     sender,
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
+		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
 		GasTipCap:  uint256.NewInt(2),
 		GasFeeCap:  uint256.NewInt(100),
 		BlobFeeCap: uint256.NewInt(3),
@@ -158,17 +161,160 @@ func TestNewRPCTransactionFrameTx(t *testing.T) {
 	if len(pending.BlobVersionedHashes) != 1 {
 		t.Fatalf("blobVersionedHashes length mismatch: got %d want 1", len(pending.BlobVersionedHashes))
 	}
-	if len(pending.Frames) != 2 {
-		t.Fatalf("frames length mismatch: got %d want 2", len(pending.Frames))
+	if pending.Sender == nil || *pending.Sender != sender {
+		t.Fatalf("sender mismatch: got %v want %v", pending.Sender, sender)
 	}
-	if pending.Frames[0].Mode != types.FrameModeVerify || pending.Frames[1].Mode != types.FrameModeSender {
-		t.Fatalf("unexpected frame modes: %#v", pending.Frames)
+	if pending.Frames == nil || len(*pending.Frames) != 2 {
+		t.Fatalf("frames length mismatch: got %v want 2", pending.Frames)
+	}
+	frames := *pending.Frames
+	if frames[0].Mode != types.FrameModeVerify || frames[1].Mode != types.FrameModeSender {
+		t.Fatalf("unexpected frame modes: %#v", frames)
+	}
+	if frames[0].Flags != 3 || frames[1].Value == nil || frames[1].Value.Uint64() != 123 {
+		t.Fatalf("unexpected frame flags/value: %#v", frames)
+	}
+	if pending.Signatures == nil || len(*pending.Signatures) != 1 {
+		t.Fatalf("signatures length mismatch: got %v want 1", pending.Signatures)
+	}
+	if (*pending.Signatures)[0].Signer != sender || !bytes.Equal((*pending.Signatures)[0].Signature, signature) {
+		t.Fatalf("unexpected signatures: %#v", *pending.Signatures)
 	}
 
 	// Mined encoding: gasPrice should be min(tip+baseFee, feeCap) = min(2+10,100)=12.
 	mined := newRPCTransaction(tx, common.HexToHash("0x1"), 1, 0, 0, big.NewInt(10), config)
 	if mined.GasPrice == nil || (*big.Int)(mined.GasPrice).Cmp(big.NewInt(12)) != 0 {
 		t.Fatalf("gasPrice mismatch for mined tx: got %v want 12", mined.GasPrice)
+	}
+}
+
+func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	config := params.AllEthashProtocolChanges
+	sender := common.HexToAddress("0xabcd")
+	target := common.HexToAddress("0x1234")
+	signature := bytes.Repeat([]byte{0x11}, 65)
+	ftx := &types.FrameTx{
+		ChainID:    uint256.MustFromBig(config.ChainID),
+		Nonce:      7,
+		Sender:     sender,
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
+		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
+		GasTipCap:  uint256.NewInt(2),
+		GasFeeCap:  uint256.NewInt(100),
+		BlobFeeCap: uint256.NewInt(0),
+	}
+	tx := types.NewTx(ftx)
+
+	data, err := json.Marshal(newRPCTransaction(tx, common.Hash{}, 0, 0, 0, nil, config))
+	if err != nil {
+		t.Fatalf("marshalling failed: %v", err)
+	}
+	have := string(data)
+	for _, want := range []string{`"sender"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
+		if !strings.Contains(have, want) {
+			t.Fatalf("rpc frame tx json missing %s: %s", want, have)
+		}
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal rpc json body: %v", err)
+	}
+	require.JSONEq(t, `[
+		{"mode":"0x1","flags":"0x3","target":null,"gasLimit":"0xc350","value":"0x0","data":"0x736967"},
+		{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
+	]`, string(body["frames"]))
+	require.JSONEq(t, `[{
+		"scheme":"0x0",
+		"signer":"0x000000000000000000000000000000000000abcd",
+		"msg":"0x",
+		"signature":"0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+	}]`, string(body["signatures"]))
+
+	var decoded types.Transaction
+	if err := decoded.UnmarshalJSON(data); err != nil {
+		t.Fatalf("unmarshal rpc frame tx json failed: %v", err)
+	}
+	if want, have := tx.Hash(), decoded.Hash(); want != have {
+		t.Fatalf("frame tx changed, want %x have %x", want, have)
+	}
+}
+
+func TestMarshalFrameReceiptNormalizesFrameStatus(t *testing.T) {
+	t.Parallel()
+
+	config := params.AllEthashProtocolChanges
+	sender := common.HexToAddress("0xabcd")
+	payer := common.HexToAddress("0xbeef")
+	tx := types.NewTx(&types.FrameTx{
+		ChainID:    uint256.MustFromBig(config.ChainID),
+		Nonce:      1,
+		Sender:     sender,
+		Frames:     []types.Frame{{Mode: types.FrameModeSender, GasLimit: 21_000, Value: new(uint256.Int)}},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(10),
+		BlobFeeCap: uint256.NewInt(0),
+	})
+	receipt := &types.Receipt{
+		Type:              types.FrameTxType,
+		Status:            types.ReceiptStatusSuccessful,
+		Payer:             payer,
+		GasUsed:           30,
+		CumulativeGasUsed: 30,
+		EffectiveGasPrice: big.NewInt(1),
+		FrameReceipts: []types.FrameReceipt{
+			{Status: 2, GasUsed: 10},
+			{Status: types.FrameReceiptStatusSkipped, GasUsed: 20},
+		},
+	}
+
+	fields := MarshalReceipt(receipt, common.Hash{0x1}, 1, types.LatestSigner(config), tx, 0)
+	if fields["payer"] != payer {
+		t.Fatalf("payer mismatch: got %#v want %s", fields["payer"], payer)
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal receipt fields: %v", err)
+	}
+	have := string(data)
+	for _, want := range []string{`"frameReceipts"`, `"payer":"0x000000000000000000000000000000000000beef"`, `"status":"0x0"`, `"status":"0x3"`, `"logs":[]`} {
+		if !strings.Contains(have, want) {
+			t.Fatalf("receipt json missing %s: %s", want, have)
+		}
+	}
+
+	receipt.FrameReceipts = nil
+	data, err = json.Marshal(MarshalReceipt(receipt, common.Hash{0x1}, 1, types.LatestSigner(config), tx, 0))
+	if err != nil {
+		t.Fatalf("marshal empty frame receipts: %v", err)
+	}
+	if !strings.Contains(string(data), `"frameReceipts":[]`) {
+		t.Fatalf("empty frameReceipts missing from frame receipt json: %s", data)
+	}
+}
+
+func TestSendRawTransactionRejectsInvalidFrameTxSchema(t *testing.T) {
+	t.Parallel()
+
+	tx := types.NewTx(&types.FrameTx{
+		ChainID:    uint256.NewInt(1),
+		Nonce:      1,
+		Sender:     common.HexToAddress("0xabcd"),
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 8, GasLimit: 21_000, Value: new(uint256.Int)}},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(10),
+		BlobFeeCap: uint256.NewInt(0),
+	})
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal invalid frame tx: %v", err)
+	}
+
+	api := &TransactionAPI{}
+	if _, err := api.SendRawTransaction(context.Background(), raw); err == nil || !strings.Contains(err.Error(), "invalid flags") {
+		t.Fatalf("expected invalid frame flags error, got %v", err)
 	}
 }
 

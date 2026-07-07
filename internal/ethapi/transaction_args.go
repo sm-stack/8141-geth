@@ -41,6 +41,7 @@ import (
 // or a message call.
 type TransactionArgs struct {
 	From                 *common.Address `json:"from"`
+	Sender               *common.Address `json:"sender,omitempty"`
 	To                   *common.Address `json:"to"`
 	Gas                  *hexutil.Uint64 `json:"gas"`
 	GasPrice             *hexutil.Big    `json:"gasPrice"`
@@ -70,6 +71,10 @@ type TransactionArgs struct {
 
 	// For SetCodeTxType
 	AuthorizationList []types.SetCodeAuthorization `json:"authorizationList"`
+
+	// For FrameTxType
+	Frames     *[]types.Frame       `json:"frames,omitempty"`
+	Signatures *[]types.TxSignature `json:"signatures,omitempty"`
 }
 
 // from retrieves the transaction sender address.
@@ -78,6 +83,17 @@ func (args *TransactionArgs) from() common.Address {
 		return common.Address{}
 	}
 	return *args.From
+}
+
+func (args *TransactionArgs) frameSender() common.Address {
+	if args.Sender != nil {
+		return *args.Sender
+	}
+	return args.from()
+}
+
+func (args *TransactionArgs) isFrameTx() bool {
+	return args.Frames != nil || args.Signatures != nil
 }
 
 // data retrieves the transaction calldata. Input field is preferred.
@@ -131,7 +147,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 	}
 
 	// create check
-	if args.To == nil {
+	if args.To == nil && !args.isFrameTx() {
 		if args.BlobHashes != nil {
 			return errors.New(`missing "to" in blob transaction`)
 		}
@@ -140,7 +156,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 		}
 	}
 
-	if args.Gas == nil {
+	if args.Gas == nil && !args.isFrameTx() {
 		// These fields are immutable during the estimation, safe to
 		// pass the pointer directly.
 		data := args.data()
@@ -180,8 +196,11 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 
 // setFeeDefaults fills in default fee values for unspecified tx fields.
 func (args *TransactionArgs) setFeeDefaults(ctx context.Context, b Backend, head *types.Header) error {
+	if args.isFrameTx() && args.GasPrice != nil {
+		return errors.New("gasPrice is not supported for frame transactions")
+	}
 	// Sanity check the EIP-4844 fee parameters.
-	if args.BlobFeeCap != nil && args.BlobFeeCap.ToInt().Sign() == 0 {
+	if !args.isFrameTx() && args.BlobFeeCap != nil && args.BlobFeeCap.ToInt().Sign() == 0 {
 		return errors.New("maxFeePerBlobGas, if specified, must be non-zero")
 	}
 	if b.ChainConfig().IsCancun(head.Number, head.Time) {
@@ -500,6 +519,8 @@ func (args *TransactionArgs) ToMessage(baseFee *big.Int, skipNonceCheck bool) *c
 func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 	usedType := types.LegacyTxType
 	switch {
+	case args.isFrameTx() || defaultType == types.FrameTxType:
+		usedType = types.FrameTxType
 	case args.AuthorizationList != nil || defaultType == types.SetCodeTxType:
 		usedType = types.SetCodeTxType
 	case args.BlobHashes != nil || defaultType == types.BlobTxType:
@@ -510,11 +531,36 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		usedType = types.AccessListTxType
 	}
 	// Make it possible to default to newer tx, but use legacy if gasprice is provided
-	if args.GasPrice != nil {
+	if args.GasPrice != nil && usedType != types.FrameTxType {
 		usedType = types.LegacyTxType
 	}
 	var data types.TxData
 	switch usedType {
+	case types.FrameTxType:
+		frames := []types.Frame{}
+		if args.Frames != nil {
+			frames = *args.Frames
+		}
+		signatures := []types.TxSignature{}
+		if args.Signatures != nil {
+			signatures = *args.Signatures
+		}
+		blobFeeCap := new(big.Int)
+		if args.BlobFeeCap != nil {
+			blobFeeCap = (*big.Int)(args.BlobFeeCap)
+		}
+		data = &types.FrameTx{
+			ChainID:    uint256.MustFromBig(args.ChainID.ToInt()),
+			Nonce:      uint64(*args.Nonce),
+			Sender:     args.frameSender(),
+			Frames:     frames,
+			Signatures: signatures,
+			GasTipCap:  uint256.MustFromBig((*big.Int)(args.MaxPriorityFeePerGas)),
+			GasFeeCap:  uint256.MustFromBig((*big.Int)(args.MaxFeePerGas)),
+			BlobFeeCap: uint256.MustFromBig(blobFeeCap),
+			BlobHashes: args.BlobHashes,
+		}
+
 	case types.SetCodeTxType:
 		al := types.AccessList{}
 		if args.AccessList != nil {
