@@ -396,6 +396,35 @@ func TestFramePoolExpiryVerifierExpiredDeadline(t *testing.T) {
 	}
 }
 
+func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	expiry := params.FrameExpiryVerifierAddress
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 1_000_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected initial tx to be accepted, got: %v", errs[0])
+	}
+
+	newHead := *pool.currentHead
+	newHead.Time = 13
+	pool.Reset(pool.currentHead, &newHead)
+	if pending, _ := pool.Stats(); pending != 0 {
+		t.Fatalf("expected expired tx to be dropped during reset, got %d pending", pending)
+	}
+}
+
 func TestFramePoolGasRule(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
@@ -486,7 +515,7 @@ func TestFramePoolGasCap(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: verifyFrameGasCap + 1, Data: []byte{0x01}},
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: maxVerifyGas + 1, Data: []byte{0x01}},
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -494,6 +523,126 @@ func TestFramePoolGasCap(t *testing.T) {
 		t.Fatal("expected rejection for VERIFY frame exceeding gas cap")
 	}
 	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolSignatureGasCountsAgainstVerifyBudget(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: maxVerifyGas - params.SigGasSecp256k1 + 1},
+	}
+	addFramePoolEOASignature(ftx, config.ChainID, key)
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection when signature gas pushes validation prefix above MAX_VERIFY_GAS")
+	}
+}
+
+func TestFramePoolRejectsAtomicBatchInValidationPrefix(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(target)
+	statedb.SetCode(target, returnCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3 | types.FrameFlagAtomicBatch, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 10000, Data: []byte{0x02}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for atomic batch flag inside validation prefix")
+	}
+}
+
+func TestFramePoolDeployValidationPrefixShapes(t *testing.T) {
+	t.Run("deploy_self_verify", func(t *testing.T) {
+		pool, statedb, config := newTestEnv()
+
+		sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+		factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+		statedb.CreateAccount(sender)
+		statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+		statedb.CreateAccount(factory)
+		statedb.SetCode(factory, returnCode, tracing.CodeChangeUnspecified)
+
+		ftx := baseFTX(sender, 0, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 10000, Data: []byte{0x01}},
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x02}},
+		}
+		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+		if errs[0] != nil {
+			t.Fatalf("expected deploy+self VERIFY prefix to be accepted, got: %v", errs[0])
+		}
+	})
+
+	t.Run("deploy_only_verify_pay", func(t *testing.T) {
+		pool, statedb, config := newTestEnv()
+
+		sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+		factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+		payer := common.HexToAddress("0x3333333333333333333333333333333333333333")
+		statedb.CreateAccount(sender)
+		statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+		statedb.CreateAccount(factory)
+		statedb.SetCode(factory, returnCode, tracing.CodeChangeUnspecified)
+		statedb.CreateAccount(payer)
+		statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+		ftx := baseFTX(sender, 0, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 10000, Data: []byte{0x01}},
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 40000, Data: []byte{0x02}},
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{0x03}},
+		}
+		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+		if errs[0] != nil {
+			t.Fatalf("expected deploy+exec VERIFY+pay VERIFY prefix to be accepted, got: %v", errs[0])
+		}
+	})
+}
+
+func TestFramePoolSelfVerifyStopsValidationPrefix(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+		{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: maxVerifyGas, Data: []byte{0x02}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected self VERIFY to stop prefix before paymaster candidate, got: %v", errs[0])
+	}
 }
 
 func TestFramePoolSenderLimit(t *testing.T) {
@@ -529,6 +678,55 @@ func TestFramePoolSenderLimit(t *testing.T) {
 
 	if pending, _ := pool.Stats(); pending != maxFrameTxsPerAccount {
 		t.Fatalf("expected %d pending, got %d", maxFrameTxsPerAccount, pending)
+	}
+}
+
+func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+	oldTx := makeFrameTx(ftx)
+	errs := pool.Add([]*types.Transaction{oldTx}, false)
+	if errs[0] != nil {
+		t.Fatalf("initial tx rejected: %v", errs[0])
+	}
+
+	underpriced := baseFTX(sender, 0, config)
+	underpriced.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x02}},
+	}
+	errs = pool.Add([]*types.Transaction{makeFrameTx(underpriced)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected same-nonce replacement without fee bump to be rejected")
+	}
+
+	bumped := baseFTX(sender, 0, config)
+	bumped.GasTipCap = uint256.NewInt(2)
+	bumped.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 11 / 10)
+	bumped.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x03}},
+	}
+	newTx := makeFrameTx(bumped)
+	errs = pool.Add([]*types.Transaction{newTx}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected bumped same-nonce replacement to be accepted, got: %v", errs[0])
+	}
+	if pool.Has(oldTx.Hash()) {
+		t.Fatal("old transaction remained after replacement")
+	}
+	if !pool.Has(newTx.Hash()) {
+		t.Fatal("replacement transaction missing from pool")
+	}
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("expected one pending tx after replacement, got %d", pending)
 	}
 }
 
@@ -680,6 +878,7 @@ func TestScopeOrderingExecThenPay(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 	statedb.CreateAccount(payer)
 	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
@@ -691,6 +890,39 @@ func TestScopeOrderingExecThenPay(t *testing.T) {
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] != nil {
 		t.Fatalf("expected acceptance for exec→pay ordering, got: %v", errs[0])
+	}
+}
+
+func TestFramePoolNonCanonicalPaymasterPendingLimit(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	senderA := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	senderB := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	payer := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	for _, sender := range []common.Address{senderA, senderB} {
+		statedb.CreateAccount(sender)
+		statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	makeTx := func(sender common.Address, data byte) *types.Transaction {
+		ftx := baseFTX(sender, 0, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 40000, Data: []byte{data}},
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{data + 1}},
+		}
+		return makeFrameTx(ftx)
+	}
+	errs := pool.Add([]*types.Transaction{makeTx(senderA, 0x01)}, false)
+	if errs[0] != nil {
+		t.Fatalf("first non-canonical paymaster tx rejected: %v", errs[0])
+	}
+	errs = pool.Add([]*types.Transaction{makeTx(senderB, 0x03)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected second pending tx using same non-canonical paymaster to be rejected")
 	}
 }
 

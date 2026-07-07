@@ -173,6 +173,9 @@ func TestFrameValidationBannedOpcodes(t *testing.T) {
 		{BASEFEE, "OP-011"},
 		{BLOBHASH, "OP-011"},
 		{BLOBBASEFEE, "OP-011"},
+		{SSTORE, "OP-011"},
+		{TLOAD, "OP-011"},
+		{TSTORE, "OP-011"},
 		{CREATE, "OP-011"},
 		{CREATE2, "OP-011"},
 		{SELFDESTRUCT, "OP-011"},
@@ -192,6 +195,39 @@ func TestFrameValidationBannedOpcodes(t *testing.T) {
 				t.Fatalf("expected rule %s, got %s", tc.rule, v.Rule)
 			}
 		})
+	}
+}
+
+func TestFrameValidationDeployOptions(t *testing.T) {
+	state := &mockStateDB{
+		codeSize: map[common.Address]int{
+			testContract: 100,
+		},
+	}
+	tracer := NewFrameValidationTracerWithOptions(state, testSender, testSender, []common.Address{testPrecompile1}, FrameValidationTracerOptions{
+		AllowCreate:              true,
+		AllowSenderStorageWrites: true,
+	})
+	tracer.OnOpcode(0, byte(CREATE), 100000, 32000, emptyScope(), nil, 1, nil)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for CREATE with deploy option: %s", v)
+	}
+	tracer.OnOpcode(1, byte(CREATE2), 100000, 32000, emptyScope(), nil, 1, nil)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for CREATE2 with deploy option: %s", v)
+	}
+	tracer.OnOpcode(2, byte(SSTORE), 100000, 100, &mockScope{address: testSender}, nil, 1, nil)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for sender SSTORE with deploy option: %s", v)
+	}
+
+	tracer = NewFrameValidationTracerWithOptions(state, testSender, testSender, []common.Address{testPrecompile1}, FrameValidationTracerOptions{
+		AllowCreate:              true,
+		AllowSenderStorageWrites: true,
+	})
+	tracer.OnOpcode(0, byte(SSTORE), 100000, 100, &mockScope{address: testContract}, nil, 1, nil)
+	if v := tracer.Violation(); v == nil {
+		t.Fatal("expected SSTORE violation outside sender storage")
 	}
 }
 

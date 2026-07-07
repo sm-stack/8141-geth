@@ -40,7 +40,7 @@ func (e *FrameValidationError) Error() string {
 }
 
 // bannedOpcodes is the set of opcodes forbidden in VERIFY frames per ERC-7562 [OP-011].
-// Note: SSTORE, LOG0-4, CALL with value are already blocked by STATICCALL/readOnly.
+// Note: LOG0-4 and CALL with value are already blocked by STATICCALL/readOnly.
 var bannedOpcodes = map[OpCode]bool{
 	ORIGIN:       true, // 0x32
 	GASPRICE:     true, // 0x3a
@@ -53,6 +53,9 @@ var bannedOpcodes = map[OpCode]bool{
 	BASEFEE:      true, // 0x48
 	BLOBHASH:     true, // 0x49
 	BLOBBASEFEE:  true, // 0x4a
+	SSTORE:       true, // 0x55
+	TLOAD:        true, // 0x5c
+	TSTORE:       true, // 0x5d
 	CREATE:       true, // 0xf0
 	CREATE2:      true, // 0xf5
 	SELFDESTRUCT: true, // 0xff
@@ -81,6 +84,7 @@ type FrameValidationTracer struct {
 	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
 	lastOpValid    bool   // Whether lastOp is meaningful
 	allowTimestamp bool
+	options        FrameValidationTracerOptions
 
 	violation *FrameValidationError // First violation (nil = no violation)
 
@@ -95,10 +99,25 @@ type FrameValidationTracer struct {
 	keccakPreimages map[string]struct{}
 }
 
+// FrameValidationTracerOptions configures EIP-8141 validation-prefix exceptions.
+type FrameValidationTracerOptions struct {
+	// AllowCreate permits CREATE/CREATE2 in the first deploy frame of a validation prefix.
+	AllowCreate bool
+
+	// AllowSenderStorageWrites permits SSTORE only when the executing scope is tx.sender.
+	AllowSenderStorageWrites bool
+}
+
 // NewFrameValidationTracer creates a tracer for VERIFY frame validation.
 // frameTarget is the VERIFY frame's target address — its own storage is exempt
 // from STO-021 checks (entity's own storage, analogous to ERC-7562 STO-031).
 func NewFrameValidationTracer(stateDB StateDB, sender common.Address, frameTarget common.Address, precompiles []common.Address) *FrameValidationTracer {
+	return NewFrameValidationTracerWithOptions(stateDB, sender, frameTarget, precompiles, FrameValidationTracerOptions{})
+}
+
+// NewFrameValidationTracerWithOptions creates a tracer with validation-prefix
+// exceptions enabled for deploy frames.
+func NewFrameValidationTracerWithOptions(stateDB StateDB, sender common.Address, frameTarget common.Address, precompiles []common.Address, opts FrameValidationTracerOptions) *FrameValidationTracer {
 	pm := make(map[common.Address]bool, len(precompiles))
 	for _, addr := range precompiles {
 		pm[addr] = true
@@ -109,6 +128,7 @@ func NewFrameValidationTracer(stateDB StateDB, sender common.Address, frameTarge
 		frameTarget:     frameTarget,
 		precompiles:     pm,
 		allowTimestamp:  frameTarget == params.FrameExpiryVerifierAddress && bytes.Equal(stateDB.GetCode(frameTarget), params.FrameExpiryVerifierCode),
+		options:         opts,
 		keccakPreimages: make(map[string]struct{}),
 	}
 }
@@ -152,7 +172,17 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 
 	// [OP-011, OP-080] Check banned opcodes.
 	if bannedOpcodes[opcode] {
+		if (opcode == CREATE || opcode == CREATE2) && t.options.AllowCreate {
+			t.lastOp = opcode
+			t.lastOpValid = true
+			return
+		}
 		if opcode == TIMESTAMP && t.allowTimestamp {
+			t.lastOp = opcode
+			t.lastOpValid = true
+			return
+		}
+		if opcode == SSTORE && t.options.AllowSenderStorageWrites && scope != nil && scope.Address() == t.sender {
 			t.lastOp = opcode
 			t.lastOpValid = true
 			return
