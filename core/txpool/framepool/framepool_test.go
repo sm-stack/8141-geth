@@ -19,11 +19,13 @@ package framepool
 import (
 	"crypto/ecdsa"
 	"encoding/binary"
+	"errors"
 	"math/big"
 	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -923,6 +925,98 @@ func TestFramePoolNonCanonicalPaymasterPendingLimit(t *testing.T) {
 	errs = pool.Add([]*types.Transaction{makeTx(senderB, 0x03)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected second pending tx using same non-canonical paymaster to be rejected")
+	}
+}
+
+func TestFramePoolCanonicalPaymasterAllowsMultiplePending(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	senderA := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	senderB := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	payer := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	for _, sender := range []common.Address{senderA, senderB} {
+		statedb.CreateAccount(sender)
+		statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	originalHash := canonicalPaymasterCodeHash
+	canonicalPaymasterCodeHash = crypto.Keccak256Hash(approvePayCode)
+	t.Cleanup(func() { canonicalPaymasterCodeHash = originalHash })
+
+	makeTx := func(sender common.Address, data byte) *types.Transaction {
+		ftx := baseFTX(sender, 0, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 2, GasLimit: 40000, Data: []byte{data}},
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{data + 1}},
+		}
+		return makeFrameTx(ftx)
+	}
+	for _, tx := range []*types.Transaction{makeTx(senderA, 0x01), makeTx(senderB, 0x03)} {
+		if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+			t.Fatalf("canonical paymaster transaction rejected: %v", err)
+		}
+	}
+}
+
+func TestFramePoolCanonicalPaymasterBypassesVerifyOpcodeRules(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	canonicalCode := []byte{0x42, 0x50, 0x60, 0x01, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, canonicalCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	originalHash := canonicalPaymasterCodeHash
+	canonicalPaymasterCodeHash = crypto.Keccak256Hash(canonicalCode)
+	t.Cleanup(func() { canonicalPaymasterCodeHash = originalHash })
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 2, GasLimit: 40000, Data: []byte{0x01}},
+		{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{0x02}},
+	}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("canonical paymaster with TIMESTAMP rejected: %v", err)
+	}
+}
+
+func TestFramePoolCanonicalPaymasterReservesPendingWithdrawal(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+
+	originalHash := canonicalPaymasterCodeHash
+	canonicalPaymasterCodeHash = crypto.Keccak256Hash(approvePayCode)
+	t.Cleanup(func() { canonicalPaymasterCodeHash = originalHash })
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 2, GasLimit: 40000, Data: []byte{0x01}},
+		{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{0x02}},
+	}
+	tx := makeFrameTx(ftx)
+	maxCost := tx.Cost()
+	balance := new(big.Int).Add(maxCost, big.NewInt(100))
+	statedb.SetBalance(payer, uint256.MustFromBig(balance), tracing.BalanceChangeUnspecified)
+	statedb.SetState(payer, canonicalPaymasterPendingWithdrawalSlot, common.BigToHash(big.NewInt(101)))
+
+	err := pool.Add([]*types.Transaction{tx}, false)[0]
+	if err == nil || !errors.Is(err, core.ErrInsufficientFunds) {
+		t.Fatalf("expected pending withdrawal solvency rejection, got %v", err)
 	}
 }
 

@@ -59,7 +59,14 @@ const (
 	txMaxSize uint64 = 512 * 1024
 )
 
-var canonicalPaymasterCodeHash common.Hash
+var (
+	// canonicalPaymasterCodeHash is keccak256(CanonicalPaymaster runtime bytecode),
+	// compiled by contracts with the pinned EIP-8141 Solidity compiler.
+	canonicalPaymasterCodeHash = common.HexToHash("0x471975c53fcc25c8c4eb88aa1d0611c4ec51932e490ca12e706565f634990dd9")
+
+	// CanonicalPaymaster fixes pending withdrawal amount at storage slot 1.
+	canonicalPaymasterPendingWithdrawalSlot = common.Hash{31: 1}
+)
 
 // BlockChain defines the blockchain interface needed by the frame pool.
 type BlockChain interface {
@@ -497,14 +504,15 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true); err != nil {
 		return frameTxMeta{}, err
 	}
-	payResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, true)
+	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
+	canonical := p.isCanonicalPaymaster(payTarget)
+	payResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !canonical)
 	if err != nil {
 		return frameTxMeta{}, err
 	}
 	if payResult.approveScope != vm.ApprovePayment {
 		return frameTxMeta{}, fmt.Errorf("VERIFY frame %d approved scope %d, want payment approval 1", plan.payVerifyIndex, payResult.approveScope)
 	}
-	canonical := p.isCanonicalPaymaster(payResult.target)
 	return frameTxMeta{
 		payer:              payResult.target,
 		usesPaymaster:      payResult.target != frameTx.Sender,
@@ -660,11 +668,11 @@ func resolveFrameTarget(sender common.Address, frame types.Frame) common.Address
 }
 
 func (p *FramePool) isCanonicalPaymaster(addr common.Address) bool {
-	// The canonical paymaster bytecode/hash is introduced by a later phase.
-	if canonicalPaymasterCodeHash == (common.Hash{}) {
-		return false
-	}
 	return p.currentState.GetCodeHash(addr) == canonicalPaymasterCodeHash
+}
+
+func (p *FramePool) pendingCanonicalWithdrawal(addr common.Address) *big.Int {
+	return p.currentState.GetState(addr, canonicalPaymasterPendingWithdrawalSlot).Big()
 }
 
 // hasNoCode returns true if the given address has no code (is an EOA).
@@ -725,8 +733,16 @@ func (p *FramePool) validatePaymasterAccounting(tx *types.Transaction, meta fram
 	reserved := p.reservedExcluding(meta.payer, replacement)
 	required := new(big.Int).Add(reserved, meta.maxCost)
 	balance := p.currentState.GetBalance(meta.payer).ToBig()
+	var pendingWithdrawal *big.Int
+	if meta.usesPaymaster && meta.canonicalPaymaster {
+		pendingWithdrawal = p.pendingCanonicalWithdrawal(meta.payer)
+		balance.Sub(balance, pendingWithdrawal)
+		if balance.Sign() < 0 {
+			balance.SetInt64(0)
+		}
+	}
 	if balance.Cmp(required) < 0 {
-		return fmt.Errorf("%w: payer %s balance %v, reserved %v, tx cost %v", core.ErrInsufficientFunds, meta.payer.Hex(), balance, reserved, meta.maxCost)
+		return fmt.Errorf("%w: payer %s available balance %v, reserved %v, pending withdrawal %v, tx cost %v", core.ErrInsufficientFunds, meta.payer.Hex(), balance, reserved, pendingWithdrawal, meta.maxCost)
 	}
 	if meta.usesPaymaster && !meta.canonicalPaymaster {
 		pending := p.nonCanonicalPendingExcluding(meta.payer, replacement)
