@@ -32,7 +32,7 @@ const (
 //
 // The function is called from executeFrames() when the frame target has no code.
 // VERIFY approves the scope allowed by the current frame flags if a matching
-// empty-msg transaction-level secp256k1 signature exists. SENDER and DEFAULT
+// empty-msg transaction-level protocol-supported signature exists. SENDER and DEFAULT
 // modes behave like a regular call to empty code and succeed without side effects.
 //
 // Returns the return data, leftover gas, and any error.
@@ -49,7 +49,7 @@ func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, 
 
 // executeDefaultVerify implements the VERIFY mode of the EOA default code.
 // Transaction-level signatures are validated before execution; this path only
-// checks that a matching empty-msg secp256k1 signature is present.
+// checks that a matching empty-msg protocol-supported signature is present.
 func executeDefaultVerify(evm *EVM, target common.Address, gas uint64) ([]byte, uint64, error) {
 	fc := evm.FrameCtx
 	if fc == nil {
@@ -77,7 +77,8 @@ func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address)
 		return 0, false
 	}
 	for _, sig := range fc.Signatures {
-		if sig.Scheme == types.SignatureSchemeSecp256k1 && sig.Signer == target && len(sig.Msg) == 0 {
+		supported := sig.Scheme == types.SignatureSchemeSecp256k1 || sig.Scheme == types.SignatureSchemeP256
+		if supported && sig.Signer == target && len(sig.Msg) == 0 {
 			return allowedScope, true
 		}
 	}

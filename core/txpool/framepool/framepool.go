@@ -62,7 +62,7 @@ const (
 var (
 	// canonicalPaymasterCodeHash is keccak256(CanonicalPaymaster runtime bytecode),
 	// compiled by contracts with the pinned EIP-8141 Solidity compiler.
-	canonicalPaymasterCodeHash = common.HexToHash("0x471975c53fcc25c8c4eb88aa1d0611c4ec51932e490ca12e706565f634990dd9")
+	canonicalPaymasterCodeHash = common.HexToHash("0x753d8fb13a049dbfd7771540fce6add0de9fd73fa5ec5a74186942d01b65275e")
 
 	// CanonicalPaymaster fixes pending withdrawal amount at storage slot 1.
 	canonicalPaymasterPendingWithdrawalSlot = common.Hash{31: 1}
