@@ -86,6 +86,7 @@ type FramePool struct {
 	gasTip       uint256.Int
 	currentHead  *types.Header
 	currentState *state.StateDB
+	slotProvider func(*types.Header) vm.SlotProvider
 
 	reserver txpool.Reserver
 
@@ -116,6 +117,9 @@ func New(chain BlockChain) *FramePool {
 		pending:     make(map[common.Address][]*types.Transaction),
 		all:         make(map[common.Hash]*types.Transaction),
 		meta:        make(map[common.Hash]frameTxMeta),
+		slotProvider: func(head *types.Header) vm.SlotProvider {
+			return vm.TimestampSlotProvider{Timestamp: head.Time}
+		},
 
 		paymasterReserved: make(map[common.Address]*big.Int),
 		paymasterPending:  make(map[common.Address]int),
@@ -182,6 +186,9 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		}
 		sender := frameTx.Sender
 		if err := validateFrameNonce(frameTx, statedb); err != nil {
+			continue
+		}
+		if err := p.validateRecentRootReferences(frameTx, statedb, newHead); err != nil {
 			continue
 		}
 		if len(p.pending[sender]) >= maxFrameTxsPerAccount {
@@ -324,6 +331,31 @@ func validateFrameNonce(tx *types.FrameTx, statedb *state.StateDB) error {
 	return nil
 }
 
+func (p *FramePool) validateRecentRootReferences(tx *types.FrameTx, statedb *state.StateDB, head *types.Header) error {
+	currentSlot := p.slotProvider(head).CurrentSlot()
+	for i, ref := range tx.RecentRootRefs {
+		if !types.RecentRootReferenceInWindow(currentSlot, ref.Slot) {
+			return fmt.Errorf("%w: recent root reference %d slot %d is invalid at current slot %d", core.ErrFrameTxInvalid, i, ref.Slot, currentSlot)
+		}
+		key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
+		want := types.RecentRootEntryHash(ref.SourceID, ref.Slot, ref.Root)
+		if have := statedb.GetState(params.RecentRootAddress, key); have != want {
+			return fmt.Errorf("%w: recent root reference %d mismatch", core.ErrFrameTxInvalid, i)
+		}
+	}
+	return nil
+}
+
+func warmRecentRootReferences(statedb *state.StateDB, refs []types.RecentRootRef) {
+	if len(refs) == 0 {
+		return
+	}
+	statedb.AddAddressToAccessList(params.RecentRootAddress)
+	for _, ref := range refs {
+		statedb.AddSlotToAccessList(params.RecentRootAddress, types.RecentRootStorageKey(ref.SourceID, ref.Slot))
+	}
+}
+
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
 func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	p.mu.Lock()
@@ -340,6 +372,9 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	sender := frameTx.Sender
 
 	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
+		return err
+	}
+	if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
 		return err
 	}
 
@@ -434,19 +469,20 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 
 	// Build FrameContext (mirrors state_transition.go:806-821).
 	frameCtx := &vm.FrameContext{
-		Sender:        frameTx.Sender,
-		NonceKeys:     frameTx.NonceKeys,
-		NonceSeq:      frameTx.NonceSeq,
-		LegacyNonce:   p.currentState.GetNonce(frameTx.Sender),
-		NonceKeysHash: frameTx.NonceKeysHash(),
-		Frames:        frameTx.Frames,
-		Signatures:    frameTx.Signatures,
-		GasTipCap:     new(uint256.Int).Set(frameTx.GasTipCap),
-		GasFeeCap:     new(uint256.Int).Set(frameTx.GasFeeCap),
-		GasLimit:      frameTx.TotalGas(),
-		SigHash:       sigHash,
-		FrameIndex:    0,
-		FrameResults:  make([]uint8, len(frameTx.Frames)),
+		Sender:         frameTx.Sender,
+		NonceKeys:      frameTx.NonceKeys,
+		NonceSeq:       frameTx.NonceSeq,
+		LegacyNonce:    p.currentState.GetNonce(frameTx.Sender),
+		NonceKeysHash:  frameTx.NonceKeysHash(),
+		Frames:         frameTx.Frames,
+		Signatures:     frameTx.Signatures,
+		GasTipCap:      new(uint256.Int).Set(frameTx.GasTipCap),
+		GasFeeCap:      new(uint256.Int).Set(frameTx.GasFeeCap),
+		GasLimit:       frameTx.TotalGas(),
+		SigHash:        sigHash,
+		FrameIndex:     0,
+		FrameResults:   make([]uint8, len(frameTx.Frames)),
+		RecentRootRefs: frameTx.RecentRootRefs,
 	}
 	if frameTx.BlobFeeCap != nil {
 		frameCtx.BlobFeeCap = new(uint256.Int).Set(frameTx.BlobFeeCap)
@@ -457,17 +493,21 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 
 	// Shared block context used for both simulation phases.
 	random := common.Hash{}
+	simulationHead := *head
+	simulationHead.Number = new(big.Int).Add(head.Number, big.NewInt(1))
+	simulationHead.Time = head.Time + params.SecondsPerSlot
 	blockCtx := vm.BlockContext{
-		CanTransfer: core.CanTransfer,
-		Transfer:    core.Transfer,
-		GetHash:     func(uint64) common.Hash { return common.Hash{} },
-		Coinbase:    common.Address{},
-		GasLimit:    head.GasLimit,
-		BlockNumber: new(big.Int).Add(head.Number, big.NewInt(1)),
-		Time:        head.Time + 12,
-		Difficulty:  new(big.Int),
-		BaseFee:     head.BaseFee,
-		Random:      &random,
+		CanTransfer:  core.CanTransfer,
+		Transfer:     core.Transfer,
+		GetHash:      func(uint64) common.Hash { return common.Hash{} },
+		Coinbase:     common.Address{},
+		GasLimit:     head.GasLimit,
+		BlockNumber:  simulationHead.Number,
+		Time:         simulationHead.Time,
+		Difficulty:   new(big.Int),
+		BaseFee:      head.BaseFee,
+		Random:       &random,
+		SlotProvider: p.slotProvider(&simulationHead),
 	}
 
 	plan, err := p.validationPrefixPlan(frameTx, p.currentState, blockCtx.Time)
@@ -498,6 +538,7 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 		evm.FrameCtx = frameCtx
 		frameCtx.FrameIndex = i
 		baseState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
+		warmRecentRootReferences(baseState, frameTx.RecentRootRefs)
 		_, _, vmerr := evm.Call(params.FrameEntryPointAddress, target, frame.Data, frame.GasLimit, new(uint256.Int))
 		evm.FrameCtx = nil
 		if violation := tracer.Violation(); violation != nil {
@@ -665,6 +706,7 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	frameCtx.FrameIndex = index
 
 	simState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
+	warmRecentRootReferences(simState, frameTx.RecentRootRefs)
 
 	caller := params.FrameEntryPointAddress
 	var (

@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -163,6 +164,10 @@ func expiryFrameData(deadline uint64) []byte {
 	binary.BigEndian.PutUint64(data, deadline)
 	return data
 }
+
+type fixedFramePoolSlotProvider uint64
+
+func (p fixedFramePoolSlotProvider) CurrentSlot() uint64 { return uint64(p) }
 
 func addFramePoolEOASignature(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
 	addFramePoolEOASignatureForMsg(ftx, chainID, key, nil)
@@ -449,6 +454,128 @@ func TestFramePoolResetKeepsIndependentNonceDomains(t *testing.T) {
 	pool.Reset(pool.currentHead, &newHead)
 	if pending, _ := pool.Stats(); pending != 2 {
 		t.Fatalf("expected both nonce domains after reset, got %d", pending)
+	}
+}
+
+func setupRecentRootFrameTx(t *testing.T, currentSlot, refSlot uint64) (*FramePool, *state.StateDB, *types.FrameTx, types.RecentRootRef) {
+	t.Helper()
+	pool, statedb, config := newTestEnv()
+	pool.currentHead.Time = currentSlot * params.SecondsPerSlot
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	ref := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: refSlot, Root: common.HexToHash("0x5678")}
+	key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
+	statedb.SetState(params.RecentRootAddress, key, types.RecentRootEntryHash(ref.SourceID, ref.Slot, ref.Root))
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	ftx.RecentRootRefs = []types.RecentRootRef{ref}
+	return pool, statedb, ftx, ref
+}
+
+func TestFramePoolRecentRootAdmission(t *testing.T) {
+	const currentSlot = uint64(9000)
+	tests := []struct {
+		name   string
+		slot   uint64
+		mutate func(*types.RecentRootRef)
+		valid  bool
+	}{
+		{name: "previous slot", slot: currentSlot - 1, valid: true},
+		{name: "oldest usable", slot: currentSlot - 8191, valid: true},
+		{name: "same slot", slot: currentSlot},
+		{name: "future slot", slot: currentSlot + 1},
+		{name: "expired", slot: currentSlot - 8192},
+		{name: "wrong root", slot: currentSlot - 1, mutate: func(ref *types.RecentRootRef) { ref.Root[0] ^= 0xff }},
+		{name: "wrong source", slot: currentSlot - 1, mutate: func(ref *types.RecentRootRef) { ref.SourceID[0] ^= 0xff }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool, statedb, ftx, ref := setupRecentRootFrameTx(t, currentSlot, tt.slot)
+			if tt.mutate != nil {
+				tt.mutate(&ftx.RecentRootRefs[0])
+			}
+			err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+			if tt.valid && err != nil {
+				t.Fatalf("valid reference rejected: %v", err)
+			}
+			if !tt.valid && err == nil {
+				t.Fatal("invalid reference accepted")
+			}
+			key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
+			if addressWarm, slotWarm := statedb.SlotInAccessList(params.RecentRootAddress, key); addressWarm || slotWarm {
+				t.Fatal("framepool validation polluted current state access list")
+			}
+		})
+	}
+}
+
+func TestFramePoolRecentRootAdmissionUsesSlotProvider(t *testing.T) {
+	pool, _, ftx, _ := setupRecentRootFrameTx(t, 1, 8999)
+	pool.slotProvider = func(*types.Header) vm.SlotProvider { return fixedFramePoolSlotProvider(9000) }
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("reference valid under injected slot provider rejected: %v", err)
+	}
+}
+
+func TestWarmRecentRootReferences(t *testing.T) {
+	_, statedb, _, ref := setupRecentRootFrameTx(t, 9000, 8999)
+	copyState := statedb.Copy()
+	warmRecentRootReferences(copyState, []types.RecentRootRef{ref})
+	key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
+	if addressWarm, slotWarm := copyState.SlotInAccessList(params.RecentRootAddress, key); !addressWarm || !slotWarm {
+		t.Fatalf("recent-root access not warmed: address=%v slot=%v", addressWarm, slotWarm)
+	}
+	if addressWarm, slotWarm := statedb.SlotInAccessList(params.RecentRootAddress, key); addressWarm || slotWarm {
+		t.Fatal("warming simulation copy affected original state")
+	}
+}
+
+func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
+	const currentSlot = uint64(9000)
+	t.Run("expiry", func(t *testing.T) {
+		pool, _, ftx, ref := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
+		if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+			t.Fatal(err)
+		}
+		newHead := *pool.currentHead
+		newHead.Time = (ref.Slot + params.RecentRootWindow) * params.SecondsPerSlot
+		pool.Reset(pool.currentHead, &newHead)
+		if pending, _ := pool.Stats(); pending != 0 {
+			t.Fatalf("expired tx retained: %d", pending)
+		}
+	})
+	t.Run("reorg mismatch", func(t *testing.T) {
+		pool, statedb, ftx, ref := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
+		if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+			t.Fatal(err)
+		}
+		statedb.SetState(params.RecentRootAddress, types.RecentRootStorageKey(ref.SourceID, ref.Slot), common.Hash{})
+		newHead := *pool.currentHead
+		pool.Reset(pool.currentHead, &newHead)
+		if pending, _ := pool.Stats(); pending != 0 {
+			t.Fatalf("mismatched tx retained: %d", pending)
+		}
+	})
+}
+
+func TestFramePoolInvalidRecentRootReplacementKeepsOriginal(t *testing.T) {
+	const currentSlot = uint64(9000)
+	pool, _, ftx, _ := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
+	original := makeFrameTx(ftx)
+	if err := pool.Add([]*types.Transaction{original}, false)[0]; err != nil {
+		t.Fatal(err)
+	}
+	replacement := types.NewTx(ftx).GetFrameTx()
+	replacement.GasTipCap = uint256.NewInt(2)
+	replacement.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
+	replacement.RecentRootRefs[0].Root[0] ^= 0xff
+	if err := pool.Add([]*types.Transaction{makeFrameTx(replacement)}, false)[0]; err == nil {
+		t.Fatal("invalid replacement accepted")
+	}
+	if !pool.Has(original.Hash()) {
+		t.Fatal("valid original was removed")
 	}
 }
 
