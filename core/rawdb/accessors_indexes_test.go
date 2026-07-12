@@ -258,6 +258,16 @@ func TestExtractReceiptFields(t *testing.T) {
 		},
 	})
 	receiptWithLogBlob, _ := rlp.EncodeToBytes(&receiptWithLogs)
+	frameReceipt := types.ReceiptForStorage(types.Receipt{
+		Type:              types.FrameTxType,
+		CumulativeGasUsed: 1337,
+		Payer:             common.HexToAddress("0xbeef"),
+		FrameReceipts: []types.FrameReceipt{
+			{Status: 1, GasUsed: 42, Logs: []*types.Log{{Address: common.HexToAddress("0xcafe")}}},
+			{Status: 3},
+		},
+	})
+	frameReceiptBlob, _ := rlp.EncodeToBytes(&frameReceipt)
 
 	invalidReceipt := types.ReceiptForStorage(types.Receipt{
 		Type:              types.LegacyTxType,
@@ -276,6 +286,7 @@ func TestExtractReceiptFields(t *testing.T) {
 		{receiptWithPostStateBlob, nil, 100, 0},
 		{receiptNoLogBlob, nil, 100, 0},
 		{receiptWithLogBlob, nil, 100, 2},
+		{frameReceiptBlob, nil, 1337, 1},
 		{invalidReceiptBlob, rlp.ErrExpectedList, 100, 0},
 	}
 	for _, c := range cases {

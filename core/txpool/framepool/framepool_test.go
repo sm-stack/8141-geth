@@ -29,7 +29,6 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
-	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
@@ -63,7 +62,7 @@ func (r *reserver) Hold(addr common.Address) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	if _, exists := r.accounts[addr]; exists {
-		return nil // allow re-reservation in tests
+		return errors.New("address already reserved")
 	}
 	r.accounts[addr] = struct{}{}
 	return nil
@@ -430,6 +429,29 @@ func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 	}
 }
 
+func TestFramePoolResetKeepsIndependentNonceDomains(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	for _, key := range []uint64{101, 102} {
+		ftx := baseFTX(sender, 0, config)
+		ftx.NonceKeys = []*uint256.Int{uint256.NewInt(key)}
+		ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000}}
+		if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+			t.Fatalf("key %d rejected: %v", key, err)
+		}
+	}
+	newHead := *pool.currentHead
+	newHead.Time++
+	pool.Reset(pool.currentHead, &newHead)
+	if pending, _ := pool.Stats(); pending != 2 {
+		t.Fatalf("expected both nonce domains after reset, got %d", pending)
+	}
+}
+
 func TestFramePoolGasRule(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
@@ -660,7 +682,8 @@ func TestFramePoolSenderLimit(t *testing.T) {
 
 	// Add maxFrameTxsPerAccount txs — all should succeed.
 	for i := uint64(0); i < maxFrameTxsPerAccount; i++ {
-		ftx := baseFTX(sender, i, config)
+		ftx := baseFTX(sender, 0, config)
+		ftx.NonceKeys = []*uint256.Int{uint256.NewInt(i + 1)}
 		ftx.Frames = []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{byte(i)}},
 		}
@@ -671,7 +694,8 @@ func TestFramePoolSenderLimit(t *testing.T) {
 	}
 
 	// The next one should be rejected.
-	ftx := baseFTX(sender, maxFrameTxsPerAccount, config)
+	ftx := baseFTX(sender, 0, config)
+	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(maxFrameTxsPerAccount + 1)}
 	ftx.Frames = []types.Frame{
 		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0xff}},
 	}
@@ -718,8 +742,9 @@ func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
 	differentDomain.GasTipCap = uint256.NewInt(2)
 	differentDomain.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
 	differentDomain.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000, Data: []byte{0x04}}}
-	if err := pool.Add([]*types.Transaction{makeFrameTx(differentDomain)}, false)[0]; !errors.Is(err, txpool.ErrAccountLimitExceeded) {
-		t.Fatalf("different nonce domain replacement error = %v, want account limit", err)
+	differentDomainTx := makeFrameTx(differentDomain)
+	if err := pool.Add([]*types.Transaction{differentDomainTx}, false)[0]; err != nil {
+		t.Fatalf("different nonce domain rejected: %v", err)
 	}
 
 	bumped := baseFTX(sender, 0, config)
@@ -739,8 +764,11 @@ func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
 	if !pool.Has(newTx.Hash()) {
 		t.Fatal("replacement transaction missing from pool")
 	}
-	if pending, _ := pool.Stats(); pending != 1 {
-		t.Fatalf("expected one pending tx after replacement, got %d", pending)
+	if !pool.Has(differentDomainTx.Hash()) {
+		t.Fatal("different nonce domain transaction missing from pool")
+	}
+	if pending, _ := pool.Stats(); pending != 2 {
+		t.Fatalf("expected two pending nonce domains after replacement, got %d", pending)
 	}
 }
 

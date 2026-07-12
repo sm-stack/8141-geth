@@ -40,7 +40,7 @@ import (
 
 const (
 	// maxFrameTxsPerAccount is the ERC-7562 SAME_SENDER_MEMPOOL_COUNT.
-	maxFrameTxsPerAccount = 1
+	maxFrameTxsPerAccount = types.MaxNonceKeys
 
 	// maxPendingTxsUsingNonCanonicalPaymaster limits pooled transactions per
 	// non-canonical paymaster.
@@ -194,7 +194,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		if err := p.validatePaymasterAccounting(tx, meta, nil); err != nil {
 			continue
 		}
-		if p.reserver != nil {
+		if len(p.pending[sender]) == 0 && p.reserver != nil {
 			if err := p.reserver.Hold(sender); err != nil {
 				continue
 			}
@@ -343,17 +343,25 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		return err
 	}
 
-	var replacement *types.Transaction
+	var (
+		replacement      *types.Transaction
+		replacementIndex = -1
+	)
 	if txs := p.pending[sender]; len(txs) > 0 {
-		if len(txs) >= maxFrameTxsPerAccount {
-			replacement = txs[0]
-			oldFrameTx := replacement.GetFrameTx()
-			if frameTx.NonceSeq != oldFrameTx.NonceSeq || !frameTx.NonceKeySetEqual(oldFrameTx) {
-				return fmt.Errorf("%w: sender %s has a pending frame transaction with a different nonce domain", txpool.ErrAccountLimitExceeded, sender.Hex())
+		for index, pendingTx := range txs {
+			oldFrameTx := pendingTx.GetFrameTx()
+			if frameTx.NonceSeq == oldFrameTx.NonceSeq && frameTx.NonceKeySetEqual(oldFrameTx) {
+				replacement = pendingTx
+				replacementIndex = index
+				break
 			}
+		}
+		if replacement != nil {
 			if !isFrameTxPriceBumped(tx, replacement) {
 				return txpool.ErrReplaceUnderpriced
 			}
+		} else if len(txs) >= maxFrameTxsPerAccount {
+			return fmt.Errorf("%w: sender %s has %d pending frame transactions", txpool.ErrAccountLimitExceeded, sender.Hex(), len(txs))
 		}
 	}
 	if replacement == nil && len(p.all) >= maxFramePoolSize {
@@ -395,7 +403,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	if replacement != nil {
 		p.releaseTxAccounting(replacement.Hash())
 		delete(p.all, replacement.Hash())
-		p.pending[sender][0] = tx
+		p.pending[sender][replacementIndex] = tx
 	} else {
 		p.pending[sender] = append(p.pending[sender], tx)
 	}
