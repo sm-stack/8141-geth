@@ -126,6 +126,46 @@ func TestFrameParamStatusOnlyPastFrames(t *testing.T) {
 	}
 }
 
+func TestTxParamKeyedNonceSelectors(t *testing.T) {
+	keys := []*uint256.Int{uint256.NewInt(7), uint256.NewInt(11)}
+	fc := &FrameContext{
+		NonceKeys:     keys,
+		NonceSeq:      3,
+		LegacyNonce:   19,
+		NonceKeysHash: types.ComputeNonceKeysHash(keys),
+	}
+	if want := common.HexToHash("0x1c206b1cab1a56015ca8c444c1039f73077b99134d3ad0130c05afe9813b586d"); fc.NonceKeysHash != want {
+		t.Fatalf("nonce keys hash = %s, want %s", fc.NonceKeysHash, want)
+	}
+	tests := []struct {
+		selector uint64
+		want     *uint256.Int
+	}{
+		{txParamNonce, uint256.NewInt(3)},
+		{txParamNonceKey0, uint256.NewInt(7)},
+		{txParamLegacyNonce, uint256.NewInt(19)},
+		{txParamNonceKeyCount, uint256.NewInt(2)},
+		{txParamNonceKeysHash, new(uint256.Int).SetBytes(fc.NonceKeysHash[:])},
+	}
+	for _, tt := range tests {
+		evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+		evm.FrameCtx = fc
+		stack := newstack()
+		stack.push(new(uint256.Int).SetUint64(tt.selector))
+		pc := uint64(0)
+		_, err := opTxParam(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack})
+		if err != nil {
+			returnStack(stack)
+			t.Fatalf("TXPARAM(%#x) failed: %v", tt.selector, err)
+		}
+		got := stack.pop()
+		returnStack(stack)
+		if !got.Eq(tt.want) {
+			t.Fatalf("TXPARAM(%#x) = %x, want %x", tt.selector, got.Bytes32(), tt.want.Bytes32())
+		}
+	}
+}
+
 func TestSigParamReturnsSignatureMetadata(t *testing.T) {
 	signer := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	msg := common.HexToHash("0x1234").Bytes()

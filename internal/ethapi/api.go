@@ -991,7 +991,9 @@ type RPCTransaction struct {
 	MaxFeePerBlobGas    *hexutil.Big                 `json:"maxFeePerBlobGas,omitempty"`
 	Hash                common.Hash                  `json:"hash"`
 	Input               hexutil.Bytes                `json:"input"`
-	Nonce               hexutil.Uint64               `json:"nonce"`
+	Nonce               *hexutil.Uint64              `json:"nonce,omitempty"`
+	NonceKeys           []*hexutil.Big               `json:"nonceKeys,omitempty"`
+	NonceSeq            *hexutil.Uint64              `json:"nonceSeq,omitempty"`
 	To                  *common.Address              `json:"to"`
 	TransactionIndex    *hexutil.Uint64              `json:"transactionIndex"`
 	Value               *hexutil.Big                 `json:"value"`
@@ -1014,6 +1016,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 	signer := types.MakeSigner(config, new(big.Int).SetUint64(blockNumber), blockTime)
 	from, _ := types.Sender(signer, tx)
 	v, r, s := tx.RawSignatureValues()
+	nonce := hexutil.Uint64(tx.Nonce())
 	result := &RPCTransaction{
 		Type:     hexutil.Uint64(tx.Type()),
 		From:     from,
@@ -1021,7 +1024,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		GasPrice: (*hexutil.Big)(tx.GasPrice()),
 		Hash:     tx.Hash(),
 		Input:    hexutil.Bytes(tx.Data()),
-		Nonce:    hexutil.Uint64(tx.Nonce()),
+		Nonce:    &nonce,
 		To:       tx.To(),
 		Value:    (*hexutil.Big)(tx.Value()),
 		V:        (*hexutil.Big)(v),
@@ -1099,6 +1102,12 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 
 	case types.FrameTxType:
 		frameTx := tx.GetFrameTx()
+		result.Nonce = nil
+		result.NonceKeys = make([]*hexutil.Big, len(frameTx.NonceKeys))
+		for i, key := range frameTx.NonceKeys {
+			result.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
+		}
+		result.NonceSeq = (*hexutil.Uint64)(&frameTx.NonceSeq)
 		result.ChainID = (*hexutil.Big)(tx.ChainId())
 		result.Sender = &frameTx.Sender
 		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())

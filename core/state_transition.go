@@ -62,7 +62,13 @@ type framePaymentEffect struct {
 	frameIndex       int
 	payer            common.Address
 	gasCharge        *uint256.Int
-	senderNonceAfter uint64
+	legacyNonceAfter *uint64
+	keyedNonceWrites []keyedNonceWrite
+}
+
+type keyedNonceWrite struct {
+	slot  common.Hash
+	value common.Hash
 }
 
 func emptyFrameLogRange() frameLogRange {
@@ -89,7 +95,12 @@ func (a *frameApprovalState) reapplyPaymentEffect(st *stateTransition, batchStar
 		return
 	}
 	st.state.SubBalance(effect.payer, new(uint256.Int).Set(effect.gasCharge), tracing.BalanceDecreaseGasBuy)
-	st.state.SetNonce(st.msg.From, effect.senderNonceAfter, tracing.NonceChangeEoACall)
+	if effect.legacyNonceAfter != nil {
+		st.state.SetNonce(st.msg.From, *effect.legacyNonceAfter, tracing.NonceChangeEoACall)
+	}
+	for _, write := range effect.keyedNonceWrites {
+		st.state.SetState(params.NonceManagerAddress, write.slot, write.value)
+	}
 }
 
 // Unwrap returns the internal evm error which allows us for further
@@ -228,6 +239,9 @@ type Message struct {
 	FrameSignatures   []types.TxSignature
 	FrameSigHash      common.Hash // Pre-computed compute_sig_hash(tx).
 	FrameFloorDataGas uint64      // Pre-computed EIP-7623 floor data gas.
+	FrameNonceKeys    []*uint256.Int
+	FrameNonceSeq     uint64
+	FrameLegacyNonce  uint64
 }
 
 // TransactionToMessage converts a transaction into a Message.
@@ -261,6 +275,8 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 			return nil, err
 		}
 		msg.Frames = ftx.Frames
+		msg.FrameNonceKeys = ftx.NonceKeys
+		msg.FrameNonceSeq = ftx.NonceSeq
 		msg.FrameSignatures = ftx.Signatures
 		msg.FrameSigHash = ftx.SigHash(tx.ChainId())
 		if err := types.ValidateFrameTxSignatures(ftx, msg.FrameSigHash); err != nil {
@@ -393,7 +409,14 @@ func (st *stateTransition) buyGas() error {
 func (st *stateTransition) preCheck() error {
 	// Only check transactions that are not fake
 	msg := st.msg
-	if !msg.SkipNonceChecks {
+	if len(msg.FrameNonceKeys) > 0 {
+		msg.FrameLegacyNonce = st.state.GetNonce(msg.From)
+		if !msg.SkipNonceChecks {
+			if err := st.checkFrameNonce(); err != nil {
+				return err
+			}
+		}
+	} else if !msg.SkipNonceChecks {
 		// Make sure this transaction's nonce is correct.
 		stNonce := st.state.GetNonce(msg.From)
 		if msgNonce := msg.Nonce; stNonce < msgNonce {
@@ -494,6 +517,29 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	return st.buyGas()
+}
+
+func (st *stateTransition) checkFrameNonce() error {
+	msg := st.msg
+	if msg.FrameNonceSeq == math.MaxUint64 {
+		return fmt.Errorf("%w: address %v, nonce sequence exhausted", ErrNonceMax, msg.From.Hex())
+	}
+	want := new(big.Int).SetUint64(msg.FrameNonceSeq)
+	for _, key := range msg.FrameNonceKeys {
+		var have *big.Int
+		if key.IsZero() {
+			have = new(big.Int).SetUint64(msg.FrameLegacyNonce)
+		} else {
+			have = st.state.GetState(params.NonceManagerAddress, types.NonceManagerSlot(msg.From, key)).Big()
+		}
+		if have.Cmp(want) < 0 {
+			return fmt.Errorf("%w: address %v, nonce key %x tx: %d state: %s", ErrNonceTooHigh, msg.From.Hex(), key.Bytes32(), msg.FrameNonceSeq, have)
+		}
+		if have.Cmp(want) > 0 {
+			return fmt.Errorf("%w: address %v, nonce key %x tx: %d state: %s", ErrNonceTooLow, msg.From.Hex(), key.Bytes32(), msg.FrameNonceSeq, have)
+		}
+	}
+	return nil
 }
 
 // execute will transition the state by applying the current message and
@@ -832,18 +878,21 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 	gasFeeCap, _ := uint256.FromBig(msg.GasFeeCap)
 	blobFeeCap, _ := uint256.FromBig(msg.BlobGasFeeCap)
 	frameCtx := &vm.FrameContext{
-		Sender:       msg.From,
-		Nonce:        msg.Nonce,
-		Frames:       msg.Frames,
-		Signatures:   msg.FrameSignatures,
-		GasTipCap:    gasTipCap,
-		GasFeeCap:    gasFeeCap,
-		BlobFeeCap:   blobFeeCap,
-		BlobHashes:   msg.BlobHashes,
-		GasLimit:     msg.GasLimit,
-		SigHash:      msg.FrameSigHash,
-		FrameIndex:   0,
-		FrameResults: make([]uint8, len(msg.Frames)),
+		Sender:        msg.From,
+		NonceKeys:     msg.FrameNonceKeys,
+		NonceSeq:      msg.FrameNonceSeq,
+		LegacyNonce:   msg.FrameLegacyNonce,
+		NonceKeysHash: types.ComputeNonceKeysHash(msg.FrameNonceKeys),
+		Frames:        msg.Frames,
+		Signatures:    msg.FrameSignatures,
+		GasTipCap:     gasTipCap,
+		GasFeeCap:     gasFeeCap,
+		BlobFeeCap:    blobFeeCap,
+		BlobHashes:    msg.BlobHashes,
+		GasLimit:      msg.GasLimit,
+		SigHash:       msg.FrameSigHash,
+		FrameIndex:    0,
+		FrameResults:  make([]uint8, len(msg.Frames)),
 	}
 	st.evm.FrameCtx = frameCtx
 	defer func() { st.evm.FrameCtx = nil }()
@@ -1000,19 +1049,30 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 				} else if approvals.payerApproved {
 					needRevert = true
 				} else {
-					gasCharge, err := st.collectGasFromPayer(target)
+					nonceGas, legacyNonceAfter, keyedWrites, err := st.consumeFrameNonce(leftOverGas)
 					if err != nil {
-						return common.Address{}, nil, nil, nil, err
-					}
-					approvals.payer = target
-					approvals.payerApproved = true
-					senderNonceAfter := st.state.GetNonce(msg.From) + 1
-					st.state.SetNonce(msg.From, senderNonceAfter, tracing.NonceChangeEoACall)
-					approvals.paymentEffect = &framePaymentEffect{
-						frameIndex:       i,
-						payer:            target,
-						gasCharge:        gasCharge,
-						senderNonceAfter: senderNonceAfter,
+						needRevert = true
+						leftOverGas = 0
+						additionalGas := frame.GasLimit - frameGasUsed[i]
+						frameGasUsed[i] += additionalGas
+						totalGasUsed += additionalGas
+					} else {
+						leftOverGas -= nonceGas
+						frameGasUsed[i] += nonceGas
+						totalGasUsed += nonceGas
+						gasCharge, err := st.collectGasFromPayer(target)
+						if err != nil {
+							return common.Address{}, nil, nil, nil, err
+						}
+						approvals.payer = target
+						approvals.payerApproved = true
+						approvals.paymentEffect = &framePaymentEffect{
+							frameIndex:       i,
+							payer:            target,
+							gasCharge:        gasCharge,
+							legacyNonceAfter: legacyNonceAfter,
+							keyedNonceWrites: keyedWrites,
+						}
 					}
 				}
 			}
@@ -1056,6 +1116,36 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 	st.gasRemaining -= totalGasUsed
 
 	return approvals.payer, frameResults, frameGasUsed, frameLogRanges, nil
+}
+
+func (st *stateTransition) consumeFrameNonce(gasAvailable uint64) (uint64, *uint64, []keyedNonceWrite, error) {
+	msg := st.msg
+	if len(msg.FrameNonceKeys) == 1 && msg.FrameNonceKeys[0].IsZero() {
+		current := st.state.GetNonce(msg.From)
+		if current == math.MaxUint64 {
+			return 0, nil, nil, ErrNonceMax
+		}
+		next := current + 1
+		st.state.SetNonce(msg.From, next, tracing.NonceChangeEoACall)
+		return 0, &next, nil, nil
+	}
+	writes := make([]keyedNonceWrite, len(msg.FrameNonceKeys))
+	var firstUse uint64
+	for i, key := range msg.FrameNonceKeys {
+		slot := types.NonceManagerSlot(msg.From, key)
+		if st.state.GetState(params.NonceManagerAddress, slot) == (common.Hash{}) {
+			firstUse++
+		}
+		writes[i] = keyedNonceWrite{slot: slot, value: common.BigToHash(new(big.Int).SetUint64(msg.FrameNonceSeq + 1))}
+	}
+	gas := firstUse * params.KeyedNonceFirstUseGas
+	if gas > gasAvailable {
+		return 0, nil, nil, vm.ErrOutOfGas
+	}
+	for _, write := range writes {
+		st.state.SetState(params.NonceManagerAddress, write.slot, write.value)
+	}
+	return gas, nil, writes, nil
 }
 
 // hasNoCode returns true if the given address has no code (is an EOA).

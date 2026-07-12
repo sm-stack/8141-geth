@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
@@ -148,7 +150,8 @@ func makeFrameTx(ftx *types.FrameTx) *types.Transaction {
 func baseFTX(sender common.Address, nonce uint64, config *params.ChainConfig) *types.FrameTx {
 	return &types.FrameTx{
 		ChainID:    uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:      nonce,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   nonce,
 		Sender:     sender,
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -710,6 +713,15 @@ func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
 		t.Fatal("expected same-nonce replacement without fee bump to be rejected")
 	}
 
+	differentDomain := baseFTX(sender, 0, config)
+	differentDomain.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
+	differentDomain.GasTipCap = uint256.NewInt(2)
+	differentDomain.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
+	differentDomain.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000, Data: []byte{0x04}}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(differentDomain)}, false)[0]; !errors.Is(err, txpool.ErrAccountLimitExceeded) {
+		t.Fatalf("different nonce domain replacement error = %v, want account limit", err)
+	}
+
 	bumped := baseFTX(sender, 0, config)
 	bumped.GasTipCap = uint256.NewInt(2)
 	bumped.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 11 / 10)
@@ -751,6 +763,44 @@ func TestFramePoolNonceCheck(t *testing.T) {
 		t.Fatal("expected rejection for nonce too low")
 	}
 	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestValidateFrameKeyedNonce(t *testing.T) {
+	_, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	key := uint256.NewInt(9)
+	slot := types.NonceManagerSlot(sender, key)
+	statedb.SetState(params.NonceManagerAddress, slot, common.BigToHash(big.NewInt(5)))
+
+	ftx := baseFTX(sender, 5, config)
+	ftx.NonceKeys = []*uint256.Int{key}
+	if err := validateFrameNonce(ftx, statedb); err != nil {
+		t.Fatalf("matching keyed nonce rejected: %v", err)
+	}
+	ftx.NonceSeq = 4
+	if err := validateFrameNonce(ftx, statedb); !errors.Is(err, core.ErrNonceTooLow) {
+		t.Fatalf("old keyed nonce error = %v, want nonce too low", err)
+	}
+	ftx.NonceSeq = 6
+	if err := validateFrameNonce(ftx, statedb); !errors.Is(err, core.ErrNonceTooHigh) {
+		t.Fatalf("future keyed nonce error = %v, want nonce too high", err)
+	}
+}
+
+func TestFramePoolRejectsInsufficientKeyedNonceSurchargeGas(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 10_000}}
+	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+	if err == nil || !strings.Contains(err.Error(), "keyed nonce first use") {
+		t.Fatalf("insufficient surcharge gas error = %v", err)
+	}
 }
 
 func TestFramePoolDefaultFrameSkipsValidation(t *testing.T) {

@@ -27,6 +27,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	commonmath "github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
@@ -34,6 +35,8 @@ import (
 
 // errFrameGasUintOverflow is returned when a gas calculation overflows uint64.
 var errFrameGasUintOverflow = errors.New("gas uint64 overflow")
+
+const MaxNonceKeys = 16
 
 // Frame mode constants as defined in EIP-8141.
 const (
@@ -141,12 +144,13 @@ type TxSignature struct {
 // FrameTx implements the EIP-8141 frame transaction.
 //
 // RLP encoding:
-// [chain_id, nonce, sender, frames, signatures, max_priority_fee_per_gas, max_fee_per_gas,
+// [chain_id, nonce_keys, nonce_seq, sender, frames, signatures, max_priority_fee_per_gas, max_fee_per_gas,
 //
 //	max_fee_per_blob_gas, blob_versioned_hashes]
 type FrameTx struct {
 	ChainID    *uint256.Int
-	Nonce      uint64
+	NonceKeys  []*uint256.Int
+	NonceSeq   uint64
 	Sender     common.Address
 	Frames     []Frame
 	Signatures []TxSignature
@@ -159,7 +163,8 @@ type FrameTx struct {
 // copy creates a deep copy of the transaction data and initializes all fields.
 func (tx *FrameTx) copy() TxData {
 	cpy := &FrameTx{
-		Nonce:      tx.Nonce,
+		NonceKeys:  make([]*uint256.Int, len(tx.NonceKeys)),
+		NonceSeq:   tx.NonceSeq,
 		Sender:     tx.Sender,
 		Frames:     make([]Frame, len(tx.Frames)),
 		Signatures: make([]TxSignature, len(tx.Signatures)),
@@ -168,6 +173,11 @@ func (tx *FrameTx) copy() TxData {
 		GasTipCap:  new(uint256.Int),
 		GasFeeCap:  new(uint256.Int),
 		BlobFeeCap: new(uint256.Int),
+	}
+	for i, key := range tx.NonceKeys {
+		if key != nil {
+			cpy.NonceKeys[i] = new(uint256.Int).Set(key)
+		}
 	}
 	// Deep copy frames.
 	for i, f := range tx.Frames {
@@ -220,7 +230,7 @@ func (tx *FrameTx) gasFeeCap() *big.Int    { return tx.GasFeeCap.ToBig() }
 func (tx *FrameTx) gasTipCap() *big.Int    { return tx.GasTipCap.ToBig() }
 func (tx *FrameTx) gasPrice() *big.Int     { return tx.GasFeeCap.ToBig() }
 func (tx *FrameTx) value() *big.Int        { return new(big.Int) }
-func (tx *FrameTx) nonce() uint64          { return tx.Nonce }
+func (tx *FrameTx) nonce() uint64          { return tx.NonceSeq }
 func (tx *FrameTx) to() *common.Address    { return nil }
 func (tx *FrameTx) blobGas() uint64        { return params.BlobTxBlobGasPerBlob * uint64(len(tx.BlobHashes)) }
 func (tx *FrameTx) BlobGas() uint64        { return tx.blobGas() }
@@ -246,14 +256,37 @@ func (tx *FrameTx) rawSignatureValues() (v, r, s *big.Int) {
 func (tx *FrameTx) setSignatureValues(chainID, v, r, s *big.Int) {}
 
 func (tx *FrameTx) encode(b *bytes.Buffer) error {
-	return rlp.Encode(b, tx)
+	return rlp.Encode(b, &frameTxRLP{
+		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq,
+		Sender: tx.Sender, Frames: tx.Frames, Signatures: tx.Signatures,
+		GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,
+		BlobFeeCap: tx.BlobFeeCap, BlobHashes: tx.BlobHashes,
+	})
 }
 
 func (tx *FrameTx) decode(input []byte) error {
-	if err := rlp.DecodeBytes(input, tx); err != nil {
+	var dec frameTxRLP
+	if err := rlp.DecodeBytes(input, &dec); err != nil {
 		return err
 	}
+	tx.ChainID, tx.NonceKeys, tx.NonceSeq = dec.ChainID, dec.NonceKeys, dec.NonceSeq
+	tx.Sender, tx.Frames, tx.Signatures = dec.Sender, dec.Frames, dec.Signatures
+	tx.GasTipCap, tx.GasFeeCap = dec.GasTipCap, dec.GasFeeCap
+	tx.BlobFeeCap, tx.BlobHashes = dec.BlobFeeCap, dec.BlobHashes
 	return tx.Validate()
+}
+
+type frameTxRLP struct {
+	ChainID    *uint256.Int
+	NonceKeys  []*uint256.Int
+	NonceSeq   uint64
+	Sender     common.Address
+	Frames     []Frame
+	Signatures []TxSignature
+	GasTipCap  *uint256.Int
+	GasFeeCap  *uint256.Int
+	BlobFeeCap *uint256.Int
+	BlobHashes []common.Hash
 }
 
 // rlpFramesData returns the RLP-encoded frames as a byte slice.
@@ -426,6 +459,25 @@ func (tx *FrameTx) sigHash(chainID *big.Int) common.Hash {
 	return prefixedRlpHash(FrameTxType, hashTx)
 }
 
+// ValidateNonceKeys checks the canonical EIP-8250 nonce domain constraints.
+func ValidateNonceKeys(keys []*uint256.Int) error {
+	if len(keys) == 0 || len(keys) > MaxNonceKeys {
+		return fmt.Errorf("frame tx has %d nonce keys, want 1..%d", len(keys), MaxNonceKeys)
+	}
+	for i, key := range keys {
+		if key == nil {
+			return fmt.Errorf("frame tx nonce key %d is nil", i)
+		}
+		if i > 0 && keys[i-1].Cmp(key) >= 0 {
+			return errors.New("frame tx nonce keys are not strictly increasing")
+		}
+		if key.IsZero() && (len(keys) != 1 || i != 0) {
+			return errors.New("zero nonce key is only valid as singleton [0]")
+		}
+	}
+	return nil
+}
+
 // Validate checks statically-decidable EIP-8141 frame transaction constraints.
 func (tx *FrameTx) Validate() error {
 	if tx.ChainID == nil {
@@ -439,6 +491,9 @@ func (tx *FrameTx) Validate() error {
 	}
 	if tx.BlobFeeCap == nil {
 		return errors.New("frame tx missing max_fee_per_blob_gas")
+	}
+	if err := ValidateNonceKeys(tx.NonceKeys); err != nil {
+		return err
 	}
 	if len(tx.Frames) == 0 {
 		return errors.New("frame tx has no frames")
@@ -497,4 +552,44 @@ func (tx *FrameTx) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (tx *FrameTx) UsesLegacyNonce() bool {
+	return len(tx.NonceKeys) == 1 && tx.NonceKeys[0] != nil && tx.NonceKeys[0].IsZero()
+}
+
+func (tx *FrameTx) NonceKeySetEqual(other *FrameTx) bool {
+	if other == nil || len(tx.NonceKeys) != len(other.NonceKeys) {
+		return false
+	}
+	for i := range tx.NonceKeys {
+		if tx.NonceKeys[i] == nil || other.NonceKeys[i] == nil || !tx.NonceKeys[i].Eq(other.NonceKeys[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (tx *FrameTx) NonceKeysHash() common.Hash {
+	return ComputeNonceKeysHash(tx.NonceKeys)
+}
+
+func ComputeNonceKeysHash(keys []*uint256.Int) common.Hash {
+	data := make([]byte, 32*(len(keys)+1))
+	new(uint256.Int).SetUint64(uint64(len(keys))).WriteToSlice(data[:32])
+	for i, key := range keys {
+		if key != nil {
+			key.WriteToSlice(data[32*(i+1) : 32*(i+2)])
+		}
+	}
+	return common.BytesToHash(crypto.Keccak256(data))
+}
+
+func NonceManagerSlot(sender common.Address, key *uint256.Int) common.Hash {
+	data := make([]byte, 64)
+	copy(data[12:32], sender[:])
+	if key != nil {
+		key.WriteToSlice(data[32:])
+	}
+	return crypto.Keccak256Hash(data)
 }

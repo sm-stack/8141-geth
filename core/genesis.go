@@ -693,6 +693,7 @@ func DeveloperGenesisBlock(gasLimit uint64, faucet *common.Address) *Genesis {
 			params.WithdrawalQueueAddress:     {Nonce: 1, Code: params.WithdrawalQueueCode, Balance: common.Big0},
 			params.ConsolidationQueueAddress:  {Nonce: 1, Code: params.ConsolidationQueueCode, Balance: common.Big0},
 			params.FrameExpiryVerifierAddress: {Nonce: 1, Code: params.FrameExpiryVerifierCode, Balance: common.Big0},
+			params.NonceManagerAddress:        {Nonce: 1, Code: params.NonceManagerCode, Balance: common.Big0},
 		},
 	}
 	if faucet != nil {

@@ -40,7 +40,8 @@ func testFrameTx() *FrameTx {
 	explicitMsg := common.Hash{0x01}.Bytes()
 	return &FrameTx{
 		ChainID:    uint256.NewInt(1),
-		Nonce:      42,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   42,
 		Sender:     common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		GasTipCap:  uint256.NewInt(1_000_000_000),  // 1 gwei
 		GasFeeCap:  uint256.NewInt(30_000_000_000), // 30 gwei
@@ -73,7 +74,8 @@ func testFrameTxSigHashVector() *FrameTx {
 	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
 	return &FrameTx{
 		ChainID:    uint256.NewInt(1),
-		Nonce:      7,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   7,
 		Sender:     common.HexToAddress("0x1111111111111111111111111111111111111111"),
 		GasTipCap:  uint256.NewInt(3),
 		GasFeeCap:  uint256.NewInt(100),
@@ -203,9 +205,13 @@ func TestFrameTxCopy(t *testing.T) {
 	cpy := ftx.copy().(*FrameTx)
 
 	// Verify deep copy independence.
-	cpy.Nonce = 99
-	if ftx.Nonce == cpy.Nonce {
+	cpy.NonceSeq = 99
+	if ftx.NonceSeq == cpy.NonceSeq {
 		t.Error("copy() did not deep copy Nonce")
+	}
+	cpy.NonceKeys[0].SetUint64(9)
+	if ftx.NonceKeys[0].Eq(cpy.NonceKeys[0]) {
+		t.Error("copy() did not deep copy NonceKeys")
 	}
 
 	cpy.Frames[0].Data[0] = 0xff
@@ -294,8 +300,8 @@ func TestFrameTxSignatureGas(t *testing.T) {
 
 func TestFrameTxSigHashVector(t *testing.T) {
 	const (
-		wantSigHash = "0x8a6995cd49dc64c051cfed96ff9809e2ecfae14413127a51f76f43347da894b3"
-		wantRawTx   = "0x06f901a40107941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+		wantSigHash = "0x0b5ac8a9045a91da5db381e495a28164a69ca61b07098a5aabd630a891b4d93a"
+		wantRawTx   = "0x06f901a601c18007941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 	)
 	tx := testFrameTxSigHashVector()
 	if got, want := tx.SigHash(tx.chainID()).Hex(), wantSigHash; got != want {
@@ -679,7 +685,8 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 	type rawFrameTx struct {
 		ChainID    *uint256.Int
-		Nonce      uint64
+		NonceKeys  []*uint256.Int
+		NonceSeq   uint64
 		Sender     common.Address
 		Frames     []rawFrame
 		Signatures []rawSignature
@@ -690,9 +697,10 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 
 	raw := rawFrameTx{
-		ChainID: uint256.NewInt(1),
-		Nonce:   1,
-		Sender:  common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		ChainID:   uint256.NewInt(1),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  1,
+		Sender:    common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Frames: []rawFrame{
 			{
 				Mode:     FrameModeVerify,
@@ -725,6 +733,32 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 }
 
+func TestFrameTxUnmarshalBinaryRejectsLegacyNineFieldPayload(t *testing.T) {
+	legacy := struct {
+		ChainID    *uint256.Int
+		Nonce      uint64
+		Sender     common.Address
+		Frames     []Frame
+		Signatures []TxSignature
+		GasTipCap  *uint256.Int
+		GasFeeCap  *uint256.Int
+		BlobFeeCap *uint256.Int
+		BlobHashes []common.Hash
+	}{
+		ChainID: uint256.NewInt(1), Nonce: 0, Sender: common.HexToAddress("0x01"),
+		Frames:    []Frame{{Mode: FrameModeDefault, GasLimit: 1, Value: new(uint256.Int)}},
+		GasTipCap: uint256.NewInt(1), GasFeeCap: uint256.NewInt(1), BlobFeeCap: new(uint256.Int),
+	}
+	payload, err := rlp.EncodeToBytes(&legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tx Transaction
+	if err := tx.UnmarshalBinary(append([]byte{FrameTxType}, payload...)); err == nil {
+		t.Fatal("legacy nine-field frame transaction was accepted")
+	}
+}
+
 func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 	valid := func() *FrameTx {
 		return testFrameTx().copy().(*FrameTx)
@@ -733,6 +767,17 @@ func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 		name string
 		mut  func(*FrameTx)
 	}{
+		{name: "no nonce keys", mut: func(tx *FrameTx) { tx.NonceKeys = nil }},
+		{name: "too many nonce keys", mut: func(tx *FrameTx) {
+			tx.NonceKeys = make([]*uint256.Int, MaxNonceKeys+1)
+			for i := range tx.NonceKeys {
+				tx.NonceKeys[i] = uint256.NewInt(uint64(i + 1))
+			}
+		}},
+		{name: "nil nonce key", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{nil} }},
+		{name: "duplicate nonce keys", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(1), uint256.NewInt(1)} }},
+		{name: "descending nonce keys", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(2), uint256.NewInt(1)} }},
+		{name: "zero with another nonce key", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(0), uint256.NewInt(1)} }},
 		{
 			name: "no frames",
 			mut:  func(tx *FrameTx) { tx.Frames = nil },

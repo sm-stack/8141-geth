@@ -181,8 +181,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 			continue
 		}
 		sender := frameTx.Sender
-		stateNonce := statedb.GetNonce(sender)
-		if tx.Nonce() != stateNonce {
+		if err := validateFrameNonce(frameTx, statedb); err != nil {
 			continue
 		}
 		if len(p.pending[sender]) >= maxFrameTxsPerAccount {
@@ -306,6 +305,25 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 	return errs
 }
 
+func validateFrameNonce(tx *types.FrameTx, statedb *state.StateDB) error {
+	want := new(big.Int).SetUint64(tx.NonceSeq)
+	for _, key := range tx.NonceKeys {
+		var have *big.Int
+		if key.IsZero() {
+			have = new(big.Int).SetUint64(statedb.GetNonce(tx.Sender))
+		} else {
+			have = statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(tx.Sender, key)).Big()
+		}
+		switch have.Cmp(want) {
+		case -1:
+			return fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooHigh, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
+		case 1:
+			return fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooLow, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
+		}
+	}
+	return nil
+}
+
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
 func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	p.mu.Lock()
@@ -321,25 +339,22 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 	sender := frameTx.Sender
 
-	// Nonce check.
-	stateNonce := p.currentState.GetNonce(sender)
-	if tx.Nonce() < stateNonce {
-		return fmt.Errorf("%w: tx nonce %d, state nonce %d", core.ErrNonceTooLow, tx.Nonce(), stateNonce)
+	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
+		return err
 	}
 
 	var replacement *types.Transaction
 	if txs := p.pending[sender]; len(txs) > 0 {
 		if len(txs) >= maxFrameTxsPerAccount {
 			replacement = txs[0]
-			if tx.Nonce() != replacement.Nonce() {
-				return fmt.Errorf("%w: sender %s has pending nonce %d, got %d", txpool.ErrAccountLimitExceeded, sender.Hex(), replacement.Nonce(), tx.Nonce())
+			oldFrameTx := replacement.GetFrameTx()
+			if frameTx.NonceSeq != oldFrameTx.NonceSeq || !frameTx.NonceKeySetEqual(oldFrameTx) {
+				return fmt.Errorf("%w: sender %s has a pending frame transaction with a different nonce domain", txpool.ErrAccountLimitExceeded, sender.Hex())
 			}
 			if !isFrameTxPriceBumped(tx, replacement) {
 				return txpool.ErrReplaceUnderpriced
 			}
 		}
-	} else if tx.Nonce() > stateNonce {
-		return fmt.Errorf("%w: tx nonce %d, state nonce %d", core.ErrNonceTooHigh, tx.Nonce(), stateNonce)
 	}
 	if replacement == nil && len(p.all) >= maxFramePoolSize {
 		return fmt.Errorf("frame pool full")
@@ -411,16 +426,19 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 
 	// Build FrameContext (mirrors state_transition.go:806-821).
 	frameCtx := &vm.FrameContext{
-		Sender:       frameTx.Sender,
-		Nonce:        frameTx.Nonce,
-		Frames:       frameTx.Frames,
-		Signatures:   frameTx.Signatures,
-		GasTipCap:    new(uint256.Int).Set(frameTx.GasTipCap),
-		GasFeeCap:    new(uint256.Int).Set(frameTx.GasFeeCap),
-		GasLimit:     frameTx.TotalGas(),
-		SigHash:      sigHash,
-		FrameIndex:   0,
-		FrameResults: make([]uint8, len(frameTx.Frames)),
+		Sender:        frameTx.Sender,
+		NonceKeys:     frameTx.NonceKeys,
+		NonceSeq:      frameTx.NonceSeq,
+		LegacyNonce:   p.currentState.GetNonce(frameTx.Sender),
+		NonceKeysHash: frameTx.NonceKeysHash(),
+		Frames:        frameTx.Frames,
+		Signatures:    frameTx.Signatures,
+		GasTipCap:     new(uint256.Int).Set(frameTx.GasTipCap),
+		GasFeeCap:     new(uint256.Int).Set(frameTx.GasFeeCap),
+		GasLimit:      frameTx.TotalGas(),
+		SigHash:       sigHash,
+		FrameIndex:    0,
+		FrameResults:  make([]uint8, len(frameTx.Frames)),
 	}
 	if frameTx.BlobFeeCap != nil {
 		frameCtx.BlobFeeCap = new(uint256.Int).Set(frameTx.BlobFeeCap)
@@ -490,6 +508,9 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 		return frameTxMeta{}, err
 	}
 	if senderResult.approveScope == vm.ApproveBoth {
+		if err := p.validateNonceSurcharge(frameTx, senderResult.gasRemaining); err != nil {
+			return frameTxMeta{}, err
+		}
 		return frameTxMeta{
 			payer:   frameTx.Sender,
 			maxCost: tx.Cost(),
@@ -512,6 +533,9 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	}
 	if payResult.approveScope != vm.ApprovePayment {
 		return frameTxMeta{}, fmt.Errorf("VERIFY frame %d approved scope %d, want payment approval 1", plan.payVerifyIndex, payResult.approveScope)
+	}
+	if err := p.validateNonceSurcharge(frameTx, payResult.gasRemaining); err != nil {
+		return frameTxMeta{}, err
 	}
 	return frameTxMeta{
 		payer:              payResult.target,
@@ -635,11 +659,14 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	simState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
 
 	caller := params.FrameEntryPointAddress
-	var vmerr error
+	var (
+		gasRemaining uint64
+		vmerr        error
+	)
 	if hasNoCode(simState, target) {
-		_, _, vmerr = vm.ExecuteDefaultCode(evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
+		_, gasRemaining, vmerr = vm.ExecuteDefaultCode(evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
 	} else {
-		_, _, vmerr = evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
+		_, gasRemaining, vmerr = evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
 	}
 	evm.FrameCtx = nil
 	if tracer != nil {
@@ -657,7 +684,26 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	return verifyResult{
 		approveScope: scope,
 		target:       target,
+		gasRemaining: gasRemaining,
 	}, nil
+}
+
+func (p *FramePool) validateNonceSurcharge(frameTx *types.FrameTx, gasRemaining uint64) error {
+	if frameTx.UsesLegacyNonce() {
+		return nil
+	}
+	var firstUse uint64
+	for _, key := range frameTx.NonceKeys {
+		slot := types.NonceManagerSlot(frameTx.Sender, key)
+		if p.currentState.GetState(params.NonceManagerAddress, slot) == (common.Hash{}) {
+			firstUse++
+		}
+	}
+	required := firstUse * params.KeyedNonceFirstUseGas
+	if gasRemaining < required {
+		return fmt.Errorf("payment VERIFY frame has %d gas remaining, need %d for keyed nonce first use", gasRemaining, required)
+	}
+	return nil
 }
 
 func resolveFrameTarget(sender common.Address, frame types.Frame) common.Address {
@@ -692,6 +738,7 @@ func hasNoCode(statedb *state.StateDB, addr common.Address) bool {
 type verifyResult struct {
 	approveScope uint8
 	target       common.Address
+	gasRemaining uint64
 }
 
 // validateFrameOrdering performs pre-simulation static validation of frame ordering.
@@ -872,10 +919,10 @@ func (p *FramePool) Nonce(addr common.Address) uint64 {
 
 	nonce := p.currentState.GetNonce(addr)
 	if txs := p.pending[addr]; len(txs) > 0 {
-		// Find the highest nonce among pending txs.
 		for _, tx := range txs {
-			if tx.Nonce()+1 > nonce {
-				nonce = tx.Nonce() + 1
+			frameTx := tx.GetFrameTx()
+			if frameTx != nil && frameTx.UsesLegacyNonce() && frameTx.NonceSeq+1 > nonce {
+				nonce = frameTx.NonceSeq + 1
 			}
 		}
 	}

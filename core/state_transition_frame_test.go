@@ -125,9 +125,10 @@ func TestFrameTxSimple(t *testing.T) {
 	statedb.SetCode(target, returnCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000, Data: nil},
@@ -170,9 +171,10 @@ func TestFrameTxSenderValueTransferAndCallValue(t *testing.T) {
 	statedb.SetCode(target, callValueStoreCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: value, Data: nil},
@@ -212,9 +214,10 @@ func TestFrameTxSenderValueTransferToEOATarget(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: value, Data: nil},
@@ -253,9 +256,10 @@ func TestFrameTxSenderValueInsufficientBalanceRevertsFrame(t *testing.T) {
 	statedb.SetCode(target, callValueStoreCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Value: uint256.NewInt(1), Data: nil},
@@ -307,9 +311,10 @@ func TestFrameTxExpiryVerifierValidDeadline(t *testing.T) {
 	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50000, Data: expiryFrameData(100)},
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
@@ -347,9 +352,10 @@ func TestFrameTxExpiryVerifierExpiredDeadlineFails(t *testing.T) {
 	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50000, Data: expiryFrameData(99)},
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
@@ -362,6 +368,50 @@ func TestFrameTxExpiryVerifierExpiredDeadlineFails(t *testing.T) {
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	if _, err := applyFrameTx(evm, config, msg); err == nil {
 		t.Fatal("expected expired expiry verifier frame to fail")
+	}
+}
+
+func TestFrameTxKeyedNonceFirstUseGas(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	sender := common.HexToAddress("0x1111")
+	key := uint256.NewInt(7)
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	run := func(seq uint64) *ExecutionResult {
+		ftx := &types.FrameTx{
+			ChainID: uint256.NewInt(config.ChainID.Uint64()), NonceKeys: []*uint256.Int{new(uint256.Int).Set(key)}, NonceSeq: seq,
+			Sender: sender, Frames: []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}},
+			GasTipCap: uint256.NewInt(1), GasFeeCap: uint256.NewInt(uint64(params.InitialBaseFee)), BlobFeeCap: new(uint256.Int),
+		}
+		result, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+		if err != nil || result.Failed() {
+			t.Fatalf("sequence %d failed: result=%v err=%v", seq, result, err)
+		}
+		return result
+	}
+	first := run(0)
+	second := run(1)
+	if got, want := first.frameGasUsed[0]-second.frameGasUsed[0], params.KeyedNonceFirstUseGas; got != want {
+		t.Fatalf("first-use gas delta = %d, want %d", got, want)
+	}
+	if got := statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(sender, key)).Big().Uint64(); got != 2 {
+		t.Fatalf("keyed nonce sequence = %d, want 2", got)
+	}
+	if got := statedb.GetNonce(sender); got != 0 {
+		t.Fatalf("keyed nonce changed account nonce to %d", got)
+	}
+}
+
+func TestNonceManagerRuntimeRejectsDirectCalls(t *testing.T) {
+	evm, statedb, _ := newFrameTestEnv()
+	caller := common.HexToAddress("0x1111")
+	statedb.CreateAccount(caller)
+	statedb.CreateAccount(params.NonceManagerAddress)
+	statedb.SetCode(params.NonceManagerAddress, params.NonceManagerCode, tracing.CodeChangeUnspecified)
+	if _, _, err := evm.Call(caller, params.NonceManagerAddress, nil, 50_000, new(uint256.Int)); !errors.Is(err, vm.ErrExecutionReverted) {
+		t.Fatalf("nonce manager direct call error = %v, want revert", err)
 	}
 }
 
@@ -427,9 +477,10 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 
 	sponsorBalBefore := statedb.GetBalance(sponsor).Clone()
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(1), uint256.NewInt(2)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 2, Target: nil, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 1, Target: &sponsor, GasLimit: 50000, Data: nil},
@@ -464,8 +515,13 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 			}
 		}
 	}
-	if got := statedb.GetNonce(sender); got != 1 {
-		t.Fatalf("sender nonce: got %d, want 1", got)
+	if got := statedb.GetNonce(sender); got != 0 {
+		t.Fatalf("sender account nonce: got %d, want 0", got)
+	}
+	for _, key := range ftx.NonceKeys {
+		if got := statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(sender, key)).Big().Uint64(); got != 1 {
+			t.Fatalf("keyed nonce %d after atomic rollback: got %d, want 1", key.Uint64(), got)
+		}
 	}
 	if sponsorBalAfter := statedb.GetBalance(sponsor); sponsorBalAfter.Cmp(sponsorBalBefore) >= 0 {
 		t.Fatalf("sponsor balance should have paid gas: before=%s after=%s", sponsorBalBefore, sponsorBalAfter)
@@ -491,9 +547,10 @@ func TestFrameTxSenderNotApproved(t *testing.T) {
 
 	// SENDER mode is first, before any VERIFY — should fail.
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: nil},
@@ -527,9 +584,10 @@ func TestFrameTxNoPayerApproval(t *testing.T) {
 	statedb.SetCode(target, returnCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000, Data: nil},
@@ -559,9 +617,10 @@ func TestFrameTxVerifyFailure(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: nil},
 		},
@@ -588,9 +647,10 @@ func TestFrameTxVerifyReturnWithoutApproveFails(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
 		},
@@ -632,9 +692,10 @@ func TestFrameTxSponsoredTransaction(t *testing.T) {
 	statedb.SetCode(target, returnCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 50000, Data: nil},
@@ -682,9 +743,10 @@ func TestFrameTxGasAccounting(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
@@ -730,9 +792,10 @@ func TestFrameTxDefaultMode(t *testing.T) {
 	statedb.SetCode(deployer, returnCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeDefault, Target: &deployer, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
@@ -763,9 +826,10 @@ func TestFrameTxPayerInsufficientBalance(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1), tracing.BalanceChangeUnspecified) // 1 wei — not enough
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
 		},
@@ -792,9 +856,10 @@ func TestFrameTxApproveScopeMustBeAllowedByFrameFlags(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: nil},
 		},
@@ -821,9 +886,10 @@ func TestFrameTxApproveScopeZeroRejected(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: nil},
 		},
@@ -852,9 +918,10 @@ func TestFrameTxReApproveExecution(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: []byte{0x02}},
@@ -885,9 +952,10 @@ func TestFrameTxPayBeforeSenderApproval(t *testing.T) {
 
 	// Sponsor tries to APPROVE(0x1) first, before any sender APPROVE(0x2).
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  common.HexToAddress("0x1111"),
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    common.HexToAddress("0x1111"),
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 50000, Data: nil},
 		},
@@ -927,9 +995,10 @@ func TestFrameTxApproveBothAfterExec(t *testing.T) {
 	statedb.SetCode(sender, conditionalApproveCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			// Frame 0: non-zero calldata → APPROVE(0x2)
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000,
@@ -979,9 +1048,10 @@ func TestFrameTxTransientStorageReset(t *testing.T) {
 	statedb.SetCode(target, tstoreCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000, Data: nil},
@@ -1028,9 +1098,10 @@ func TestFrameTxDeploymentFlow(t *testing.T) {
 	statedb.SetCode(deployer, returnCode, tracing.CodeChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeDefault, Target: &deployer, GasLimit: 50000, Data: []byte{0xde, 0xad}},
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
@@ -1089,9 +1160,10 @@ func TestFrameTxTxParam(t *testing.T) {
 	statedb.SetNonce(sender, nonce, tracing.NonceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   nonce,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  nonce,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 100000, Data: nil},
@@ -1178,9 +1250,10 @@ func TestFrameTxFrameIntrospectionOpcodes(t *testing.T) {
 
 	frameGas := uint64(50000)
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: frameGas, Data: frameData},
 			{Mode: types.FrameModeSender, Target: &target, GasLimit: 300000, Data: nil},

@@ -186,8 +186,9 @@ func fundAccount(ctx context.Context, client *ethclient.Client, devKey *ecdsa.Pr
 // buildFrameTx constructs an EIP-8141 frame transaction.
 //
 // Example 1 — Simple Transaction:
-//   Frame 0: VERIFY(sender)  -> validate(v, r, s, scope=2) -> APPROVE(both)
-//   Frame 1: SENDER(target)  -> simple call (empty data)
+//
+//	Frame 0: VERIFY(sender)  -> validate(v, r, s, scope=2) -> APPROVE(both)
+//	Frame 1: SENDER(target)  -> simple call (empty data)
 func buildFrameTx(ctx context.Context, client *ethclient.Client, ownerKey *ecdsa.PrivateKey, simpleAccountAddr common.Address) (*types.Transaction, error) {
 	// Get SimpleAccount nonce (should be 1 after contract creation per EIP-161).
 	accountNonce, err := client.NonceAt(ctx, simpleAccountAddr, nil)
@@ -215,9 +216,10 @@ func buildFrameTx(ctx context.Context, client *ethclient.Client, ownerKey *ecdsa
 	// Build FrameTx with placeholder VERIFY data.
 	// sigHash elides VERIFY data, so placeholder doesn't affect the hash.
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(chainID),
-		Nonce:   accountNonce,
-		Sender:  simpleAccountAddr,
+		ChainID:   uint256.NewInt(chainID),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  accountNonce,
+		Sender:    simpleAccountAddr,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: verifyGas, Data: nil},
 			{Mode: types.FrameModeSender, Target: &targetAddr, GasLimit: senderGas, Data: nil},
@@ -247,10 +249,10 @@ func buildFrameTx(ctx context.Context, client *ethclient.Client, ownerKey *ecdsa
 	// Selector: f2d64fed
 	calldata := make([]byte, 4+32*4) // 132 bytes
 	copy(calldata[0:4], validateSelector)
-	calldata[35] = v                                        // uint8 v in last byte of word 1
-	copy(calldata[36:68], common.LeftPadBytes(r, 32))       // bytes32 r
-	copy(calldata[68:100], common.LeftPadBytes(s, 32))      // bytes32 s
-	calldata[131] = 2                                       // uint8 scope=2 (both) in last byte of word 4
+	calldata[35] = v                                   // uint8 v in last byte of word 1
+	copy(calldata[36:68], common.LeftPadBytes(r, 32))  // bytes32 r
+	copy(calldata[68:100], common.LeftPadBytes(s, 32)) // bytes32 s
+	calldata[131] = 2                                  // uint8 scope=2 (both) in last byte of word 4
 
 	// Set the VERIFY frame data.
 	ftx.Frames[0].Data = calldata

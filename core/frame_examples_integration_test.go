@@ -65,7 +65,8 @@ func applyFrameTxAndReceipt(t *testing.T, evm *vm.EVM, statedb *state.StateDB, c
 func newFrameTx(config *params.ChainConfig, nonce uint64, sender common.Address, frames []types.Frame) *types.Transaction {
 	return types.NewTx(&types.FrameTx{
 		ChainID:    uint256.MustFromBig(config.ChainID),
-		Nonce:      nonce,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   nonce,
 		Sender:     sender,
 		Frames:     frames,
 		GasTipCap:  uint256.NewInt(1),

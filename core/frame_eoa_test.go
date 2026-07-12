@@ -76,9 +76,10 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 	transfer := uint256.NewInt(1_000_000_000_000_000)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 			{Mode: types.FrameModeSender, Target: &recipient, GasLimit: 100000, Value: transfer, Data: nil},
@@ -122,9 +123,10 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
@@ -159,9 +161,10 @@ func TestEOADefaultCodeWrongSigner(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
@@ -189,9 +192,10 @@ func TestEOADefaultCodeTxSignatureRequiresAllowedScope(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},
 		},
@@ -220,9 +224,10 @@ func TestEOADefaultCodeRejectsFrameDataSignature(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000,
 				// Old layout: byte0, sig_type=secp256k1, v, r, s. This must not be parsed.
@@ -258,9 +263,10 @@ func TestEOADefaultCodeDefaultModeSucceeds(t *testing.T) {
 	// target has NO code — EOA
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 			{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000,
@@ -310,9 +316,10 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 	transfer := uint256.NewInt(1_000_000_000_000_000)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 100000, Data: nil},               // EOA VERIFY
 			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 100000, Data: nil},          // Sponsor VERIFY
@@ -352,9 +359,10 @@ func TestEOADefaultCodeMissingTxSignature(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: []byte{}},
 		},
@@ -381,9 +389,10 @@ func TestEOADefaultCodeRequiresEmptyMsgSignature(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 		},
@@ -415,9 +424,10 @@ func TestEOADefaultCodeSenderModeSucceedsAsEmptyCall(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := &types.FrameTx{
-		ChainID: uint256.NewInt(config.ChainID.Uint64()),
-		Nonce:   0,
-		Sender:  sender,
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000, Data: nil},
 			{Mode: types.FrameModeSender, Target: nil, GasLimit: 200000, Data: []byte{0xff, 0xee}},

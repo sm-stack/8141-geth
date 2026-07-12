@@ -233,4 +233,7 @@ var (
 	FrameExpiryVerifierAddress = common.HexToAddress("0x0000000000000000000000000000000000008141")
 	FrameExpiryVerifierCode    = common.FromHex("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd")
 	FrameExpiryDataLength      = 8
+	NonceManagerAddress        = common.HexToAddress("0x0000000000000000000000000000000000008250")
+	NonceManagerCode           = common.FromHex("60006000fd")
+	KeyedNonceFirstUseGas      = uint64(20_000)
 )

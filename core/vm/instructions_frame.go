@@ -37,18 +37,21 @@ const (
 // needed by the frame transaction introspection opcodes. All fields are
 // populated from the flattened Message during executeFrames().
 type FrameContext struct {
-	Sender       common.Address // tx.sender
-	Nonce        uint64         // tx.nonce
-	Frames       []types.Frame  // tx.frames
-	Signatures   []types.TxSignature
-	GasTipCap    *uint256.Int  // max_priority_fee_per_gas
-	GasFeeCap    *uint256.Int  // max_fee_per_gas
-	BlobFeeCap   *uint256.Int  // max_fee_per_blob_gas
-	BlobHashes   []common.Hash // blob_versioned_hashes
-	GasLimit     uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
-	SigHash      common.Hash   // Cached compute_sig_hash(tx).
-	FrameIndex   int           // Currently executing frame index.
-	FrameResults []uint8       // Status of each completed frame (0=fail, 1=success, 3=skipped).
+	Sender        common.Address // tx.sender
+	NonceKeys     []*uint256.Int // tx.nonce_keys
+	NonceSeq      uint64         // tx.nonce_seq
+	LegacyNonce   uint64         // sender account nonce before frame execution
+	NonceKeysHash common.Hash    // keccak256(bytes32(len(nonce_keys)) || nonce_keys...)
+	Frames        []types.Frame  // tx.frames
+	Signatures    []types.TxSignature
+	GasTipCap     *uint256.Int  // max_priority_fee_per_gas
+	GasFeeCap     *uint256.Int  // max_fee_per_gas
+	BlobFeeCap    *uint256.Int  // max_fee_per_blob_gas
+	BlobHashes    []common.Hash // blob_versioned_hashes
+	GasLimit      uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
+	SigHash       common.Hash   // Cached compute_sig_hash(tx).
+	FrameIndex    int           // Currently executing frame index.
+	FrameResults  []uint8       // Status of each completed frame (0=fail, 1=success, 3=skipped).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -120,6 +123,10 @@ const (
 	txParamFrameCount     = 0x09
 	txParamFrameIndex     = 0x0a
 	txParamSignatureCount = 0x0b
+	txParamNonceKey0      = 0x0c
+	txParamLegacyNonce    = 0x0d
+	txParamNonceKeyCount  = 0x0e
+	txParamNonceKeysHash  = 0x0f
 )
 
 // FRAMEPARAM parameter selectors.
@@ -226,7 +233,7 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	case txParamTxType:
 		param.SetUint64(uint64(types.FrameTxType))
 	case txParamNonce:
-		param.SetUint64(fc.Nonce)
+		param.SetUint64(fc.NonceSeq)
 	case txParamSender:
 		setAddressWord(param, fc.Sender)
 	case txParamGasTipCap:
@@ -247,6 +254,17 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		param.SetUint64(uint64(fc.FrameIndex))
 	case txParamSignatureCount:
 		param.SetUint64(uint64(len(fc.Signatures)))
+	case txParamNonceKey0:
+		if len(fc.NonceKeys) == 0 || fc.NonceKeys[0] == nil {
+			return nil, invalidFrameOpcode(TXPARAM)
+		}
+		param.Set(fc.NonceKeys[0])
+	case txParamLegacyNonce:
+		param.SetUint64(fc.LegacyNonce)
+	case txParamNonceKeyCount:
+		param.SetUint64(uint64(len(fc.NonceKeys)))
+	case txParamNonceKeysHash:
+		param.SetBytes32(fc.NonceKeysHash[:])
 	default:
 		return nil, invalidFrameOpcode(TXPARAM)
 	}

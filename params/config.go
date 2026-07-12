@@ -1205,6 +1205,7 @@ func (c *ChainConfig) ActiveSystemContracts(time uint64) map[string]common.Addre
 		active["CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS"] = ConsolidationQueueAddress
 		active["DEPOSIT_CONTRACT_ADDRESS"] = c.DepositContractAddress
 		active["EXPIRY_VERIFIER_ADDRESS"] = FrameExpiryVerifierAddress
+		active["NONCE_MANAGER_ADDRESS"] = NonceManagerAddress
 		active["HISTORY_STORAGE_ADDRESS"] = HistoryStorageAddress
 		active["WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS"] = WithdrawalQueueAddress
 	}

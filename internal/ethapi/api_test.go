@@ -127,7 +127,8 @@ func TestNewRPCTransactionFrameTx(t *testing.T) {
 	signature := bytes.Repeat([]byte{0x11}, 65)
 	ftx := &types.FrameTx{
 		ChainID:    uint256.MustFromBig(config.ChainID),
-		Nonce:      7,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   7,
 		Sender:     sender,
 		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
 		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
@@ -164,6 +165,9 @@ func TestNewRPCTransactionFrameTx(t *testing.T) {
 	if pending.Sender == nil || *pending.Sender != sender {
 		t.Fatalf("sender mismatch: got %v want %v", pending.Sender, sender)
 	}
+	if pending.Nonce != nil || pending.NonceSeq == nil || *pending.NonceSeq != 7 || len(pending.NonceKeys) != 1 || pending.NonceKeys[0].ToInt().Sign() != 0 {
+		t.Fatalf("unexpected frame nonce fields: nonce=%v keys=%v seq=%v", pending.Nonce, pending.NonceKeys, pending.NonceSeq)
+	}
 	if pending.Frames == nil || len(*pending.Frames) != 2 {
 		t.Fatalf("frames length mismatch: got %v want 2", pending.Frames)
 	}
@@ -197,7 +201,8 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 	signature := bytes.Repeat([]byte{0x11}, 65)
 	ftx := &types.FrameTx{
 		ChainID:    uint256.MustFromBig(config.ChainID),
-		Nonce:      7,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   7,
 		Sender:     sender,
 		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
 		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
@@ -212,7 +217,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshalling failed: %v", err)
 	}
 	have := string(data)
-	for _, want := range []string{`"sender"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
+	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
 		if !strings.Contains(have, want) {
 			t.Fatalf("rpc frame tx json missing %s: %s", want, have)
 		}
@@ -250,7 +255,8 @@ func TestMarshalFrameReceiptNormalizesFrameStatus(t *testing.T) {
 	payer := common.HexToAddress("0xbeef")
 	tx := types.NewTx(&types.FrameTx{
 		ChainID:    uint256.MustFromBig(config.ChainID),
-		Nonce:      1,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   1,
 		Sender:     sender,
 		Frames:     []types.Frame{{Mode: types.FrameModeSender, GasLimit: 21_000, Value: new(uint256.Int)}},
 		GasTipCap:  uint256.NewInt(1),
@@ -300,7 +306,8 @@ func TestSendRawTransactionRejectsInvalidFrameTxSchema(t *testing.T) {
 
 	tx := types.NewTx(&types.FrameTx{
 		ChainID:    uint256.NewInt(1),
-		Nonce:      1,
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:   1,
 		Sender:     common.HexToAddress("0xabcd"),
 		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 8, GasLimit: 21_000, Value: new(uint256.Int)}},
 		GasTipCap:  uint256.NewInt(1),
