@@ -200,15 +200,16 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 	target := common.HexToAddress("0x1234")
 	signature := bytes.Repeat([]byte{0x11}, 65)
 	ftx := &types.FrameTx{
-		ChainID:    uint256.MustFromBig(config.ChainID),
-		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
-		NonceSeq:   7,
-		Sender:     sender,
-		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
-		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
-		GasTipCap:  uint256.NewInt(2),
-		GasFeeCap:  uint256.NewInt(100),
-		BlobFeeCap: uint256.NewInt(0),
+		ChainID:        uint256.MustFromBig(config.ChainID),
+		NonceKeys:      []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:       7,
+		Sender:         sender,
+		Frames:         []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
+		Signatures:     []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
+		GasTipCap:      uint256.NewInt(2),
+		GasFeeCap:      uint256.NewInt(100),
+		BlobFeeCap:     uint256.NewInt(0),
+		RecentRootRefs: []types.RecentRootRef{{SourceID: common.HexToHash("0x01"), Slot: 9, Root: common.HexToHash("0x02")}},
 	}
 	tx := types.NewTx(ftx)
 
@@ -217,7 +218,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshalling failed: %v", err)
 	}
 	have := string(data)
-	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
+	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`, `"recentRootReferences"`} {
 		if !strings.Contains(have, want) {
 			t.Fatalf("rpc frame tx json missing %s: %s", want, have)
 		}

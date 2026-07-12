@@ -51,6 +51,7 @@ type txJSON struct {
 	AuthorizationList    []SetCodeAuthorization `json:"authorizationList,omitempty"`
 	Frames               *[]Frame               `json:"frames,omitempty"`
 	Signatures           *[]TxSignature         `json:"signatures,omitempty"`
+	RecentRootReferences *[]RecentRootRef       `json:"recentRootReferences,omitempty"`
 	V                    *hexutil.Big           `json:"v"`
 	R                    *hexutil.Big           `json:"r"`
 	S                    *hexutil.Big           `json:"s"`
@@ -199,6 +200,7 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		enc.BlobVersionedHashes = itx.BlobHashes
 		enc.Frames = &itx.Frames
 		enc.Signatures = &itx.Signatures
+		enc.RecentRootReferences = &itx.RecentRootRefs
 	}
 	return json.Marshal(&enc)
 }
@@ -580,6 +582,10 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 			return errors.New("missing required field 'signatures' in frame transaction")
 		}
 		itx.Signatures = *dec.Signatures
+		if dec.RecentRootReferences == nil {
+			return errors.New("missing required field 'recentRootReferences' in frame transaction")
+		}
+		itx.RecentRootRefs = *dec.RecentRootReferences
 		if dec.MaxPriorityFeePerGas == nil {
 			return errors.New("missing required field 'maxPriorityFeePerGas' for frame transaction")
 		}

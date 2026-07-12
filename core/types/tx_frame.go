@@ -141,38 +141,48 @@ type TxSignature struct {
 	Signature []byte
 }
 
+// RecentRootRef identifies an EIP-8272 root committed in a prior slot.
+// RLP encoding: [source_id, slot, root].
+type RecentRootRef struct {
+	SourceID common.Hash
+	Slot     uint64
+	Root     common.Hash
+}
+
 // FrameTx implements the EIP-8141 frame transaction.
 //
 // RLP encoding:
 // [chain_id, nonce_keys, nonce_seq, sender, frames, signatures, max_priority_fee_per_gas, max_fee_per_gas,
 //
-//	max_fee_per_blob_gas, blob_versioned_hashes]
+//	max_fee_per_blob_gas, blob_versioned_hashes, recent_root_references]
 type FrameTx struct {
-	ChainID    *uint256.Int
-	NonceKeys  []*uint256.Int
-	NonceSeq   uint64
-	Sender     common.Address
-	Frames     []Frame
-	Signatures []TxSignature
-	GasTipCap  *uint256.Int  // max_priority_fee_per_gas
-	GasFeeCap  *uint256.Int  // max_fee_per_gas
-	BlobFeeCap *uint256.Int  // max_fee_per_blob_gas
-	BlobHashes []common.Hash // blob_versioned_hashes
+	ChainID        *uint256.Int
+	NonceKeys      []*uint256.Int
+	NonceSeq       uint64
+	Sender         common.Address
+	Frames         []Frame
+	Signatures     []TxSignature
+	GasTipCap      *uint256.Int  // max_priority_fee_per_gas
+	GasFeeCap      *uint256.Int  // max_fee_per_gas
+	BlobFeeCap     *uint256.Int  // max_fee_per_blob_gas
+	BlobHashes     []common.Hash // blob_versioned_hashes
+	RecentRootRefs []RecentRootRef
 }
 
 // copy creates a deep copy of the transaction data and initializes all fields.
 func (tx *FrameTx) copy() TxData {
 	cpy := &FrameTx{
-		NonceKeys:  make([]*uint256.Int, len(tx.NonceKeys)),
-		NonceSeq:   tx.NonceSeq,
-		Sender:     tx.Sender,
-		Frames:     make([]Frame, len(tx.Frames)),
-		Signatures: make([]TxSignature, len(tx.Signatures)),
-		BlobHashes: make([]common.Hash, len(tx.BlobHashes)),
-		ChainID:    new(uint256.Int),
-		GasTipCap:  new(uint256.Int),
-		GasFeeCap:  new(uint256.Int),
-		BlobFeeCap: new(uint256.Int),
+		NonceKeys:      make([]*uint256.Int, len(tx.NonceKeys)),
+		NonceSeq:       tx.NonceSeq,
+		Sender:         tx.Sender,
+		Frames:         make([]Frame, len(tx.Frames)),
+		Signatures:     make([]TxSignature, len(tx.Signatures)),
+		BlobHashes:     make([]common.Hash, len(tx.BlobHashes)),
+		RecentRootRefs: make([]RecentRootRef, len(tx.RecentRootRefs)),
+		ChainID:        new(uint256.Int),
+		GasTipCap:      new(uint256.Int),
+		GasFeeCap:      new(uint256.Int),
+		BlobFeeCap:     new(uint256.Int),
 	}
 	for i, key := range tx.NonceKeys {
 		if key != nil {
@@ -205,6 +215,7 @@ func (tx *FrameTx) copy() TxData {
 		}
 	}
 	copy(cpy.BlobHashes, tx.BlobHashes)
+	copy(cpy.RecentRootRefs, tx.RecentRootRefs)
 	if tx.ChainID != nil {
 		cpy.ChainID.Set(tx.ChainID)
 	}
@@ -261,6 +272,7 @@ func (tx *FrameTx) encode(b *bytes.Buffer) error {
 		Sender: tx.Sender, Frames: tx.Frames, Signatures: tx.Signatures,
 		GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,
 		BlobFeeCap: tx.BlobFeeCap, BlobHashes: tx.BlobHashes,
+		RecentRootRefs: tx.RecentRootRefs,
 	})
 }
 
@@ -273,20 +285,22 @@ func (tx *FrameTx) decode(input []byte) error {
 	tx.Sender, tx.Frames, tx.Signatures = dec.Sender, dec.Frames, dec.Signatures
 	tx.GasTipCap, tx.GasFeeCap = dec.GasTipCap, dec.GasFeeCap
 	tx.BlobFeeCap, tx.BlobHashes = dec.BlobFeeCap, dec.BlobHashes
+	tx.RecentRootRefs = dec.RecentRootRefs
 	return tx.Validate()
 }
 
 type frameTxRLP struct {
-	ChainID    *uint256.Int
-	NonceKeys  []*uint256.Int
-	NonceSeq   uint64
-	Sender     common.Address
-	Frames     []Frame
-	Signatures []TxSignature
-	GasTipCap  *uint256.Int
-	GasFeeCap  *uint256.Int
-	BlobFeeCap *uint256.Int
-	BlobHashes []common.Hash
+	ChainID        *uint256.Int
+	NonceKeys      []*uint256.Int
+	NonceSeq       uint64
+	Sender         common.Address
+	Frames         []Frame
+	Signatures     []TxSignature
+	GasTipCap      *uint256.Int
+	GasFeeCap      *uint256.Int
+	BlobFeeCap     *uint256.Int
+	BlobHashes     []common.Hash
+	RecentRootRefs []RecentRootRef
 }
 
 // rlpFramesData returns the RLP-encoded frames as a byte slice.
@@ -303,9 +317,15 @@ func (tx *FrameTx) rlpSignaturesData() []byte {
 	return buf.Bytes()
 }
 
+func (tx *FrameTx) rlpRecentRootRefsData() []byte {
+	var buf bytes.Buffer
+	rlp.Encode(&buf, tx.RecentRootRefs)
+	return buf.Bytes()
+}
+
 // frameTxCalldataBytes returns the byte blobs charged as frame tx data.
 func (tx *FrameTx) frameTxCalldataBytes() [][]byte {
-	return [][]byte{tx.rlpFramesData(), tx.rlpSignaturesData()}
+	return [][]byte{tx.rlpFramesData(), tx.rlpRecentRootRefsData(), tx.rlpSignaturesData()}
 }
 
 func countZeroNonZero(chunks ...[]byte) (uint64, uint64) {
@@ -355,15 +375,28 @@ func (tx *FrameTx) fixedGas() (uint64, error) {
 	if total, overflow = commonmath.SafeAdd(total, signatureGas); overflow {
 		return 0, errFrameGasUintOverflow
 	}
+	if len(tx.RecentRootRefs) > 0 {
+		refGas, overflow := commonmath.SafeMul(uint64(len(tx.RecentRootRefs)), params.RecentRootPerRefGas)
+		if overflow {
+			return 0, errFrameGasUintOverflow
+		}
+		if refGas, overflow = commonmath.SafeAdd(refGas, params.RecentRootBaseGas); overflow {
+			return 0, errFrameGasUintOverflow
+		}
+		if total, overflow = commonmath.SafeAdd(total, refGas); overflow {
+			return 0, errFrameGasUintOverflow
+		}
+	}
 	return total, nil
 }
 
-// CalldataGas returns the EIP-7623 calldata cost of the RLP-encoded frames and
-// signatures.
+// CalldataGas returns the EIP-7623 calldata cost of the RLP-encoded frames,
+// recent-root references, and signatures.
 //
 // Per EIP-8141:
 //
-//	calldata_cost(rlp(tx.frames)) + calldata_cost(rlp(tx.signatures))
+//	calldata_cost(rlp(tx.frames) || rlp(tx.recent_root_references))
+//	+ calldata_cost(rlp(tx.signatures))
 //
 // Returns errFrameGasUintOverflow if the result would exceed uint64.
 func (tx *FrameTx) CalldataGas() (uint64, error) {
@@ -390,6 +423,7 @@ func (tx *FrameTx) CalldataGas() (uint64, error) {
 //	+ calldata_cost(rlp(signatures))
 //	+ calldata_cost(rlp(frames))
 //	+ signature_verification_cost
+//	+ (refs > 0 ? RECENT_ROOT_BASE_GAS + refs * RECENT_ROOT_PER_REF_GAS : 0)
 func (tx *FrameTx) IntrinsicGas() (uint64, error) {
 	total, err := tx.fixedGas()
 	if err != nil {
@@ -414,6 +448,7 @@ func (tx *FrameTx) IntrinsicGas() (uint64, error) {
 //	+ calldata_cost(rlp(signatures))
 //	+ calldata_cost(rlp(frames))
 //	+ signature_verification_cost
+//	+ (refs > 0 ? RECENT_ROOT_BASE_GAS + refs * RECENT_ROOT_PER_REF_GAS : 0)
 //	+ sum(frame.gas_limit)
 //
 // On overflow, math.MaxUint64 is returned; callers relying on this value for
@@ -494,6 +529,9 @@ func (tx *FrameTx) Validate() error {
 	}
 	if err := ValidateNonceKeys(tx.NonceKeys); err != nil {
 		return err
+	}
+	if len(tx.RecentRootRefs) > params.MaxRecentRootReferences {
+		return fmt.Errorf("frame tx has %d recent root references, max %d", len(tx.RecentRootRefs), params.MaxRecentRootReferences)
 	}
 	if len(tx.Frames) == 0 {
 		return errors.New("frame tx has no frames")

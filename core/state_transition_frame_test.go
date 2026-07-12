@@ -107,6 +107,62 @@ func expiryFrameData(deadline uint64) []byte {
 	return data
 }
 
+type fixedSlotProvider uint64
+
+func (p fixedSlotProvider) CurrentSlot() uint64 { return uint64(p) }
+
+func TestFrameTxRecentRootReferenceValidation(t *testing.T) {
+	const currentSlot = uint64(9000)
+	tests := []struct {
+		name      string
+		slot      uint64
+		changeRef func(*types.RecentRootRef)
+		valid     bool
+	}{
+		{name: "previous slot", slot: currentSlot - 1, valid: true},
+		{name: "oldest usable slot", slot: currentSlot - 8191, valid: true},
+		{name: "same slot", slot: currentSlot},
+		{name: "expired slot", slot: currentSlot - 8192},
+		{name: "wrong root", slot: currentSlot - 1, changeRef: func(ref *types.RecentRootRef) { ref.Root[0] ^= 0xff }},
+		{name: "wrong source", slot: currentSlot - 1, changeRef: func(ref *types.RecentRootRef) { ref.SourceID[0] ^= 0xff }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evm, statedb, config := newFrameTestEnv()
+			evm.Context.SlotProvider = fixedSlotProvider(currentSlot)
+			sender := common.HexToAddress("0x1111")
+			statedb.CreateAccount(sender)
+			statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+			statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+			storedRef := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: tt.slot, Root: common.HexToHash("0x5678")}
+			key := types.RecentRootStorageKey(storedRef.SourceID, storedRef.Slot)
+			statedb.SetState(params.RecentRootAddress, key, types.RecentRootEntryHash(storedRef.SourceID, storedRef.Slot, storedRef.Root))
+			txRef := storedRef
+			if tt.changeRef != nil {
+				tt.changeRef(&txRef)
+			}
+			ftx := &types.FrameTx{
+				ChainID: uint256.NewInt(config.ChainID.Uint64()), NonceKeys: []*uint256.Int{uint256.NewInt(0)}, Sender: sender,
+				Frames: []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}, RecentRootRefs: []types.RecentRootRef{txRef},
+				GasTipCap: uint256.NewInt(1), GasFeeCap: uint256.NewInt(uint64(params.InitialBaseFee)), BlobFeeCap: new(uint256.Int),
+			}
+			_, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+			if tt.valid && err != nil {
+				t.Fatalf("valid reference rejected: %v", err)
+			}
+			if tt.valid {
+				addressWarm, slotWarm := statedb.SlotInAccessList(params.RecentRootAddress, types.RecentRootStorageKey(txRef.SourceID, txRef.Slot))
+				if !addressWarm || !slotWarm {
+					t.Fatal("validated recent root reference was not warmed")
+				}
+			}
+			if !tt.valid && err == nil {
+				t.Fatal("invalid reference accepted")
+			}
+		})
+	}
+}
+
 // TestFrameTxSimple tests the simplest frame transaction: VERIFY(APPROVE 0x3) + SENDER(RETURN).
 // This replicates Example 1 from EIP-8141.
 func TestFrameTxSimple(t *testing.T) {

@@ -235,13 +235,14 @@ type Message struct {
 	SkipTransactionChecks bool
 
 	// EIP-8141: flattened frame transaction fields.
-	Frames            []types.Frame // Frame list (nil for non-frame transactions).
-	FrameSignatures   []types.TxSignature
-	FrameSigHash      common.Hash // Pre-computed compute_sig_hash(tx).
-	FrameFloorDataGas uint64      // Pre-computed EIP-7623 floor data gas.
-	FrameNonceKeys    []*uint256.Int
-	FrameNonceSeq     uint64
-	FrameLegacyNonce  uint64
+	Frames              []types.Frame // Frame list (nil for non-frame transactions).
+	FrameSignatures     []types.TxSignature
+	FrameSigHash        common.Hash // Pre-computed compute_sig_hash(tx).
+	FrameFloorDataGas   uint64      // Pre-computed EIP-7623 floor data gas.
+	FrameNonceKeys      []*uint256.Int
+	FrameNonceSeq       uint64
+	FrameLegacyNonce    uint64
+	FrameRecentRootRefs []types.RecentRootRef
 }
 
 // TransactionToMessage converts a transaction into a Message.
@@ -279,6 +280,7 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		msg.FrameNonceSeq = ftx.NonceSeq
 		msg.FrameSignatures = ftx.Signatures
 		msg.FrameSigHash = ftx.SigHash(tx.ChainId())
+		msg.FrameRecentRootRefs = ftx.RecentRootRefs
 		if err := types.ValidateFrameTxSignatures(ftx, msg.FrameSigHash); err != nil {
 			return nil, err
 		}
@@ -416,6 +418,9 @@ func (st *stateTransition) preCheck() error {
 				return err
 			}
 		}
+		if err := st.checkRecentRootReferences(); err != nil {
+			return err
+		}
 	} else if !msg.SkipNonceChecks {
 		// Make sure this transaction's nonce is correct.
 		stNonce := st.state.GetNonce(msg.From)
@@ -517,6 +522,21 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	return st.buyGas()
+}
+
+func (st *stateTransition) checkRecentRootReferences() error {
+	currentSlot := st.evm.CurrentSlot()
+	for i, ref := range st.msg.FrameRecentRootRefs {
+		if !types.RecentRootReferenceInWindow(currentSlot, ref.Slot) {
+			return fmt.Errorf("%w: recent root reference %d slot %d is invalid at current slot %d", ErrFrameTxInvalid, i, ref.Slot, currentSlot)
+		}
+		key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
+		want := types.RecentRootEntryHash(ref.SourceID, ref.Slot, ref.Root)
+		if have := st.state.GetState(params.RecentRootAddress, key); have != want {
+			return fmt.Errorf("%w: recent root reference %d mismatch", ErrFrameTxInvalid, i)
+		}
+	}
+	return nil
 }
 
 func (st *stateTransition) checkFrameNonce() error {
@@ -657,6 +677,12 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	// - reset transient storage(eip 1153)
 	if isFrameTx {
 		st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, nil, vm.ActivePrecompiles(rules), nil)
+		if len(msg.FrameRecentRootRefs) > 0 {
+			st.state.AddAddressToAccessList(params.RecentRootAddress)
+			for _, ref := range msg.FrameRecentRootRefs {
+				st.state.AddSlotToAccessList(params.RecentRootAddress, types.RecentRootStorageKey(ref.SourceID, ref.Slot))
+			}
+		}
 	} else {
 		st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
 	}
@@ -878,21 +904,22 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 	gasFeeCap, _ := uint256.FromBig(msg.GasFeeCap)
 	blobFeeCap, _ := uint256.FromBig(msg.BlobGasFeeCap)
 	frameCtx := &vm.FrameContext{
-		Sender:        msg.From,
-		NonceKeys:     msg.FrameNonceKeys,
-		NonceSeq:      msg.FrameNonceSeq,
-		LegacyNonce:   msg.FrameLegacyNonce,
-		NonceKeysHash: types.ComputeNonceKeysHash(msg.FrameNonceKeys),
-		Frames:        msg.Frames,
-		Signatures:    msg.FrameSignatures,
-		GasTipCap:     gasTipCap,
-		GasFeeCap:     gasFeeCap,
-		BlobFeeCap:    blobFeeCap,
-		BlobHashes:    msg.BlobHashes,
-		GasLimit:      msg.GasLimit,
-		SigHash:       msg.FrameSigHash,
-		FrameIndex:    0,
-		FrameResults:  make([]uint8, len(msg.Frames)),
+		Sender:         msg.From,
+		NonceKeys:      msg.FrameNonceKeys,
+		NonceSeq:       msg.FrameNonceSeq,
+		LegacyNonce:    msg.FrameLegacyNonce,
+		NonceKeysHash:  types.ComputeNonceKeysHash(msg.FrameNonceKeys),
+		Frames:         msg.Frames,
+		Signatures:     msg.FrameSignatures,
+		GasTipCap:      gasTipCap,
+		GasFeeCap:      gasFeeCap,
+		BlobFeeCap:     blobFeeCap,
+		BlobHashes:     msg.BlobHashes,
+		GasLimit:       msg.GasLimit,
+		SigHash:        msg.FrameSigHash,
+		FrameIndex:     0,
+		FrameResults:   make([]uint8, len(msg.Frames)),
+		RecentRootRefs: msg.FrameRecentRootRefs,
 	}
 	st.evm.FrameCtx = frameCtx
 	defer func() { st.evm.FrameCtx = nil }()

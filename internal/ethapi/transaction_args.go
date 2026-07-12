@@ -73,10 +73,11 @@ type TransactionArgs struct {
 	AuthorizationList []types.SetCodeAuthorization `json:"authorizationList"`
 
 	// For FrameTxType
-	Frames     *[]types.Frame       `json:"frames,omitempty"`
-	Signatures *[]types.TxSignature `json:"signatures,omitempty"`
-	NonceKeys  []*hexutil.Big       `json:"nonceKeys,omitempty"`
-	NonceSeq   *hexutil.Uint64      `json:"nonceSeq,omitempty"`
+	Frames               *[]types.Frame         `json:"frames,omitempty"`
+	Signatures           *[]types.TxSignature   `json:"signatures,omitempty"`
+	NonceKeys            []*hexutil.Big         `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64        `json:"nonceSeq,omitempty"`
+	RecentRootReferences *[]types.RecentRootRef `json:"recentRootReferences,omitempty"`
 }
 
 // from retrieves the transaction sender address.
@@ -95,7 +96,7 @@ func (args *TransactionArgs) frameSender() common.Address {
 }
 
 func (args *TransactionArgs) isFrameTx() bool {
-	return args.Frames != nil || args.Signatures != nil || args.NonceKeys != nil || args.NonceSeq != nil
+	return args.Frames != nil || args.Signatures != nil || args.NonceKeys != nil || args.NonceSeq != nil || args.RecentRootReferences != nil
 }
 
 // data retrieves the transaction calldata. Input field is preferred.
@@ -629,21 +630,26 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		if args.Signatures != nil {
 			signatures = *args.Signatures
 		}
+		recentRootRefs := []types.RecentRootRef{}
+		if args.RecentRootReferences != nil {
+			recentRootRefs = *args.RecentRootReferences
+		}
 		blobFeeCap := new(big.Int)
 		if args.BlobFeeCap != nil {
 			blobFeeCap = (*big.Int)(args.BlobFeeCap)
 		}
 		data = &types.FrameTx{
-			ChainID:    uint256.MustFromBig(args.ChainID.ToInt()),
-			NonceKeys:  nonceKeys,
-			NonceSeq:   uint64(*nonceSeq),
-			Sender:     args.frameSender(),
-			Frames:     frames,
-			Signatures: signatures,
-			GasTipCap:  uint256.MustFromBig((*big.Int)(args.MaxPriorityFeePerGas)),
-			GasFeeCap:  uint256.MustFromBig((*big.Int)(args.MaxFeePerGas)),
-			BlobFeeCap: uint256.MustFromBig(blobFeeCap),
-			BlobHashes: args.BlobHashes,
+			ChainID:        uint256.MustFromBig(args.ChainID.ToInt()),
+			NonceKeys:      nonceKeys,
+			NonceSeq:       uint64(*nonceSeq),
+			Sender:         args.frameSender(),
+			Frames:         frames,
+			Signatures:     signatures,
+			GasTipCap:      uint256.MustFromBig((*big.Int)(args.MaxPriorityFeePerGas)),
+			GasFeeCap:      uint256.MustFromBig((*big.Int)(args.MaxFeePerGas)),
+			BlobFeeCap:     uint256.MustFromBig(blobFeeCap),
+			BlobHashes:     args.BlobHashes,
+			RecentRootRefs: recentRootRefs,
 		}
 
 	case types.SetCodeTxType:

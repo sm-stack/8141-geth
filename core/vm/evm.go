@@ -58,15 +58,24 @@ type BlockContext struct {
 	GetHash GetHashFunc
 
 	// Block information
-	Coinbase    common.Address // Provides information for COINBASE
-	GasLimit    uint64         // Provides information for GASLIMIT
-	BlockNumber *big.Int       // Provides information for NUMBER
-	Time        uint64         // Provides information for TIME
-	Difficulty  *big.Int       // Provides information for DIFFICULTY
-	BaseFee     *big.Int       // Provides information for BASEFEE (0 if vm runs with NoBaseFee flag and 0 gas price)
-	BlobBaseFee *big.Int       // Provides information for BLOBBASEFEE (0 if vm runs with NoBaseFee flag and 0 blob gas price)
-	Random      *common.Hash   // Provides information for PREVRANDAO
+	Coinbase     common.Address // Provides information for COINBASE
+	GasLimit     uint64         // Provides information for GASLIMIT
+	BlockNumber  *big.Int       // Provides information for NUMBER
+	Time         uint64         // Provides information for TIME
+	Difficulty   *big.Int       // Provides information for DIFFICULTY
+	BaseFee      *big.Int       // Provides information for BASEFEE (0 if vm runs with NoBaseFee flag and 0 gas price)
+	BlobBaseFee  *big.Int       // Provides information for BLOBBASEFEE (0 if vm runs with NoBaseFee flag and 0 blob gas price)
+	Random       *common.Hash   // Provides information for PREVRANDAO
+	SlotProvider SlotProvider   // Optional consensus slot source for EIP-8272.
 }
+
+type SlotProvider interface {
+	CurrentSlot() uint64
+}
+
+type TimestampSlotProvider struct{ Timestamp uint64 }
+
+func (p TimestampSlotProvider) CurrentSlot() uint64 { return p.Timestamp / params.SecondsPerSlot }
 
 // TxContext provides the EVM with information about a transaction.
 // All fields can change between transactions.
@@ -141,6 +150,9 @@ type EVM struct {
 // state transition of a block, with the transaction context switched as
 // needed by calling evm.SetTxContext.
 func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+	if blockCtx.SlotProvider == nil {
+		blockCtx.SlotProvider = TimestampSlotProvider{Timestamp: blockCtx.Time}
+	}
 	evm := &EVM{
 		Context:     blockCtx,
 		StateDB:     statedb,
@@ -201,6 +213,8 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 	evm.Config.ExtraEips = extraEips
 	return evm
 }
+
+func (evm *EVM) CurrentSlot() uint64 { return evm.Context.SlotProvider.CurrentSlot() }
 
 // SetPrecompiles sets the precompiled contracts for the EVM.
 // This method is only used through RPC calls.
@@ -284,6 +298,16 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		}
 		evm.StateDB.CreateAccount(addr)
 	}
+	if evm.chainRules.IsPrague && addr == params.RecentRootAddress {
+		ret, gas, err = evm.callRecentRoot(caller, input, gas, value)
+		if err != nil {
+			evm.StateDB.RevertToSnapshot(snapshot)
+			if err != ErrExecutionReverted {
+				gas = 0
+			}
+		}
+		return ret, gas, err
+	}
 	evm.Context.Transfer(evm.StateDB, caller, addr, value)
 
 	if isPrecompile {
@@ -319,6 +343,39 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		//	evm.StateDB.DiscardSnapshot(snapshot)
 	}
 	return ret, gas, err
+}
+
+func (evm *EVM) callRecentRoot(caller common.Address, input []byte, gas uint64, value *uint256.Int) ([]byte, uint64, error) {
+	if evm.readOnly {
+		return nil, gas, ErrWriteProtection
+	}
+	if len(input) != 64 || !value.IsZero() {
+		return nil, gas, ErrExecutionReverted
+	}
+	const hashGas = 3*params.Keccak256Gas + 9*params.Keccak256WordGas
+	if gas < hashGas {
+		return nil, 0, ErrOutOfGas
+	}
+	gas -= hashGas
+	salt := common.BytesToHash(input[:32])
+	root := common.BytesToHash(input[32:])
+	sourceID := types.RecentRootSourceID(caller, salt)
+	slot := evm.CurrentSlot()
+	key := types.RecentRootStorageKey(sourceID, slot)
+	entry := types.RecentRootEntryHash(sourceID, slot, root)
+
+	stack := newstack()
+	defer returnStack(stack)
+	stack.push(new(uint256.Int).SetBytes(entry[:]))
+	stack.push(new(uint256.Int).SetBytes(key[:]))
+	contract := NewContract(caller, params.RecentRootAddress, value, gas, evm.jumpDests)
+	cost, err := gasSStoreEIP3529(evm, contract, stack, nil, 0)
+	if err != nil || cost > gas {
+		return nil, 0, ErrOutOfGas
+	}
+	gas -= cost
+	evm.StateDB.SetState(params.RecentRootAddress, key, entry)
+	return nil, gas, nil
 }
 
 // CallCode executes the contract associated with the addr with the given input

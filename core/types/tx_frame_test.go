@@ -55,6 +55,11 @@ func testFrameTx() *FrameTx {
 			{Scheme: SignatureSchemeSecp256k1, Signer: signer, Msg: nil, Signature: bytes.Repeat([]byte{0x11}, 65)},
 			{Scheme: SignatureSchemeP256, Signer: signer, Msg: explicitMsg, Signature: bytes.Repeat([]byte{0x22}, 128)},
 		},
+		RecentRootRefs: []RecentRootRef{{
+			SourceID: common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+			Slot:     9,
+			Root:     common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		}},
 	}
 }
 
@@ -99,12 +104,17 @@ func testFrameTxSigHashVector() *FrameTx {
 				Signature: common.Hex2Bytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
 			},
 		},
+		RecentRootRefs: []RecentRootRef{{
+			SourceID: common.HexToHash("0x0101010101010101010101010101010101010101010101010101010101010101"),
+			Slot:     9,
+			Root:     common.HexToHash("0x0202020202020202020202020202020202020202020202020202020202020202"),
+		}},
 	}
 }
 
 func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
 	var tokens uint64
-	for _, chunk := range [][]byte{ftx.rlpFramesData(), ftx.rlpSignaturesData()} {
+	for _, chunk := range [][]byte{ftx.rlpFramesData(), ftx.rlpRecentRootRefsData(), ftx.rlpSignaturesData()} {
 		for _, b := range chunk {
 			if b == 0 {
 				tokens++
@@ -134,10 +144,14 @@ func expectedFrameTxSignatureGas(t *testing.T, ftx *FrameTx) uint64 {
 
 func expectedFrameTxIntrinsicGas(t *testing.T, ftx *FrameTx) uint64 {
 	t.Helper()
-	return params.TxGasEIP8141 +
+	gas := params.TxGasEIP8141 +
 		uint64(len(ftx.Frames))*params.FrameTxPerFrameGas +
 		expectedFrameTxCalldataGas(ftx) +
 		expectedFrameTxSignatureGas(t, ftx)
+	if len(ftx.RecentRootRefs) > 0 {
+		gas += params.RecentRootBaseGas + uint64(len(ftx.RecentRootRefs))*params.RecentRootPerRefGas
+	}
+	return gas
 }
 
 func TestFrameTxType(t *testing.T) {
@@ -300,8 +314,8 @@ func TestFrameTxSignatureGas(t *testing.T) {
 
 func TestFrameTxSigHashVector(t *testing.T) {
 	const (
-		wantSigHash = "0x0b5ac8a9045a91da5db381e495a28164a69ca61b07098a5aabd630a891b4d93a"
-		wantRawTx   = "0x06f901a601c18007941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+		wantSigHash = "0xc0aeaa116efe492bd25f0648a49964062170aa3f911dbcdb61cb888945a1bde4"
+		wantRawTx   = "0x06f901ed01c18007941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20f845f843a0010101010101010101010101010101010101010101010101010101010101010109a00202020202020202020202020202020202020202020202020202020202020202"
 	)
 	tx := testFrameTxSigHashVector()
 	if got, want := tx.SigHash(tx.chainID()).Hex(), wantSigHash; got != want {
@@ -584,6 +598,33 @@ func TestFrameTxIntrinsicGas(t *testing.T) {
 	}
 }
 
+func TestFrameTxRecentRootIntrinsicGas(t *testing.T) {
+	withRef := testFrameTx()
+	withoutRef := withRef.copy().(*FrameTx)
+	withoutRef.RecentRootRefs = nil
+	withFixed, err := withRef.fixedGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutFixed, err := withoutRef.fixedGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := withFixed-withoutFixed, params.RecentRootBaseGas+params.RecentRootPerRefGas; got != want {
+		t.Fatalf("one-reference fixed gas delta = %d, want %d", got, want)
+	}
+	second := withRef.RecentRootRefs[0]
+	second.Slot++
+	withRef.RecentRootRefs = append(withRef.RecentRootRefs, second)
+	twoFixed, err := withRef.fixedGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := twoFixed-withFixed, params.RecentRootPerRefGas; got != want {
+		t.Fatalf("second-reference fixed gas delta = %d, want %d", got, want)
+	}
+}
+
 // TestFrameTxCalldataGas verifies CalldataGas() returns the EIP-7623 token cost
 // of the RLP-encoded frames and signatures.
 func TestFrameTxCalldataGas(t *testing.T) {
@@ -684,16 +725,17 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 		Signature []byte
 	}
 	type rawFrameTx struct {
-		ChainID    *uint256.Int
-		NonceKeys  []*uint256.Int
-		NonceSeq   uint64
-		Sender     common.Address
-		Frames     []rawFrame
-		Signatures []rawSignature
-		GasTipCap  *uint256.Int
-		GasFeeCap  *uint256.Int
-		BlobFeeCap *uint256.Int
-		BlobHashes []common.Hash
+		ChainID        *uint256.Int
+		NonceKeys      []*uint256.Int
+		NonceSeq       uint64
+		Sender         common.Address
+		Frames         []rawFrame
+		Signatures     []rawSignature
+		GasTipCap      *uint256.Int
+		GasFeeCap      *uint256.Int
+		BlobFeeCap     *uint256.Int
+		BlobHashes     []common.Hash
+		RecentRootRefs []RecentRootRef
 	}
 
 	raw := rawFrameTx{
@@ -711,11 +753,12 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 				Data:     []byte("signature"),
 			},
 		},
-		Signatures: nil,
-		GasTipCap:  uint256.NewInt(1),
-		GasFeeCap:  uint256.NewInt(1),
-		BlobFeeCap: uint256.NewInt(0),
-		BlobHashes: nil,
+		Signatures:     nil,
+		GasTipCap:      uint256.NewInt(1),
+		GasFeeCap:      uint256.NewInt(1),
+		BlobFeeCap:     uint256.NewInt(0),
+		BlobHashes:     nil,
+		RecentRootRefs: nil,
 	}
 	payload, err := rlp.EncodeToBytes(raw)
 	if err != nil {
@@ -730,6 +773,39 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid frame target length") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFrameTxUnmarshalBinaryRejectsInvalidRecentRootReference(t *testing.T) {
+	type rawRef struct {
+		SourceID []byte
+		Slot     uint64
+		Root     []byte
+	}
+	base := testFrameTxSigHashVector()
+	for _, ref := range []rawRef{
+		{SourceID: make([]byte, 31), Slot: 1, Root: make([]byte, 32)},
+		{SourceID: make([]byte, 32), Slot: 1, Root: make([]byte, 31)},
+	} {
+		raw := struct {
+			ChainID                          *uint256.Int
+			NonceKeys                        []*uint256.Int
+			NonceSeq                         uint64
+			Sender                           common.Address
+			Frames                           []Frame
+			Signatures                       []TxSignature
+			GasTipCap, GasFeeCap, BlobFeeCap *uint256.Int
+			BlobHashes                       []common.Hash
+			RecentRootRefs                   []rawRef
+		}{base.ChainID, base.NonceKeys, base.NonceSeq, base.Sender, base.Frames, base.Signatures, base.GasTipCap, base.GasFeeCap, base.BlobFeeCap, base.BlobHashes, []rawRef{ref}}
+		payload, err := rlp.EncodeToBytes(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded Transaction
+		if err := decoded.UnmarshalBinary(append([]byte{FrameTxType}, payload...)); err == nil {
+			t.Fatal("invalid recent root reference accepted")
+		}
 	}
 }
 
@@ -759,6 +835,32 @@ func TestFrameTxUnmarshalBinaryRejectsLegacyNineFieldPayload(t *testing.T) {
 	}
 }
 
+func TestFrameTxUnmarshalBinaryRejectsLegacyTenFieldPayload(t *testing.T) {
+	tx := testFrameTxSigHashVector()
+	legacy := frameTxRLP{
+		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq, Sender: tx.Sender,
+		Frames: tx.Frames, Signatures: tx.Signatures, GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,
+		BlobFeeCap: tx.BlobFeeCap, BlobHashes: tx.BlobHashes,
+	}
+	payload, err := rlp.EncodeToBytes(struct {
+		ChainID                          *uint256.Int
+		NonceKeys                        []*uint256.Int
+		NonceSeq                         uint64
+		Sender                           common.Address
+		Frames                           []Frame
+		Signatures                       []TxSignature
+		GasTipCap, GasFeeCap, BlobFeeCap *uint256.Int
+		BlobHashes                       []common.Hash
+	}{legacy.ChainID, legacy.NonceKeys, legacy.NonceSeq, legacy.Sender, legacy.Frames, legacy.Signatures, legacy.GasTipCap, legacy.GasFeeCap, legacy.BlobFeeCap, legacy.BlobHashes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Transaction
+	if err := decoded.UnmarshalBinary(append([]byte{FrameTxType}, payload...)); err == nil {
+		t.Fatal("legacy ten-field frame transaction was accepted")
+	}
+}
+
 func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 	valid := func() *FrameTx {
 		return testFrameTx().copy().(*FrameTx)
@@ -778,6 +880,7 @@ func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 		{name: "duplicate nonce keys", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(1), uint256.NewInt(1)} }},
 		{name: "descending nonce keys", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(2), uint256.NewInt(1)} }},
 		{name: "zero with another nonce key", mut: func(tx *FrameTx) { tx.NonceKeys = []*uint256.Int{uint256.NewInt(0), uint256.NewInt(1)} }},
+		{name: "too many recent root references", mut: func(tx *FrameTx) { tx.RecentRootRefs = make([]RecentRootRef, params.MaxRecentRootReferences+1) }},
 		{
 			name: "no frames",
 			mut:  func(tx *FrameTx) { tx.Frames = nil },

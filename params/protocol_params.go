@@ -39,6 +39,8 @@ const (
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract. NOTE: Not payable on data of calls between transactions.
 	TxGasEIP8141          uint64 = 15000 // Per frame transaction (EIP-8141). NOTE: Not payable on data of calls between transactions.
 	FrameTxPerFrameGas    uint64 = 475   // Per EIP-8141 frame transaction frame.
+	RecentRootBaseGas     uint64 = 2400  // Base intrinsic gas when recent-root references are present.
+	RecentRootPerRefGas   uint64 = 2002  // Per-reference intrinsic gas for EIP-8272.
 	SigGasSecp256k1       uint64 = 2800  // Per EIP-8141 secp256k1 transaction-level signature verification.
 	SigGasP256            uint64 = 6700  // Per EIP-8141 P256 transaction-level signature verification.
 	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions.
@@ -190,7 +192,8 @@ const (
 
 	MaxBlockSize = 8_388_608 // maximum size of an RLP-encoded block
 
-	MaxFrames int = 64 // Maximum number of frames per frame transaction.
+	MaxFrames               int = 64 // Maximum number of frames per frame transaction.
+	MaxRecentRootReferences     = 16
 )
 
 // Bls12381G1MultiExpDiscountTable is the gas discount table for BLS12-381 G1 multi exponentiation operation
@@ -236,4 +239,8 @@ var (
 	NonceManagerAddress        = common.HexToAddress("0x0000000000000000000000000000000000008250")
 	NonceManagerCode           = common.FromHex("60006000fd")
 	KeyedNonceFirstUseGas      = uint64(20_000)
+	RecentRootAddress          = common.HexToAddress("0x0000000000000000000000000000000000008272")
+	RecentRootCode             = common.FromHex("60006000fd00")
+	RecentRootWindow           = uint64(8192)
+	SecondsPerSlot             = uint64(12)
 )

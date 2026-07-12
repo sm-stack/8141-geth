@@ -166,6 +166,64 @@ func TestTxParamKeyedNonceSelectors(t *testing.T) {
 	}
 }
 
+func TestRecentRootIntrospection(t *testing.T) {
+	if RECENTROOTREFLOAD != 0xb5 || RECENTROOTREFLOAD.String() != "RECENTROOTREFLOAD" {
+		t.Fatalf("unexpected recent-root opcode assignment: %#x %s", RECENTROOTREFLOAD, RECENTROOTREFLOAD)
+	}
+	if op := pragueInstructionSet[RECENTROOTREFLOAD]; op == nil || op.undefined || op.constantGas != GasQuickStep {
+		t.Fatalf("recent-root opcode not enabled with gas 3: %#v", op)
+	}
+	ref := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: 77, Root: common.HexToHash("0x5678")}
+	fc := &FrameContext{RecentRootRefs: []types.RecentRootRef{ref}}
+	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+	evm.FrameCtx = fc
+
+	stack := newstack()
+	stack.push(uint256.NewInt(txParamRecentRootRefCount))
+	pc := uint64(0)
+	if _, err := opTxParam(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err != nil {
+		t.Fatal(err)
+	}
+	gotCount := stack.pop()
+	if got := gotCount.Uint64(); got != 1 {
+		t.Fatalf("reference count = %d, want 1", got)
+	}
+	returnStack(stack)
+
+	fields := []struct {
+		field uint64
+		want  *uint256.Int
+	}{
+		{0, new(uint256.Int).SetBytes(ref.SourceID[:])},
+		{1, uint256.NewInt(ref.Slot)},
+		{2, new(uint256.Int).SetBytes(ref.Root[:])},
+	}
+	for _, tt := range fields {
+		stack := newstack()
+		stack.push(uint256.NewInt(0))
+		stack.push(uint256.NewInt(tt.field))
+		if _, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err != nil {
+			returnStack(stack)
+			t.Fatalf("field %d: %v", tt.field, err)
+		}
+		if got := stack.pop(); !got.Eq(tt.want) {
+			returnStack(stack)
+			t.Fatalf("field %d = %x, want %x", tt.field, got.Bytes32(), tt.want.Bytes32())
+		}
+		returnStack(stack)
+	}
+	for _, pair := range [][2]uint64{{1, 0}, {0, 3}} {
+		stack := newstack()
+		stack.push(uint256.NewInt(pair[0]))
+		stack.push(uint256.NewInt(pair[1]))
+		_, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack})
+		returnStack(stack)
+		if err == nil {
+			t.Fatalf("index/field %v accepted", pair)
+		}
+	}
+}
+
 func TestSigParamReturnsSignatureMetadata(t *testing.T) {
 	signer := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	msg := common.HexToHash("0x1234").Bytes()

@@ -245,6 +245,20 @@ func TestDeveloperGenesisIncludesFrameExpiryVerifier(t *testing.T) {
 	}
 }
 
+func TestDeveloperGenesisIncludesRecentRootContract(t *testing.T) {
+	genesis := DeveloperGenesisBlock(30_000_000, nil)
+	account, ok := genesis.Alloc[params.RecentRootAddress]
+	if !ok {
+		t.Fatal("recent root contract missing from developer genesis")
+	}
+	if account.Nonce != 1 {
+		t.Fatalf("recent root nonce = %d, want 1", account.Nonce)
+	}
+	if !bytes.Equal(account.Code, params.RecentRootCode) {
+		t.Fatalf("recent root code = %x, want %x", account.Code, params.RecentRootCode)
+	}
+}
+
 func TestReadWriteGenesisAlloc(t *testing.T) {
 	var (
 		db    = rawdb.NewMemoryDatabase()

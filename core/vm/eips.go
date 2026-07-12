@@ -599,4 +599,10 @@ func enable8141(jt *JumpTable) {
 		minStack:    minStack(2, 1),
 		maxStack:    maxStack(2, 1),
 	}
+	jt[RECENTROOTREFLOAD] = &operation{
+		execute:     opRecentRootRefLoad,
+		constantGas: GasQuickStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
 }

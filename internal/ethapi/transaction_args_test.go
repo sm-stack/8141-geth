@@ -278,6 +278,7 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 			{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
 		],
 		"signatures":[{"scheme":"0x0","signer":"0x000000000000000000000000000000000000abcd","msg":"0x","signature":"%s"}]
+		,"recentRootReferences":[{"sourceId":"0x0101010101010101010101010101010101010101010101010101010101010101","slot":"0x9","root":"0x0202020202020202020202020202020202020202020202020202020202020202"}]
 	}`, signature)
 
 	var args TransactionArgs
@@ -309,6 +310,9 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 	}
 	if ftx.NonceSeq != 3 || len(ftx.NonceKeys) != 2 || ftx.NonceKeys[0].Uint64() != 7 || ftx.NonceKeys[1].Uint64() != 11 {
 		t.Fatalf("unexpected keyed nonce: keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
+	}
+	if len(ftx.RecentRootRefs) != 1 || ftx.RecentRootRefs[0].Slot != 9 {
+		t.Fatalf("unexpected recent root references: %#v", ftx.RecentRootRefs)
 	}
 }
 
