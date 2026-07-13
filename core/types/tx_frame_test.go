@@ -21,7 +21,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -75,41 +79,121 @@ func testVRS(sig []byte) []byte {
 	return vrs
 }
 
-func testFrameTxSigHashVector() *FrameTx {
-	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
-	return &FrameTx{
-		ChainID:    uint256.NewInt(1),
-		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
-		NonceSeq:   7,
-		Sender:     common.HexToAddress("0x1111111111111111111111111111111111111111"),
-		GasTipCap:  uint256.NewInt(3),
-		GasFeeCap:  uint256.NewInt(100),
-		BlobFeeCap: uint256.NewInt(0),
-		BlobHashes: []common.Hash{common.HexToHash("0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")},
-		Frames: []Frame{
-			{Mode: FrameModeVerify, Flags: 3, GasLimit: 50000, Data: []byte{0xaa, 0xbb}},
-			{Mode: FrameModeSender, Flags: FrameFlagAtomicBatch, Target: &target, GasLimit: 70000, Value: uint256.NewInt(12345), Data: []byte{0xcc, 0xdd, 0xee}},
-			{Mode: FrameModeDefault, Target: &target, GasLimit: 30000, Data: []byte{0x99}},
-		},
-		Signatures: []TxSignature{
-			{
-				Scheme:    SignatureSchemeSecp256k1,
-				Signer:    common.HexToAddress("0x3333333333333333333333333333333333333333"),
-				Signature: common.Hex2Bytes("0011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222"),
-			},
-			{
-				Scheme:    SignatureSchemeP256,
-				Signer:    common.HexToAddress("0x4444444444444444444444444444444444444444"),
-				Msg:       common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").Bytes(),
-				Signature: common.Hex2Bytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
-			},
-		},
-		RecentRootRefs: []RecentRootRef{{
-			SourceID: common.HexToHash("0x0101010101010101010101010101010101010101010101010101010101010101"),
-			Slot:     9,
-			Root:     common.HexToHash("0x0202020202020202020202020202020202020202020202020202020202020202"),
-		}},
+type storedFrameTxVector struct {
+	Transaction struct {
+		ChainID    string   `json:"chainId"`
+		NonceKeys  []string `json:"nonceKeys"`
+		NonceSeq   string   `json:"nonceSeq"`
+		Sender     string   `json:"sender"`
+		GasTipCap  string   `json:"maxPriorityFeePerGas"`
+		GasFeeCap  string   `json:"maxFeePerGas"`
+		BlobFeeCap string   `json:"maxFeePerBlobGas"`
+		BlobHashes []string `json:"blobVersionedHashes"`
+		Frames     []struct {
+			Mode     string  `json:"mode"`
+			Flags    uint8   `json:"flags"`
+			Target   *string `json:"target"`
+			GasLimit string  `json:"gasLimit"`
+			Value    string  `json:"value"`
+			Data     string  `json:"data"`
+		} `json:"frames"`
+		Signatures []struct {
+			Scheme    uint8  `json:"scheme"`
+			Signer    string `json:"signer"`
+			Msg       string `json:"msg"`
+			Signature string `json:"signature"`
+		} `json:"signatures"`
+		RecentRootRefs []struct {
+			SourceID string `json:"sourceId"`
+			Slot     string `json:"slot"`
+			Root     string `json:"root"`
+		} `json:"recentRootReferences"`
+	} `json:"transaction"`
+	SigHash        string `json:"sigHash"`
+	RawTransaction string `json:"rawTransaction"`
+}
+
+func loadFrameTxVector(t *testing.T) (*FrameTx, storedFrameTxVector) {
+	t.Helper()
+	path := os.Getenv("EIP8141_VECTOR_PATH")
+	if path == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			candidate := filepath.Join(dir, ".context", "test-vectors", "frame-transaction-v1.json")
+			if _, err := os.Stat(candidate); err == nil {
+				path = candidate
+				break
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				path = filepath.Join("testdata", "frame-transaction-v1.json")
+				break
+			}
+			dir = parent
+		}
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored storedFrameTxVector
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	parseU64 := func(value string) uint64 {
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	parseU256 := func(value string) *uint256.Int {
+		parsed, err := uint256.FromDecimal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	decode := func(value string) []byte {
+		parsed, err := hexutil.Decode(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	tx := &FrameTx{
+		ChainID:    parseU256(stored.Transaction.ChainID),
+		NonceSeq:   parseU64(stored.Transaction.NonceSeq),
+		Sender:     common.HexToAddress(stored.Transaction.Sender),
+		GasTipCap:  parseU256(stored.Transaction.GasTipCap),
+		GasFeeCap:  parseU256(stored.Transaction.GasFeeCap),
+		BlobFeeCap: parseU256(stored.Transaction.BlobFeeCap),
+	}
+	for _, key := range stored.Transaction.NonceKeys {
+		tx.NonceKeys = append(tx.NonceKeys, parseU256(key))
+	}
+	for _, hash := range stored.Transaction.BlobHashes {
+		tx.BlobHashes = append(tx.BlobHashes, common.HexToHash(hash))
+	}
+	modes := map[string]uint8{"default": FrameModeDefault, "verify": FrameModeVerify, "sender": FrameModeSender}
+	for _, frame := range stored.Transaction.Frames {
+		converted := Frame{Mode: modes[frame.Mode], Flags: frame.Flags, GasLimit: parseU64(frame.GasLimit), Value: parseU256(frame.Value), Data: decode(frame.Data)}
+		if frame.Target != nil {
+			target := common.HexToAddress(*frame.Target)
+			converted.Target = &target
+		}
+		tx.Frames = append(tx.Frames, converted)
+	}
+	for _, signature := range stored.Transaction.Signatures {
+		tx.Signatures = append(tx.Signatures, TxSignature{Scheme: signature.Scheme, Signer: common.HexToAddress(signature.Signer), Msg: decode(signature.Msg), Signature: decode(signature.Signature)})
+	}
+	for _, ref := range stored.Transaction.RecentRootRefs {
+		tx.RecentRootRefs = append(tx.RecentRootRefs, RecentRootRef{SourceID: common.HexToHash(ref.SourceID), Slot: parseU64(ref.Slot), Root: common.HexToHash(ref.Root)})
+	}
+	return tx, stored
 }
 
 func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
@@ -313,19 +397,15 @@ func TestFrameTxSignatureGas(t *testing.T) {
 }
 
 func TestFrameTxSigHashVector(t *testing.T) {
-	const (
-		wantSigHash = "0xc0aeaa116efe492bd25f0648a49964062170aa3f911dbcdb61cb888945a1bde4"
-		wantRawTx   = "0x06f901ed01c18007941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20f845f843a0010101010101010101010101010101010101010101010101010101010101010109a00202020202020202020202020202020202020202020202020202020202020202"
-	)
-	tx := testFrameTxSigHashVector()
-	if got, want := tx.SigHash(tx.chainID()).Hex(), wantSigHash; got != want {
+	tx, vector := loadFrameTxVector(t)
+	if got, want := tx.SigHash(tx.chainID()).Hex(), vector.SigHash; got != want {
 		t.Fatalf("SigHash = %s, want %s", got, want)
 	}
 	typed, err := NewTx(tx).MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary failed: %v", err)
 	}
-	if got, want := hexutil.Encode(typed), wantRawTx; got != want {
+	if got, want := hexutil.Encode(typed), vector.RawTransaction; got != want {
 		t.Fatalf("raw typed tx = %s, want %s", got, want)
 	}
 }
@@ -782,7 +862,7 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidRecentRootReference(t *testing.T) {
 		Slot     uint64
 		Root     []byte
 	}
-	base := testFrameTxSigHashVector()
+	base, _ := loadFrameTxVector(t)
 	for _, ref := range []rawRef{
 		{SourceID: make([]byte, 31), Slot: 1, Root: make([]byte, 32)},
 		{SourceID: make([]byte, 32), Slot: 1, Root: make([]byte, 31)},
@@ -836,7 +916,7 @@ func TestFrameTxUnmarshalBinaryRejectsLegacyNineFieldPayload(t *testing.T) {
 }
 
 func TestFrameTxUnmarshalBinaryRejectsLegacyTenFieldPayload(t *testing.T) {
-	tx := testFrameTxSigHashVector()
+	tx, _ := loadFrameTxVector(t)
 	legacy := frameTxRLP{
 		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq, Sender: tx.Sender,
 		Frames: tx.Frames, Signatures: tx.Signatures, GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,

@@ -1,0 +1,66 @@
+{
+  "name": "eip-8141-8250-8272-frame-transaction-v1",
+  "transaction": {
+    "chainId": "1",
+    "nonceKeys": ["0"],
+    "nonceSeq": "7",
+    "sender": "0x1111111111111111111111111111111111111111",
+    "frames": [
+      {
+        "mode": "verify",
+        "flags": 3,
+        "target": null,
+        "gasLimit": "50000",
+        "value": "0",
+        "data": "0xaabb"
+      },
+      {
+        "mode": "sender",
+        "flags": 4,
+        "target": "0x2222222222222222222222222222222222222222",
+        "gasLimit": "70000",
+        "value": "12345",
+        "data": "0xccddee"
+      },
+      {
+        "mode": "default",
+        "flags": 0,
+        "target": "0x2222222222222222222222222222222222222222",
+        "gasLimit": "30000",
+        "value": "0",
+        "data": "0x99"
+      }
+    ],
+    "signatures": [
+      {
+        "scheme": 0,
+        "signer": "0x3333333333333333333333333333333333333333",
+        "msg": "0x",
+        "signature": "0x0011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222"
+      },
+      {
+        "scheme": 1,
+        "signer": "0x4444444444444444444444444444444444444444",
+        "msg": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "signature": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    ],
+    "maxPriorityFeePerGas": "3",
+    "maxFeePerGas": "100",
+    "maxFeePerBlobGas": "0",
+    "blobVersionedHashes": [
+      "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    ],
+    "recentRootReferences": [
+      {
+        "sourceId": "0x0101010101010101010101010101010101010101010101010101010101010101",
+        "slot": "9",
+        "root": "0x0202020202020202020202020202020202020202020202020202020202020202"
+      }
+    ],
+    "type": "frame"
+  },
+  "sigHash": "0xc0aeaa116efe492bd25f0648a49964062170aa3f911dbcdb61cb888945a1bde4",
+  "rawTransaction": "0x06f901ed01c18007941111111111111111111111111111111111111111f84cca01038082c3508082aabbe202049422222222222222222222222222222222222222228301117082303983ccddeedd8080942222222222222222222222222222222222222222827530808199f90117f85a8094333333333333333333333333333333333333333380b8410011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f8b901944444444444444444444444444444444444444444a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab880bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee036480e1a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20f845f843a0010101010101010101010101010101010101010101010101010101010101010109a00202020202020202020202020202020202020202020202020202020202020202",
+  "intrinsicGas": "197537"
+}
