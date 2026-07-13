@@ -276,14 +276,14 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 }
 
 // opRecentRootRefLoad implements RECENTROOTREFLOAD (0xb5).
-// Stack: [index, field] -> [value], with field at the top of stack.
+// Stack: [field, index] -> [value], with index at the top of stack.
 func opRecentRootRefLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	fc, err := requireFrameContext(evm, RECENTROOTREFLOAD)
 	if err != nil {
 		return nil, err
 	}
-	field := scope.Stack.pop()
-	indexWord := scope.Stack.peek()
+	indexWord := scope.Stack.pop()
+	field := scope.Stack.peek()
 	index, overflow := indexWord.Uint64WithOverflow()
 	if overflow || index >= uint64(len(fc.RecentRootRefs)) {
 		return nil, invalidFrameOpcode(RECENTROOTREFLOAD)
@@ -291,11 +291,11 @@ func opRecentRootRefLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, err
 	ref := fc.RecentRootRefs[index]
 	switch field.Uint64() {
 	case 0:
-		indexWord.SetBytes32(ref.SourceID[:])
+		field.SetBytes32(ref.SourceID[:])
 	case 1:
-		indexWord.SetUint64(ref.Slot)
+		field.SetUint64(ref.Slot)
 	case 2:
-		indexWord.SetBytes32(ref.Root[:])
+		field.SetBytes32(ref.Root[:])
 	default:
 		return nil, invalidFrameOpcode(RECENTROOTREFLOAD)
 	}

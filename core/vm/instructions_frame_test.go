@@ -200,8 +200,8 @@ func TestRecentRootIntrospection(t *testing.T) {
 	}
 	for _, tt := range fields {
 		stack := newstack()
-		stack.push(uint256.NewInt(0))
 		stack.push(uint256.NewInt(tt.field))
+		stack.push(uint256.NewInt(0))
 		if _, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err != nil {
 			returnStack(stack)
 			t.Fatalf("field %d: %v", tt.field, err)
@@ -214,8 +214,8 @@ func TestRecentRootIntrospection(t *testing.T) {
 	}
 	for _, pair := range [][2]uint64{{1, 0}, {0, 3}} {
 		stack := newstack()
-		stack.push(uint256.NewInt(pair[0]))
 		stack.push(uint256.NewInt(pair[1]))
+		stack.push(uint256.NewInt(pair[0]))
 		_, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack})
 		returnStack(stack)
 		if err == nil {

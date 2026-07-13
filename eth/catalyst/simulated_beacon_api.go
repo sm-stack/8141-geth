@@ -18,8 +18,12 @@ package catalyst
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -107,4 +111,12 @@ func (a *simulatedBeaconAPI) AddWithdrawal(ctx context.Context, withdrawal *type
 // SetFeeRecipient sets the fee recipient for block building purposes.
 func (a *simulatedBeaconAPI) SetFeeRecipient(ctx context.Context, feeRecipient common.Address) {
 	a.sim.setFeeRecipient(feeRecipient)
+}
+
+// AdvanceTime seals a developer block after advancing its timestamp by seconds.
+func (a *simulatedBeaconAPI) AdvanceTime(ctx context.Context, seconds hexutil.Uint64) error {
+	if uint64(seconds) > uint64(math.MaxInt64)/uint64(time.Second) {
+		return fmt.Errorf("time adjustment %d seconds exceeds maximum", seconds)
+	}
+	return a.sim.AdvanceTime(time.Duration(seconds) * time.Second)
 }
