@@ -446,6 +446,12 @@ var (
 		Value:    ethconfig.Defaults.TxPool.Lifetime,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolMaxVerifyGasFlag = &cli.Uint64Flag{
+		Name:     "framepool.maxverifygas",
+		Usage:    "Maximum frame transaction validation gas (values above 100000 require fully disabled P2P, as in --dev)",
+		Value:    ethconfig.Defaults.FramePool.MaxVerifyGas,
+		Category: flags.TxPoolCategory,
+	}
 	// Blob transaction pool settings
 	BlobPoolDataDirFlag = &cli.StringFlag{
 		Name:     "blobpool.datadir",
@@ -1385,6 +1391,7 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 		cfg.ListenAddr = ""
 		cfg.NoDial = true
 		cfg.NoDiscovery = true
+		cfg.DiscoveryV4 = false
 		cfg.DiscoveryV5 = false
 	}
 }
@@ -1611,6 +1618,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setEtherbase(ctx, cfg)
 	setGPO(ctx, &cfg.GPO)
 	setTxPool(ctx, &cfg.TxPool)
+	if ctx.IsSet(FramePoolMaxVerifyGasFlag.Name) {
+		cfg.FramePool.MaxVerifyGas = ctx.Uint64(FramePoolMaxVerifyGasFlag.Name)
+	}
 	setBlobPool(ctx, &cfg.BlobPool)
 	setMiner(ctx, &cfg.Miner)
 	setRequiredBlocks(ctx, cfg)

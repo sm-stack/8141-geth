@@ -233,7 +233,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
 	]`, string(body["frames"]))
 	require.JSONEq(t, `[{
-		"scheme":"0x0",
+		"scheme":"0x1",
 		"signer":"0x000000000000000000000000000000000000abcd",
 		"msg":"0x",
 		"signature":"0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
@@ -272,7 +272,7 @@ func TestMarshalFrameReceiptNormalizesFrameStatus(t *testing.T) {
 		CumulativeGasUsed: 30,
 		EffectiveGasPrice: big.NewInt(1),
 		FrameReceipts: []types.FrameReceipt{
-			{Status: 2, GasUsed: 10},
+			{Status: 3, GasUsed: 10},
 			{Status: types.FrameReceiptStatusSkipped, GasUsed: 20},
 		},
 	}
@@ -286,7 +286,7 @@ func TestMarshalFrameReceiptNormalizesFrameStatus(t *testing.T) {
 		t.Fatalf("marshal receipt fields: %v", err)
 	}
 	have := string(data)
-	for _, want := range []string{`"frameReceipts"`, `"payer":"0x000000000000000000000000000000000000beef"`, `"status":"0x0"`, `"status":"0x3"`, `"logs":[]`} {
+	for _, want := range []string{`"frameReceipts"`, `"payer":"0x000000000000000000000000000000000000beef"`, `"status":"0x0"`, `"status":"0x2"`, `"logs":[]`} {
 		if !strings.Contains(have, want) {
 			t.Fatalf("receipt json missing %s: %s", want, have)
 		}

@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -991,6 +992,12 @@ func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 			mut:  func(tx *FrameTx) { tx.Frames[len(tx.Frames)-1].Flags = FrameFlagAtomicBatch },
 		},
 		{
+			name: "atomic before verify frame",
+			mut: func(tx *FrameTx) {
+				tx.Frames = []Frame{{Mode: FrameModeSender, Flags: FrameFlagAtomicBatch}, {Mode: FrameModeVerify}}
+			},
+		},
+		{
 			name: "frame gas overflow",
 			mut: func(tx *FrameTx) {
 				tx.Frames = []Frame{
@@ -1000,8 +1007,25 @@ func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 			},
 		},
 		{
+			name: "VERIFY frame starts atomic batch",
+			mut: func(tx *FrameTx) {
+				tx.Frames = []Frame{
+					{Mode: FrameModeVerify, Flags: FrameFlagAtomicBatch},
+					{Mode: FrameModeSender},
+				}
+			},
+		},
+		{
+			name: "execution approval targets third party",
+			mut: func(tx *FrameTx) {
+				target := common.HexToAddress("0x1234")
+				tx.Frames[0].Target = &target
+				tx.Frames[0].Flags = 2
+			},
+		},
+		{
 			name: "unsupported signature scheme",
-			mut:  func(tx *FrameTx) { tx.Signatures[0].Scheme = 2 },
+			mut:  func(tx *FrameTx) { tx.Signatures[0].Scheme = 3 },
 		},
 		{
 			name: "bad secp256k1 signature length",
@@ -1060,6 +1084,65 @@ func TestFrameTxValidateRejectsStaticConstraintViolations(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestValidateFrameTxSignaturesArbitrary(t *testing.T) {
+	tx := testFrameTx().copy().(*FrameTx)
+	tx.Signatures = []TxSignature{{
+		Scheme:    SignatureSchemeArbitrary,
+		Signature: []byte{0x01, 0x02, 0x03},
+	}}
+	if err := ValidateFrameTxSignatures(tx, tx.SigHash(tx.chainID())); err != nil {
+		t.Fatalf("arbitrary signature rejected: %v", err)
+	}
+	gas, err := tx.SignatureGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gas != params.SigGasArbitrary {
+		t.Fatalf("arbitrary signature gas %d, want %d", gas, params.SigGasArbitrary)
+	}
+	tx.Signatures[0].Signer = common.HexToAddress("0x1234")
+	if err := ValidateFrameTxSignatures(tx, tx.SigHash(tx.chainID())); err == nil {
+		t.Fatal("arbitrary signature with signer accepted")
+	}
+}
+
+func TestTxSignatureOptionalSignerRLP(t *testing.T) {
+	sig := TxSignature{Scheme: SignatureSchemeArbitrary, Signature: []byte{0x01}}
+	encoded, err := rlp.EncodeToBytes(sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields []rlp.RawValue
+	if err := rlp.DecodeBytes(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 4 || !bytes.Equal(fields[1], []byte{0x80}) {
+		t.Fatalf("optional signer encoding %x", encoded)
+	}
+	var decoded TxSignature
+	if err := rlp.DecodeBytes(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Signer != (common.Address{}) {
+		t.Fatalf("decoded signer %s", decoded.Signer)
+	}
+	if decoded.signerPresent {
+		t.Fatal("omitted signer decoded as present")
+	}
+
+	explicitZero := TxSignature{Scheme: SignatureSchemeSecp256k1, signerPresent: true}
+	explicitEncoded, err := rlp.EncodeToBytes(explicitZero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rlp.DecodeBytes(explicitEncoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.signerPresent || decoded.Signer != (common.Address{}) {
+		t.Fatal("explicit zero signer was not preserved")
 	}
 }
 
@@ -1124,6 +1207,10 @@ func TestValidateFrameTxSignaturesP256(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to sign p256 msg: %v", err)
 	}
+	halfN := new(big.Int).Rsh(new(big.Int).Set(elliptic.P256().Params().N), 1)
+	if s.Cmp(halfN) > 0 {
+		s.Sub(elliptic.P256().Params().N, s)
+	}
 	sig := make([]byte, signatureLengthP256)
 	copy(sig[0:32], common.LeftPadBytes(r.Bytes(), 32))
 	copy(sig[32:64], common.LeftPadBytes(s.Bytes(), 32))
@@ -1141,6 +1228,12 @@ func TestValidateFrameTxSignaturesP256(t *testing.T) {
 	if err := ValidateFrameTxSignatures(tx, tx.SigHash(tx.chainID())); err != nil {
 		t.Fatalf("ValidateFrameTxSignatures p256 failed: %v", err)
 	}
+	highS := new(big.Int).Sub(elliptic.P256().Params().N, s)
+	copy(tx.Signatures[0].Signature[32:64], common.LeftPadBytes(highS.Bytes(), 32))
+	if err := ValidateFrameTxSignatures(tx, tx.SigHash(tx.chainID())); err == nil {
+		t.Fatal("expected high-s p256 signature to fail")
+	}
+	copy(tx.Signatures[0].Signature[32:64], common.LeftPadBytes(s.Bytes(), 32))
 	tx.Signatures[0].Signature[0] ^= 0x01
 	if err := ValidateFrameTxSignatures(tx, tx.SigHash(tx.chainID())); err == nil {
 		t.Fatal("expected mutated p256 signature to fail")

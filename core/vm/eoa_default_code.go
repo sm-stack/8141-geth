@@ -76,11 +76,16 @@ func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address)
 	if allowedScope == ApproveNone {
 		return 0, false
 	}
-	for _, sig := range fc.Signatures {
-		supported := sig.Scheme == types.SignatureSchemeSecp256k1 || sig.Scheme == types.SignatureSchemeP256
-		if supported && sig.Signer == target && len(sig.Msg) == 0 {
-			return allowedScope, true
-		}
+	sigIndex := 1
+	if allowedScope&ApproveExecution != 0 {
+		sigIndex = 0
+	}
+	if sigIndex >= len(fc.Signatures) {
+		return 0, false
+	}
+	sig := fc.Signatures[sigIndex]
+	if sig.Scheme == types.SignatureSchemeSecp256k1 && types.ResolveTxSignatureSigner(sig, fc.Sender) == target && len(sig.Msg) == 0 {
+		return allowedScope, true
 	}
 	return 0, false
 }

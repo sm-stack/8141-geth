@@ -57,7 +57,7 @@ const (
 	FrameReceiptStatusSuccessful = uint8(1)
 
 	// FrameReceiptStatusSkipped means frame execution was skipped by atomic batch rollback.
-	FrameReceiptStatusSkipped = uint8(3)
+	FrameReceiptStatusSkipped = uint8(2)
 )
 
 func validFrameReceiptStatus(status uint64) bool {

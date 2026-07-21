@@ -133,6 +133,7 @@ func (sig *TxSignature) UnmarshalJSON(input []byte) error {
 		return errors.New("'scheme' value overflows uint8")
 	}
 	sig.Scheme = uint8(*dec.Scheme)
+	sig.signerPresent = false
 	if dec.Signer == nil {
 		return errors.New("missing required field 'signer' in tx signature")
 	}

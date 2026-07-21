@@ -498,7 +498,7 @@ func TestFrameTxAtomicBatchFailureRollsBackAndSkips(t *testing.T) {
 	})
 	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
 
-	assertFrameStatuses(t, receipt, []uint8{1, 1, 0, 3})
+	assertFrameStatuses(t, receipt, []uint8{1, 1, 0, types.FrameReceiptStatusSkipped})
 	if got := receipt.FrameReceipts[3].GasUsed; got != 0 {
 		t.Fatalf("skipped frame gas used: got %d want 0", got)
 	}
@@ -516,6 +516,7 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 	sender := common.HexToAddress("0x1111")
 	sponsor := common.HexToAddress("0x2222")
 	failingTarget := common.HexToAddress("0x3333")
+	skippedTarget := common.HexToAddress("0x5555")
 	successTarget := common.HexToAddress("0x4444")
 
 	statedb.CreateAccount(sender)
@@ -528,6 +529,8 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 
 	statedb.CreateAccount(failingTarget)
 	statedb.SetCode(failingTarget, revertCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(skippedTarget)
+	statedb.SetCode(skippedTarget, storeOneCode, tracing.CodeChangeUnspecified)
 	statedb.CreateAccount(successTarget)
 	statedb.SetCode(successTarget, storeTwoCode, tracing.CodeChangeUnspecified)
 
@@ -538,9 +541,10 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 		NonceSeq:  0,
 		Sender:    sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 2, Target: nil, GasLimit: 50000, Data: nil},
-			{Mode: types.FrameModeVerify, Flags: types.FrameFlagAtomicBatch | 1, Target: &sponsor, GasLimit: 50000, Data: nil},
-			{Mode: types.FrameModeSender, Target: &failingTarget, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeSender, Flags: types.FrameFlagAtomicBatch, Target: &failingTarget, GasLimit: 50000, Data: nil},
+			{Mode: types.FrameModeSender, Target: &skippedTarget, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeSender, Target: &successTarget, GasLimit: 100000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
@@ -560,6 +564,7 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 		types.FrameReceiptStatusSuccessful,
 		types.FrameReceiptStatusSuccessful,
 		types.FrameReceiptStatusFailed,
+		types.FrameReceiptStatusSkipped,
 		types.FrameReceiptStatusSuccessful,
 	}
 	if got := result.frameResults; len(got) != len(wantResults) {
@@ -996,7 +1001,7 @@ func TestFrameTxReApproveExecution(t *testing.T) {
 }
 
 // TestFrameTxPayBeforeSenderApproval tests that payment approval before sender approval is rejected.
-// Per spec: "If sender_approved == false and status is 3, revert the frame."
+// Per spec, payment approval before sender approval reverts the frame.
 func TestFrameTxPayBeforeSenderApproval(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 

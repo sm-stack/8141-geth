@@ -264,7 +264,7 @@ func TestExtractReceiptFields(t *testing.T) {
 		Payer:             common.HexToAddress("0xbeef"),
 		FrameReceipts: []types.FrameReceipt{
 			{Status: 1, GasUsed: 42, Logs: []*types.Log{{Address: common.HexToAddress("0xcafe")}}},
-			{Status: 3},
+			{Status: types.FrameReceiptStatusSkipped},
 		},
 	})
 	frameReceiptBlob, _ := rlp.EncodeToBytes(&frameReceipt)

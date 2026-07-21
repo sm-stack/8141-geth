@@ -531,7 +531,7 @@ func TestFrameReceiptMarshalBinary(t *testing.T) {
 				},
 			},
 			{
-				Status:  3,
+				Status:  FrameReceiptStatusSkipped,
 				GasUsed: 222,
 				Logs:    nil,
 			},
@@ -644,7 +644,7 @@ func TestReceiptForStorageFrameRoundTrip(t *testing.T) {
 		Payer:             common.HexToAddress("0xbeef"),
 		FrameReceipts: []FrameReceipt{
 			{
-				Status:  3,
+				Status:  FrameReceiptStatusSkipped,
 				GasUsed: 50,
 				Logs: []*Log{
 					{
@@ -714,7 +714,7 @@ func TestFrameReceiptJSON(t *testing.T) {
 		Payer:             common.HexToAddress("0x7777"),
 		FrameReceipts: []FrameReceipt{
 			{
-				Status:  3,
+				Status:  FrameReceiptStatusSkipped,
 				GasUsed: 21,
 				Logs: []*Log{
 					{
@@ -759,7 +759,7 @@ func TestFrameReceiptJSONZeroPayerIsPresent(t *testing.T) {
 		CumulativeGasUsed: 1,
 		Payer:             common.Address{},
 		FrameReceipts: []FrameReceipt{
-			{Status: 3, GasUsed: 1, Logs: []*Log{}},
+			{Status: FrameReceiptStatusSkipped, GasUsed: 1, Logs: []*Log{}},
 		},
 		Logs:    []*Log{},
 		GasUsed: 1,
@@ -799,7 +799,7 @@ func TestFrameReceiptJSONRejectsMissingPayer(t *testing.T) {
 		CumulativeGasUsed: 1,
 		Payer:             common.HexToAddress("0x1111"),
 		FrameReceipts: []FrameReceipt{
-			{Status: 3, GasUsed: 1, Logs: []*Log{}},
+			{Status: FrameReceiptStatusSkipped, GasUsed: 1, Logs: []*Log{}},
 		},
 		Logs:    []*Log{},
 		GasUsed: 1,

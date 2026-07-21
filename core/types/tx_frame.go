@@ -47,7 +47,9 @@ const (
 
 // Frame flag constants as defined in EIP-8141.
 const (
-	FrameFlagApproveScopeMask uint8 = 0x03
+	FrameFlagApprovePayment   uint8 = 0x01
+	FrameFlagApproveExecution uint8 = 0x02
+	FrameFlagApproveScopeMask uint8 = FrameFlagApprovePayment | FrameFlagApproveExecution
 	FrameFlagAtomicBatch      uint8 = 0x04
 )
 
@@ -68,8 +70,9 @@ func DecodeFrameExpiryDeadline(data []byte) (uint64, bool) {
 
 // Transaction signature scheme constants as defined in EIP-8141.
 const (
-	SignatureSchemeSecp256k1 uint8 = 0
-	SignatureSchemeP256      uint8 = 1
+	SignatureSchemeArbitrary uint8 = 0
+	SignatureSchemeSecp256k1 uint8 = 1
+	SignatureSchemeP256      uint8 = 2
 )
 
 // Frame represents a single execution frame in a frame transaction (EIP-8141).
@@ -139,6 +142,43 @@ type TxSignature struct {
 	Signer    common.Address
 	Msg       []byte
 	Signature []byte
+
+	// signerPresent distinguishes an omitted signer from an explicitly encoded
+	// zero address. It is populated by RLP decoding; ordinary constructors can
+	// omit it because every non-zero Signer is necessarily present.
+	signerPresent bool
+}
+
+// EncodeRLP implements the EIP-8141 optional signer encoding. A zero signer is
+// encoded as empty bytes and resolves to tx.sender for protocol schemes.
+func (sig TxSignature) EncodeRLP(w io.Writer) error {
+	var signer []byte
+	if sig.signerPresent || sig.Signer != (common.Address{}) {
+		signer = sig.Signer.Bytes()
+	}
+	return rlp.Encode(w, []any{sig.Scheme, signer, sig.Msg, sig.Signature})
+}
+
+// DecodeRLP rejects signer encodings other than empty or exactly 20 bytes.
+func (sig *TxSignature) DecodeRLP(s *rlp.Stream) error {
+	var dec struct {
+		Scheme    uint8
+		Signer    []byte
+		Msg       []byte
+		Signature []byte
+	}
+	if err := s.Decode(&dec); err != nil {
+		return err
+	}
+	if len(dec.Signer) != 0 && len(dec.Signer) != common.AddressLength {
+		return fmt.Errorf("invalid signature signer length %d", len(dec.Signer))
+	}
+	sig.Scheme = dec.Scheme
+	sig.Signer = common.BytesToAddress(dec.Signer)
+	sig.signerPresent = len(dec.Signer) == common.AddressLength
+	sig.Msg = dec.Msg
+	sig.Signature = dec.Signature
+	return nil
 }
 
 // RecentRootRef identifies an EIP-8272 root committed in a prior slot.
@@ -208,10 +248,11 @@ func (tx *FrameTx) copy() TxData {
 	}
 	for i, sig := range tx.Signatures {
 		cpy.Signatures[i] = TxSignature{
-			Scheme:    sig.Scheme,
-			Signer:    sig.Signer,
-			Msg:       common.CopyBytes(sig.Msg),
-			Signature: common.CopyBytes(sig.Signature),
+			Scheme:        sig.Scheme,
+			Signer:        sig.Signer,
+			Msg:           common.CopyBytes(sig.Msg),
+			Signature:     common.CopyBytes(sig.Signature),
+			signerPresent: sig.signerPresent,
 		}
 	}
 	copy(cpy.BlobHashes, tx.BlobHashes)
@@ -344,6 +385,8 @@ func (tx *FrameTx) SignatureGas() (uint64, error) {
 	for _, sig := range tx.Signatures {
 		var gas uint64
 		switch sig.Scheme {
+		case SignatureSchemeArbitrary:
+			gas = params.SigGasArbitrary
 		case SignatureSchemeSecp256k1:
 			gas = params.SigGasSecp256k1
 		case SignatureSchemeP256:
@@ -562,8 +605,16 @@ func (tx *FrameTx) Validate() error {
 		if frame.Mode != FrameModeSender && !value.IsZero() {
 			return fmt.Errorf("frame %d has nonzero value outside SENDER mode", i)
 		}
-		if frame.Flags&FrameFlagAtomicBatch != 0 && i+1 == len(tx.Frames) {
-			return fmt.Errorf("frame %d has atomic batch flag without following frame", i)
+		if frame.Flags&FrameFlagAtomicBatch != 0 {
+			if frame.Mode == FrameModeVerify {
+				return fmt.Errorf("VERIFY frame %d has atomic batch flag", i)
+			}
+			if i+1 == len(tx.Frames) {
+				return fmt.Errorf("frame %d has atomic batch flag without following frame", i)
+			}
+			if tx.Frames[i+1].Mode == FrameModeVerify {
+				return fmt.Errorf("frame %d atomic batch includes VERIFY frame %d", i, i+1)
+			}
 		}
 		var overflow bool
 		if totalFrameGas, overflow = commonmath.SafeAdd(totalFrameGas, frame.GasLimit); overflow {
@@ -572,6 +623,9 @@ func (tx *FrameTx) Validate() error {
 		target := tx.Sender
 		if frame.Target != nil {
 			target = *frame.Target
+		}
+		if frame.Flags&FrameFlagApproveExecution != 0 && target != tx.Sender {
+			return fmt.Errorf("frame %d allows execution approval outside sender", i)
 		}
 		if IsFrameExpiryVerifier(frame, target) {
 			expiryFrames++

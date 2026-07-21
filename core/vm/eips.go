@@ -596,8 +596,10 @@ func enable8141(jt *JumpTable) {
 	jt[SIGPARAM] = &operation{
 		execute:     opSigParam,
 		constantGas: GasQuickStep,
+		dynamicGas:  gasSigParam,
 		minStack:    minStack(2, 1),
 		maxStack:    maxStack(2, 1),
+		memorySize:  memorySigParam,
 	}
 	jt[RECENTROOTREFLOAD] = &operation{
 		execute:     opRecentRootRefLoad,

@@ -277,7 +277,7 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 			{"mode":"0x1","flags":"0x3","target":null,"gasLimit":"0xc350","value":"0x0","data":"0x736967"},
 			{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
 		],
-		"signatures":[{"scheme":"0x0","signer":"0x000000000000000000000000000000000000abcd","msg":"0x","signature":"%s"}]
+		"signatures":[{"scheme":"0x1","signer":"0x000000000000000000000000000000000000abcd","msg":"0x","signature":"%s"}]
 		,"recentRootReferences":[{"sourceId":"0x0101010101010101010101010101010101010101010101010101010101010101","slot":"0x9","root":"0x0202020202020202020202020202020202020202020202020202020202020202"}]
 	}`, signature)
 

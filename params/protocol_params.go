@@ -41,6 +41,7 @@ const (
 	FrameTxPerFrameGas    uint64 = 475   // Per EIP-8141 frame transaction frame.
 	RecentRootBaseGas     uint64 = 2400  // Base intrinsic gas when recent-root references are present.
 	RecentRootPerRefGas   uint64 = 2002  // Per-reference intrinsic gas for EIP-8272.
+	SigGasArbitrary       uint64 = 100   // Per EIP-8141 arbitrary transaction-level signature structural validation.
 	SigGasSecp256k1       uint64 = 2800  // Per EIP-8141 secp256k1 transaction-level signature verification.
 	SigGasP256            uint64 = 6700  // Per EIP-8141 P256 transaction-level signature verification.
 	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions.

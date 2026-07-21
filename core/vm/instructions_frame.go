@@ -51,7 +51,7 @@ type FrameContext struct {
 	GasLimit       uint64        // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
 	SigHash        common.Hash   // Cached compute_sig_hash(tx).
 	FrameIndex     int           // Currently executing frame index.
-	FrameResults   []uint8       // Status of each completed frame (0=fail, 1=success, 3=skipped).
+	FrameResults   []uint8       // Status of each completed frame (0=fail, 1=success, 2=skipped).
 	RecentRootRefs []types.RecentRootRef
 }
 
@@ -150,6 +150,7 @@ const (
 	sigParamScheme       = 0x01
 	sigParamMsg          = 0x02
 	sigParamSignatureLen = 0x03
+	sigParamSignature    = 0x04
 )
 
 func invalidFrameOpcode(op OpCode) error {
@@ -382,9 +383,10 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		if idx >= fc.FrameIndex {
 			return nil, invalidFrameOpcode(FRAMEPARAM)
 		}
-		param.Clear()
-		if idx < len(fc.FrameResults) && fc.FrameResults[idx] == types.FrameReceiptStatusSuccessful {
-			param.SetUint64(1)
+		if idx >= len(fc.FrameResults) {
+			param.Clear()
+		} else {
+			param.SetUint64(uint64(fc.FrameResults[idx]))
 		}
 	case frameParamAllowedScope:
 		param.SetUint64(uint64(frame.Flags & types.FrameFlagApproveScopeMask))
@@ -421,7 +423,11 @@ func opSigParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	sig := &fc.Signatures[int(idx)]
 	switch selector {
 	case sigParamSigner:
-		setAddressWord(param, sig.Signer)
+		if sig.Scheme == types.SignatureSchemeArbitrary {
+			return nil, invalidFrameOpcode(SIGPARAM)
+		}
+		signer := types.ResolveTxSignatureSigner(*sig, fc.Sender)
+		setAddressWord(param, signer)
 	case sigParamScheme:
 		param.SetUint64(uint64(sig.Scheme))
 	case sigParamMsg:
@@ -435,10 +441,64 @@ func opSigParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		}
 	case sigParamSignatureLen:
 		param.SetUint64(uint64(len(sig.Signature)))
+	case sigParamSignature:
+		if sig.Scheme != types.SignatureSchemeArbitrary || scope.Stack.len() < 4 {
+			return nil, invalidFrameOpcode(SIGPARAM)
+		}
+		scope.Stack.pop() // selector
+		length := scope.Stack.pop()
+		dataOffset := scope.Stack.pop()
+		memOffset := scope.Stack.pop()
+		dataOffset64, overflow := dataOffset.Uint64WithOverflow()
+		if overflow {
+			dataOffset64 = ^uint64(0)
+		}
+		length64 := length.Uint64()
+		scope.Memory.Set(memOffset.Uint64(), length64, getData(sig.Signature, dataOffset64, length64))
 	default:
 		return nil, invalidFrameOpcode(SIGPARAM)
 	}
 	return nil, nil
+}
+
+func memorySigParam(stack *Stack) (uint64, bool) {
+	if stack.len() < 2 || stack.Back(1).Uint64() != sigParamSignature {
+		return 0, false
+	}
+	if stack.len() < 5 {
+		return 0, true
+	}
+	return calcMemSize64(stack.Back(4), stack.Back(2))
+}
+
+func gasSigParam(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
+	if stack.len() < 2 || stack.Back(1).Uint64() != sigParamSignature {
+		return 0, nil
+	}
+	if stack.len() < 5 {
+		return 0, ErrGasUintOverflow
+	}
+	gas, err := memoryGasCost(mem, memorySize)
+	if err != nil {
+		return 0, err
+	}
+	words, overflow := stack.Back(2).Uint64WithOverflow()
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	words, overflow = math.SafeMul(toWordSize(words), params.CopyGas)
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	gas, overflow = math.SafeAdd(gas, words)
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	gas, overflow = math.SafeAdd(gas, 1)
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	return gas, nil
 }
 
 // memoryFrameDataCopy returns the memory size required for FRAMEDATACOPY.

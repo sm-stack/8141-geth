@@ -15,7 +15,7 @@
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 // Package framepool implements the transaction pool for EIP-8141 frame transactions.
-// It validates VERIFY frames using ERC-7562-style opcode restriction rules.
+// It validates public-mempool prefixes using EIP-8141 structural and trace rules.
 package framepool
 
 import (
@@ -39,8 +39,8 @@ import (
 )
 
 const (
-	// maxFrameTxsPerAccount is the ERC-7562 SAME_SENDER_MEMPOOL_COUNT.
-	maxFrameTxsPerAccount = types.MaxNonceKeys
+	// maxFrameTxsPerAccount is the EIP-8141 public-mempool sender limit.
+	maxFrameTxsPerAccount = 1
 
 	// maxPendingTxsUsingNonCanonicalPaymaster limits pooled transactions per
 	// non-canonical paymaster.
@@ -49,8 +49,9 @@ const (
 	// maxFramePoolSize limits total pooled frame transactions.
 	maxFramePoolSize = 256
 
-	// maxVerifyGas is the EIP-8141 MAX_VERIFY_GAS budget for the validation prefix.
-	maxVerifyGas uint64 = 100_000
+	// PublicMaxVerifyGas is the fixed EIP-8141 public-mempool validation budget.
+	PublicMaxVerifyGas uint64 = 100_000
+	maxVerifyGas              = PublicMaxVerifyGas
 
 	// frameTxPriceBump is the same-nonce replacement bump percentage.
 	frameTxPriceBump = 10
@@ -59,10 +60,19 @@ const (
 	txMaxSize uint64 = 512 * 1024
 )
 
+// Config configures frame transaction validation policy. Values above
+// PublicMaxVerifyGas are only permitted on isolated nodes with no peers.
+type Config struct {
+	MaxVerifyGas uint64
+}
+
+// DefaultConfig follows the EIP-8141 public-mempool constants.
+var DefaultConfig = Config{MaxVerifyGas: maxVerifyGas}
+
 var (
 	// canonicalPaymasterCodeHash is keccak256(CanonicalPaymaster runtime bytecode),
 	// compiled by contracts with the pinned EIP-8141 Solidity compiler.
-	canonicalPaymasterCodeHash = common.HexToHash("0x753d8fb13a049dbfd7771540fce6add0de9fd73fa5ec5a74186942d01b65275e")
+	canonicalPaymasterCodeHash = common.HexToHash("0x6c30f5865065de960a498c71c875f58fc0817d3b5c93819def154c652ba80435")
 
 	// CanonicalPaymaster fixes pending withdrawal amount at storage slot 1.
 	canonicalPaymasterPendingWithdrawalSlot = common.Hash{31: 1}
@@ -76,8 +86,8 @@ type BlockChain interface {
 }
 
 // FramePool is a transaction pool for EIP-8141 frame transactions.
-// It validates VERIFY frames by simulating them with ERC-7562-style opcode
-// restriction rules before accepting transactions into the pool.
+// It validates VERIFY frames by simulating the EIP-8141 public-mempool
+// validation prefix before accepting transactions into the pool.
 type FramePool struct {
 	chain       BlockChain
 	chainconfig *params.ChainConfig
@@ -87,6 +97,7 @@ type FramePool struct {
 	currentHead  *types.Header
 	currentState *state.StateDB
 	slotProvider func(*types.Header) vm.SlotProvider
+	verifyGasCap uint64
 
 	reserver txpool.Reserver
 
@@ -110,13 +121,22 @@ type frameTxMeta struct {
 
 // New creates a new frame transaction pool.
 func New(chain BlockChain) *FramePool {
+	return NewWithConfig(DefaultConfig, chain)
+}
+
+// NewWithConfig creates a frame transaction pool with explicit policy settings.
+func NewWithConfig(config Config, chain BlockChain) *FramePool {
+	if config.MaxVerifyGas == 0 {
+		config.MaxVerifyGas = maxVerifyGas
+	}
 	return &FramePool{
-		chain:       chain,
-		chainconfig: chain.Config(),
-		signer:      types.LatestSigner(chain.Config()),
-		pending:     make(map[common.Address][]*types.Transaction),
-		all:         make(map[common.Hash]*types.Transaction),
-		meta:        make(map[common.Hash]frameTxMeta),
+		chain:        chain,
+		chainconfig:  chain.Config(),
+		signer:       types.LatestSigner(chain.Config()),
+		verifyGasCap: config.MaxVerifyGas,
+		pending:      make(map[common.Address][]*types.Transaction),
+		all:          make(map[common.Hash]*types.Transaction),
+		meta:         make(map[common.Hash]frameTxMeta),
 		slotProvider: func(head *types.Header) vm.SlotProvider {
 			return vm.TimestampSlotProvider{Timestamp: head.Time}
 		},
@@ -358,6 +378,21 @@ func warmRecentRootReferences(statedb *state.StateDB, refs []types.RecentRootRef
 
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
 func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
+	frameTx := tx.GetFrameTx()
+	if frameTx == nil {
+		return fmt.Errorf("not a frame transaction")
+	}
+	p.mu.RLock()
+	alreadyKnown := p.all[tx.Hash()] != nil
+	p.mu.RUnlock()
+	if alreadyKnown {
+		return txpool.ErrAlreadyKnown
+	}
+	signatureGas, err := p.validateFrameSignatures(frameTx)
+	if err != nil {
+		return err
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -365,10 +400,6 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		return txpool.ErrAlreadyKnown
 	}
 
-	frameTx := tx.GetFrameTx()
-	if frameTx == nil {
-		return fmt.Errorf("not a frame transaction")
-	}
 	sender := frameTx.Sender
 
 	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
@@ -420,7 +451,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 
 	// Simulate the validation prefix.
-	meta, err := p.simulateVerifyFrames(tx)
+	meta, err := p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
 	if err != nil {
 		if held && p.reserver != nil {
 			p.reserver.Release(sender)
@@ -449,8 +480,35 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 
 // simulateVerifyFrames validates the EIP-8141 validation prefix and returns the
 // payer metadata needed by framepool accounting. Expiry verifier frames are
-// checked for deadline/canonical code but skipped for prefix shape and gas budget.
+// checked directly, skipped for prefix shape, and included in the gas budget.
 func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, error) {
+	frameTx := tx.GetFrameTx()
+	if frameTx == nil {
+		return frameTxMeta{}, fmt.Errorf("not a frame transaction")
+	}
+	signatureGas, err := p.validateFrameSignatures(frameTx)
+	if err != nil {
+		return frameTxMeta{}, err
+	}
+	return p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
+}
+
+func (p *FramePool) validateFrameSignatures(frameTx *types.FrameTx) (uint64, error) {
+	signatureGas, err := frameTx.SignatureGas()
+	if err != nil {
+		return 0, err
+	}
+	if signatureGas > p.verifyGasCap {
+		return 0, fmt.Errorf("signature validation gas %d exceeds cap %d", signatureGas, p.verifyGasCap)
+	}
+	sigHash := frameTx.SigHash(p.chainconfig.ChainID)
+	if err := types.ValidateFrameTxSignatures(frameTx, sigHash); err != nil {
+		return 0, err
+	}
+	return signatureGas, nil
+}
+
+func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, signatureGas uint64) (frameTxMeta, error) {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
 		return frameTxMeta{}, fmt.Errorf("not a frame transaction")
@@ -459,13 +517,6 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	rules := p.chainconfig.Rules(head.Number, head.Difficulty.Sign() == 0, head.Time)
 	precompiles := vm.ActivePrecompiles(rules)
 	sigHash := frameTx.SigHash(p.chainconfig.ChainID)
-	if err := types.ValidateFrameTxSignatures(frameTx, sigHash); err != nil {
-		return frameTxMeta{}, err
-	}
-	signatureGas, err := frameTx.SignatureGas()
-	if err != nil {
-		return frameTxMeta{}, err
-	}
 
 	// Build FrameContext (mirrors state_transition.go:806-821).
 	frameCtx := &vm.FrameContext{
@@ -514,12 +565,15 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	if err != nil {
 		return frameTxMeta{}, err
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, false); err != nil {
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, false, p.verifyGasCap); err != nil {
 		return frameTxMeta{}, err
 	}
 	baseState := p.currentState.Copy()
 
 	if plan.deployIndex >= 0 {
+		if len(baseState.GetCode(frameTx.Sender)) != 0 {
+			return frameTxMeta{}, fmt.Errorf("deploy frame requires code-less sender in transaction pre-state")
+		}
 		i := plan.deployIndex
 		frame := frameTx.Frames[i]
 		target := frameTx.Sender
@@ -571,7 +625,7 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	if plan.payVerifyIndex < 0 {
 		return frameTxMeta{}, fmt.Errorf("execution-only validation prefix missing payment VERIFY frame")
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true); err != nil {
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
 		return frameTxMeta{}, err
 	}
 	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
@@ -595,6 +649,7 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 }
 
 type validationPrefixPlan struct {
+	expiryIndex       int
 	deployIndex       int
 	senderVerifyIndex int
 	payVerifyIndex    int
@@ -602,48 +657,69 @@ type validationPrefixPlan struct {
 
 func (p *FramePool) validationPrefixPlan(frameTx *types.FrameTx, statedb *state.StateDB, timestamp uint64) (validationPrefixPlan, error) {
 	plan := validationPrefixPlan{
+		expiryIndex:       -1,
 		deployIndex:       -1,
 		senderVerifyIndex: -1,
 		payVerifyIndex:    -1,
 	}
-	var nonExpiry []int
-	for i, frame := range frameTx.Frames {
+	start := 0
+	if frame := frameTx.Frames[0]; types.IsFrameExpiryVerifier(frame, resolveFrameTarget(frameTx.Sender, frame)) {
+		if err := validateExpiryVerifierFrame(statedb, 0, frame, resolveFrameTarget(frameTx.Sender, frame), timestamp); err != nil {
+			return plan, err
+		}
+		plan.expiryIndex = 0
+		start = 1
+	}
+	for i := start; i < len(frameTx.Frames); i++ {
+		frame := frameTx.Frames[i]
 		if frame.Mode > types.FrameModeSender {
 			return plan, fmt.Errorf("frame has invalid mode %d", frame.Mode)
 		}
 		target := resolveFrameTarget(frameTx.Sender, frame)
 		if types.IsFrameExpiryVerifier(frame, target) {
-			if err := validateExpiryVerifierFrame(statedb, i, frame, target, timestamp); err != nil {
-				return plan, err
-			}
-			continue
+			return plan, fmt.Errorf("expiry verifier frame %d must be first", i)
 		}
-		nonExpiry = append(nonExpiry, i)
 	}
-	if len(nonExpiry) == 0 {
+	if start == len(frameTx.Frames) {
 		return plan, fmt.Errorf("no non-expiry validation prefix frames")
 	}
-	pos := 0
-	first := frameTx.Frames[nonExpiry[pos]]
+	pos := start
+	first := frameTx.Frames[pos]
 	if first.Mode == types.FrameModeDefault {
-		plan.deployIndex = nonExpiry[pos]
+		if first.Flags != 0 {
+			return plan, fmt.Errorf("deploy frame %d has flags %d, want 0", pos, first.Flags)
+		}
+		plan.deployIndex = pos
 		pos++
-		if pos >= len(nonExpiry) {
+		if pos >= len(frameTx.Frames) {
 			return plan, fmt.Errorf("deploy validation prefix missing sender VERIFY frame")
 		}
 	}
-	senderVerifyIndex := nonExpiry[pos]
+	senderVerifyIndex := pos
 	senderVerify := frameTx.Frames[senderVerifyIndex]
 	if senderVerify.Mode != types.FrameModeVerify || resolveFrameTarget(frameTx.Sender, senderVerify) != frameTx.Sender {
 		return plan, fmt.Errorf("validation prefix must begin with VERIFY targeting sender")
 	}
 	plan.senderVerifyIndex = senderVerifyIndex
 	pos++
-	if pos < len(nonExpiry) {
-		payIndex := nonExpiry[pos]
-		payFrame := frameTx.Frames[payIndex]
-		if payFrame.Mode == types.FrameModeVerify && resolveFrameTarget(frameTx.Sender, payFrame) != frameTx.Sender {
-			plan.payVerifyIndex = payIndex
+	switch senderVerify.Flags {
+	case vm.ApproveBoth:
+	case vm.ApproveExecution:
+		if pos >= len(frameTx.Frames) {
+			return plan, fmt.Errorf("execution-only validation prefix missing payment VERIFY frame")
+		}
+		payFrame := frameTx.Frames[pos]
+		if payFrame.Mode != types.FrameModeVerify || payFrame.Flags != vm.ApprovePayment {
+			return plan, fmt.Errorf("payment frame %d must be VERIFY with flags 1", pos)
+		}
+		plan.payVerifyIndex = pos
+		pos++
+	default:
+		return plan, fmt.Errorf("sender VERIFY frame %d has flags %d, want 2 or 3", senderVerifyIndex, senderVerify.Flags)
+	}
+	for i := pos; i < len(frameTx.Frames); i++ {
+		if frameTx.Frames[i].Mode == types.FrameModeVerify {
+			return plan, fmt.Errorf("VERIFY frame %d appears after validation prefix", i)
 		}
 	}
 	return plan, nil
@@ -663,9 +739,9 @@ func validateExpiryVerifierFrame(statedb *state.StateDB, index int, frame types.
 	return nil
 }
 
-func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, signatureGas uint64, includePay bool) error {
+func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, signatureGas uint64, includePay bool, gasCap uint64) error {
 	total := signatureGas
-	indices := []int{plan.deployIndex, plan.senderVerifyIndex}
+	indices := []int{plan.expiryIndex, plan.deployIndex, plan.senderVerifyIndex}
 	if includePay {
 		indices = append(indices, plan.payVerifyIndex)
 	}
@@ -679,8 +755,8 @@ func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, 
 		}
 		var overflow bool
 		total, overflow = commonmath.SafeAdd(total, frame.GasLimit)
-		if overflow || total > maxVerifyGas {
-			return fmt.Errorf("validation prefix gas %d exceeds cap %d", total, maxVerifyGas)
+		if overflow || total > gasCap {
+			return fmt.Errorf("validation prefix gas %d exceeds cap %d", total, gasCap)
 		}
 	}
 	return nil

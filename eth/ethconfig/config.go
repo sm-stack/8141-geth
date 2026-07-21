@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/framepool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -65,6 +66,7 @@ var Defaults = Config{
 	LogQueryLimit:        1000,
 	Miner:                miner.DefaultConfig,
 	TxPool:               legacypool.DefaultConfig,
+	FramePool:            framepool.DefaultConfig,
 	BlobPool:             blobpool.DefaultConfig,
 	RPCGasCap:            50000000,
 	RPCEVMTimeout:        5 * time.Second,
@@ -142,8 +144,9 @@ type Config struct {
 	Miner miner.Config
 
 	// Transaction pool options
-	TxPool   legacypool.Config
-	BlobPool blobpool.Config
+	TxPool    legacypool.Config
+	FramePool framepool.Config
+	BlobPool  blobpool.Config
 
 	// Gas Price Oracle options
 	GPO gasprice.Config

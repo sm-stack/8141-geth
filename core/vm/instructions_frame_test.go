@@ -17,6 +17,7 @@
 package vm
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -102,8 +103,8 @@ func TestFrameParamStatusOnlyPastFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("past skipped status failed: %v", err)
 	}
-	if !got.IsZero() {
-		t.Fatalf("past skipped status = %d, want 0", got.Uint64())
+	if !got.Eq(uint256.NewInt(uint64(types.FrameReceiptStatusSkipped))) {
+		t.Fatalf("past skipped status = %d, want %d", got.Uint64(), types.FrameReceiptStatusSkipped)
 	}
 	for _, tt := range []struct {
 		name         string
@@ -265,5 +266,42 @@ func TestSigParamReturnsSignatureMetadata(t *testing.T) {
 				t.Fatalf("got %x, want %x", got.Bytes32(), tt.want.Bytes32())
 			}
 		})
+	}
+}
+
+func TestSigParamArbitrarySignatureCopy(t *testing.T) {
+	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+	evm.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{
+		Scheme:    types.SignatureSchemeArbitrary,
+		Signature: []byte{0x11, 0x22, 0x33},
+	}}}
+	stack := newstack()
+	defer returnStack(stack)
+	stack.push(uint256.NewInt(0))
+	stack.push(uint256.NewInt(1))
+	stack.push(uint256.NewInt(4))
+	stack.push(uint256.NewInt(sigParamSignature))
+	stack.push(uint256.NewInt(0))
+	memory := NewMemory()
+	memory.Resize(4)
+	pc := uint64(0)
+	if _, err := opSigParam(&pc, evm, &ScopeContext{Memory: memory, Stack: stack}); err != nil {
+		t.Fatalf("arbitrary signature copy failed: %v", err)
+	}
+	if got := memory.GetCopy(0, 4); !bytes.Equal(got, []byte{0x22, 0x33, 0x00, 0x00}) {
+		t.Fatalf("copied bytes %x", got)
+	}
+}
+
+func TestSigParamArbitrarySignerHalts(t *testing.T) {
+	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
+	evm.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeArbitrary}}}
+	stack := newstack()
+	defer returnStack(stack)
+	stack.push(uint256.NewInt(sigParamSigner))
+	stack.push(uint256.NewInt(0))
+	pc := uint64(0)
+	if _, err := opSigParam(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err == nil {
+		t.Fatal("arbitrary signer introspection succeeded")
 	}
 }

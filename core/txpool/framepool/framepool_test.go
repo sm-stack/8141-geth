@@ -165,6 +165,22 @@ func expiryFrameData(deadline uint64) []byte {
 	return data
 }
 
+func createFactoryCode(runtime []byte) []byte {
+	if len(runtime) == 0 || len(runtime) > 32 {
+		panic("test runtime must contain 1..32 bytes")
+	}
+	initCode := append([]byte{byte(vm.PUSH1) + byte(len(runtime)) - 1}, runtime...)
+	initCode = append(initCode,
+		byte(vm.PUSH1), 0x00, byte(vm.MSTORE),
+		byte(vm.PUSH1), byte(len(runtime)), byte(vm.PUSH1), byte(32-len(runtime)), byte(vm.RETURN),
+	)
+	prefix := []byte{
+		byte(vm.PUSH1), byte(len(initCode)), byte(vm.PUSH1), 0x10, byte(vm.PUSH1), 0x00, byte(vm.CODECOPY),
+		byte(vm.PUSH1), byte(len(initCode)), byte(vm.PUSH1), 0x00, byte(vm.PUSH1), 0x00, byte(vm.CREATE), byte(vm.POP), byte(vm.STOP),
+	}
+	return append(prefix, initCode...)
+}
+
 type fixedFramePoolSlotProvider uint64
 
 func (p fixedFramePoolSlotProvider) CurrentSlot() uint64 { return uint64(p) }
@@ -372,7 +388,7 @@ func TestFramePoolExpiryVerifierFrame(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 1_000_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 40_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
 		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 	}
 
@@ -405,6 +421,46 @@ func TestFramePoolExpiryVerifierExpiredDeadline(t *testing.T) {
 	}
 }
 
+func TestFramePoolRejectsExpiryVerifierOutsideFirstFrame(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	expiry := params.FrameExpiryVerifierAddress
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 40_000},
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 40_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
+	}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err == nil {
+		t.Fatal("expiry verifier outside first frame accepted")
+	}
+}
+
+func TestFramePoolCountsExpiryGasAgainstVerifyBudget(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	expiry := params.FrameExpiryVerifierAddress
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(expiry)
+	statedb.SetCode(expiry, params.FrameExpiryVerifierCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 50_001, Data: expiryFrameData(pool.currentHead.Time + 12)},
+		{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000},
+	}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err == nil {
+		t.Fatal("expiry gas was excluded from validation budget")
+	}
+}
+
 func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
@@ -418,7 +474,7 @@ func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 1_000_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
+		{Mode: types.FrameModeVerify, Target: &expiry, GasLimit: 40_000, Data: expiryFrameData(pool.currentHead.Time + 12)},
 		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
 	}
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -434,26 +490,30 @@ func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 	}
 }
 
-func TestFramePoolResetKeepsIndependentNonceDomains(t *testing.T) {
+func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	for _, key := range []uint64{101, 102} {
+	for i, key := range []uint64{101, 102} {
 		ftx := baseFTX(sender, 0, config)
 		ftx.NonceKeys = []*uint256.Int{uint256.NewInt(key)}
 		ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000}}
-		if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
-			t.Fatalf("key %d rejected: %v", key, err)
+		err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+		if i == 0 && err != nil {
+			t.Fatalf("first key %d rejected: %v", key, err)
+		}
+		if i == 1 && err == nil {
+			t.Fatalf("second key %d accepted despite sender limit", key)
 		}
 	}
 	newHead := *pool.currentHead
 	newHead.Time++
 	pool.Reset(pool.currentHead, &newHead)
-	if pending, _ := pool.Stats(); pending != 2 {
-		t.Fatalf("expected both nonce domains after reset, got %d", pending)
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("expected one sender transaction after reset, got %d", pending)
 	}
 }
 
@@ -679,6 +739,25 @@ func TestFramePoolGasCap(t *testing.T) {
 	t.Logf("correctly rejected: %v", errs[0])
 }
 
+func TestFramePoolPrivacyProofVerifyGasBudget(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	pool.verifyGasCap = 500_000
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 400_000, Data: []byte{0x01}},
+	}
+
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("expected 400k privacy-proof VERIFY budget to be accepted, got: %v", err)
+	}
+}
+
 func TestFramePoolSignatureGasCountsAgainstVerifyBudget(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
@@ -699,6 +778,21 @@ func TestFramePoolSignatureGasCountsAgainstVerifyBudget(t *testing.T) {
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected rejection when signature gas pushes validation prefix above MAX_VERIFY_GAS")
+	}
+}
+
+func TestFramePoolRejectsSignatureGasBeforeCryptographicValidation(t *testing.T) {
+	pool, _, config := newTestEnv()
+	ftx := baseFTX(common.HexToAddress("0x1111111111111111111111111111111111111111"), 0, config)
+	for range 15 {
+		ftx.Signatures = append(ftx.Signatures, types.TxSignature{
+			Scheme:    types.SignatureSchemeP256,
+			Signature: make([]byte, 64), // Invalid, but the aggregate gas cap must win first.
+		})
+	}
+	_, err := pool.validateFrameSignatures(ftx)
+	if err == nil || !strings.Contains(err.Error(), "signature validation gas") {
+		t.Fatalf("expected signature gas cap error before cryptographic validation, got %v", err)
 	}
 }
 
@@ -726,7 +820,7 @@ func TestFramePoolRejectsAtomicBatchInValidationPrefix(t *testing.T) {
 }
 
 func TestFramePoolDeployValidationPrefixShapes(t *testing.T) {
-	t.Run("deploy_self_verify", func(t *testing.T) {
+	t.Run("reject_noop_deploy_for_existing_sender", func(t *testing.T) {
 		pool, statedb, config := newTestEnv()
 
 		sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -743,12 +837,12 @@ func TestFramePoolDeployValidationPrefixShapes(t *testing.T) {
 			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0x02}},
 		}
 		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
-		if errs[0] != nil {
-			t.Fatalf("expected deploy+self VERIFY prefix to be accepted, got: %v", errs[0])
+		if errs[0] == nil || !strings.Contains(errs[0].Error(), "code-less sender") {
+			t.Fatalf("expected noop deploy for existing sender to be rejected, got: %v", errs[0])
 		}
 	})
 
-	t.Run("deploy_only_verify_pay", func(t *testing.T) {
+	t.Run("reject_noop_deploy_for_existing_sender_with_paymaster", func(t *testing.T) {
 		pool, statedb, config := newTestEnv()
 
 		sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -770,13 +864,32 @@ func TestFramePoolDeployValidationPrefixShapes(t *testing.T) {
 			{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{0x03}},
 		}
 		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
-		if errs[0] != nil {
-			t.Fatalf("expected deploy+exec VERIFY+pay VERIFY prefix to be accepted, got: %v", errs[0])
+		if errs[0] == nil || !strings.Contains(errs[0].Error(), "code-less sender") {
+			t.Fatalf("expected noop deploy for existing sender to be rejected, got: %v", errs[0])
+		}
+	})
+
+	t.Run("deploy_sender_then_verify", func(t *testing.T) {
+		pool, statedb, config := newTestEnv()
+		factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+		sender := crypto.CreateAddress(factory, 0)
+		statedb.CreateAccount(sender)
+		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+		statedb.CreateAccount(factory)
+		statedb.SetCode(factory, createFactoryCode(approveBothCode), tracing.CodeChangeUnspecified)
+
+		ftx := baseFTX(sender, 0, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 60_000},
+			{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000},
+		}
+		if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+			t.Fatalf("expected sender deployment followed by VERIFY to pass: %v", err)
 		}
 	})
 }
 
-func TestFramePoolSelfVerifyStopsValidationPrefix(t *testing.T) {
+func TestFramePoolRejectsVerifyAfterValidationPrefix(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -794,8 +907,8 @@ func TestFramePoolSelfVerifyStopsValidationPrefix(t *testing.T) {
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
-	if errs[0] != nil {
-		t.Fatalf("expected self VERIFY to stop prefix before paymaster candidate, got: %v", errs[0])
+	if errs[0] == nil {
+		t.Fatal("expected VERIFY after self-validation prefix to be rejected")
 	}
 }
 
@@ -870,8 +983,8 @@ func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
 	differentDomain.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
 	differentDomain.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000, Data: []byte{0x04}}}
 	differentDomainTx := makeFrameTx(differentDomain)
-	if err := pool.Add([]*types.Transaction{differentDomainTx}, false)[0]; err != nil {
-		t.Fatalf("different nonce domain rejected: %v", err)
+	if err := pool.Add([]*types.Transaction{differentDomainTx}, false)[0]; err == nil {
+		t.Fatal("different nonce domain accepted despite one-per-sender limit")
 	}
 
 	bumped := baseFTX(sender, 0, config)
@@ -891,11 +1004,11 @@ func TestFramePoolSameNonceReplacementRequiresFeeBump(t *testing.T) {
 	if !pool.Has(newTx.Hash()) {
 		t.Fatal("replacement transaction missing from pool")
 	}
-	if !pool.Has(differentDomainTx.Hash()) {
-		t.Fatal("different nonce domain transaction missing from pool")
+	if pool.Has(differentDomainTx.Hash()) {
+		t.Fatal("rejected different nonce domain transaction entered pool")
 	}
-	if pending, _ := pool.Stats(); pending != 2 {
-		t.Fatalf("expected two pending nonce domains after replacement, got %d", pending)
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("expected one pending sender transaction after replacement, got %d", pending)
 	}
 }
 
