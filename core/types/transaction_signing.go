@@ -230,6 +230,7 @@ func newModernSigner(chainID *big.Int, fork forks.Fork) Signer {
 	}
 	if fork >= forks.Prague {
 		s.txtypes.set(SetCodeTxType)
+		s.txtypes.set(FrameTxType)
 	}
 	return s
 }
@@ -262,6 +263,10 @@ func (s *modernSigner) Sender(tx *Transaction) (common.Address, error) {
 	if tx.ChainId().Cmp(s.chainID) != 0 {
 		return common.Address{}, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.ChainId(), s.chainID)
 	}
+	// Frame transactions carry their sender explicitly; no ECDSA recovery.
+	if tt == FrameTxType {
+		return tx.FrameSender(), nil
+	}
 	// 'modern' txs are defined to use 0 and 1 as their recovery
 	// id, add 27 to become equivalent to unprotected Homestead signatures.
 	V, R, S := tx.RawSignatureValues()
@@ -276,6 +281,10 @@ func (s *modernSigner) SignatureValues(tx *Transaction, sig []byte) (R, S, V *bi
 	}
 	if tt == LegacyTxType {
 		return s.legacy.SignatureValues(tx, sig)
+	}
+	// Frame transactions don't use ECDSA signatures.
+	if tt == FrameTxType {
+		return new(big.Int), new(big.Int), new(big.Int), nil
 	}
 	// Check that chain ID of tx matches the signer. We also accept ID zero here,
 	// because it indicates that the chain ID was not specified in the tx.

@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/framepool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/miner"
@@ -51,6 +52,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		LogQueryLimit           int
 		Miner                   miner.Config
 		TxPool                  legacypool.Config
+		FramePool               framepool.Config
 		BlobPool                blobpool.Config
 		GPO                     gasprice.Config
 		EnablePreimageRecording bool
@@ -106,6 +108,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.LogQueryLimit = c.LogQueryLimit
 	enc.Miner = c.Miner
 	enc.TxPool = c.TxPool
+	enc.FramePool = c.FramePool
 	enc.BlobPool = c.BlobPool
 	enc.GPO = c.GPO
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
@@ -165,6 +168,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		LogQueryLimit           *int
 		Miner                   *miner.Config
 		TxPool                  *legacypool.Config
+		FramePool               *framepool.Config
 		BlobPool                *blobpool.Config
 		GPO                     *gasprice.Config
 		EnablePreimageRecording *bool
@@ -290,6 +294,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.TxPool != nil {
 		c.TxPool = *dec.TxPool
+	}
+	if dec.FramePool != nil {
+		c.FramePool = *dec.FramePool
 	}
 	if dec.BlobPool != nil {
 		c.BlobPool = *dec.BlobPool

@@ -551,6 +551,358 @@ func TestSlimReceiptEncodingDecoding(t *testing.T) {
 	}
 }
 
+func TestFrameReceiptMarshalBinary(t *testing.T) {
+	payer := common.HexToAddress("0x1234")
+	frameReceipt := &Receipt{
+		Type:              FrameTxType,
+		CumulativeGasUsed: 777,
+		Payer:             payer,
+		FrameReceipts: []FrameReceipt{
+			{
+				Status:  1,
+				GasUsed: 111,
+				Logs: []*Log{
+					{
+						Address: common.HexToAddress("0x1111"),
+						Topics:  []common.Hash{common.HexToHash("0x01")},
+						Data:    []byte{0x01},
+					},
+				},
+			},
+			{
+				Status:  FrameReceiptStatusSkipped,
+				GasUsed: 222,
+				Logs:    nil,
+			},
+			{
+				Status:  0,
+				GasUsed: 333,
+				Logs: []*Log{
+					{
+						Address: common.HexToAddress("0x2222"),
+						Topics:  []common.Hash{common.HexToHash("0x02")},
+						Data:    []byte{0x02},
+					},
+				},
+			},
+		},
+	}
+	frameReceipt.Logs = flattenFrameLogs(frameReceipt.FrameReceipts)
+	frameReceipt.Bloom = CreateBloom(frameReceipt)
+
+	have, err := frameReceipt.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal binary error: %v", err)
+	}
+	var buf bytes.Buffer
+	Receipts{frameReceipt}.EncodeIndex(0, &buf)
+	if !bytes.Equal(have, buf.Bytes()) {
+		t.Errorf("BinaryMarshal and EncodeIndex mismatch, got %x want %x", have, buf.Bytes())
+	}
+
+	var dec Receipt
+	if err := dec.UnmarshalBinary(have); err != nil {
+		t.Fatalf("unmarshal binary error: %v", err)
+	}
+	if dec.Type != FrameTxType {
+		t.Fatalf("type mismatch: got %d want %d", dec.Type, FrameTxType)
+	}
+	if dec.CumulativeGasUsed != frameReceipt.CumulativeGasUsed {
+		t.Fatalf("cumulative gas mismatch: got %d want %d", dec.CumulativeGasUsed, frameReceipt.CumulativeGasUsed)
+	}
+	if dec.Payer != frameReceipt.Payer {
+		t.Fatalf("payer mismatch: got %s want %s", dec.Payer, frameReceipt.Payer)
+	}
+	if len(dec.FrameReceipts) != len(frameReceipt.FrameReceipts) {
+		t.Fatalf("frame receipt count mismatch: got %d want %d", len(dec.FrameReceipts), len(frameReceipt.FrameReceipts))
+	}
+	for i := range dec.FrameReceipts {
+		got, want := dec.FrameReceipts[i], frameReceipt.FrameReceipts[i]
+		if got.Status != want.Status {
+			t.Fatalf("frame %d status mismatch: got %d want %d", i, got.Status, want.Status)
+		}
+		if got.GasUsed != want.GasUsed {
+			t.Fatalf("frame %d gasUsed mismatch: got %d want %d", i, got.GasUsed, want.GasUsed)
+		}
+		if len(got.Logs) != len(want.Logs) {
+			t.Fatalf("frame %d log count mismatch: got %d want %d", i, len(got.Logs), len(want.Logs))
+		}
+		for j := range got.Logs {
+			if !reflect.DeepEqual(got.Logs[j], want.Logs[j]) {
+				t.Fatalf("frame %d log %d mismatch: got %#v want %#v", i, j, got.Logs[j], want.Logs[j])
+			}
+		}
+	}
+	if !reflect.DeepEqual(dec.Logs, flattenFrameLogs(dec.FrameReceipts)) {
+		t.Fatal("decoded logs are not flattened from frame receipts")
+	}
+	if dec.Status != ReceiptStatusSuccessful {
+		t.Fatalf("decoded status mismatch: got %d want %d", dec.Status, ReceiptStatusSuccessful)
+	}
+	if dec.Bloom != CreateBloom(&dec) {
+		t.Fatal("decoded bloom mismatch")
+	}
+}
+
+func TestReceiptUnmarshalBinaryClearsFrameFields(t *testing.T) {
+	legacy := &Receipt{
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Logs:              []*Log{},
+	}
+	legacy.Bloom = CreateBloom(legacy)
+	enc, err := legacy.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal binary error: %v", err)
+	}
+	got := &Receipt{
+		Type:  FrameTxType,
+		Payer: common.HexToAddress("0xabcd"),
+		FrameReceipts: []FrameReceipt{
+			{Status: 1, GasUsed: 1},
+		},
+	}
+	if err := got.UnmarshalBinary(enc); err != nil {
+		t.Fatalf("unmarshal binary error: %v", err)
+	}
+	if got.Type != LegacyTxType {
+		t.Fatalf("type mismatch: got %d want %d", got.Type, LegacyTxType)
+	}
+	if got.Payer != (common.Address{}) {
+		t.Fatalf("payer should be cleared, got %s", got.Payer)
+	}
+	if got.FrameReceipts != nil {
+		t.Fatalf("frame receipts should be cleared, got %#v", got.FrameReceipts)
+	}
+}
+
+func TestReceiptForStorageFrameRoundTrip(t *testing.T) {
+	stored := &ReceiptForStorage{
+		Type:              FrameTxType,
+		CumulativeGasUsed: 999,
+		Payer:             common.HexToAddress("0xbeef"),
+		FrameReceipts: []FrameReceipt{
+			{
+				Status:  FrameReceiptStatusSkipped,
+				GasUsed: 50,
+				Logs: []*Log{
+					{
+						Address: common.HexToAddress("0x3333"),
+						Topics:  []common.Hash{common.HexToHash("0x03")},
+						Data:    []byte{0x03},
+					},
+				},
+			},
+		},
+	}
+	enc, err := rlp.EncodeToBytes(stored)
+	if err != nil {
+		t.Fatalf("encode error: %v", err)
+	}
+	var dec ReceiptForStorage
+	if err := rlp.DecodeBytes(enc, &dec); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if dec.Type != FrameTxType {
+		t.Fatalf("type mismatch: got %d want %d", dec.Type, FrameTxType)
+	}
+	if dec.Payer != stored.Payer {
+		t.Fatalf("payer mismatch: got %s want %s", dec.Payer, stored.Payer)
+	}
+	if !reflect.DeepEqual(dec.FrameReceipts, stored.FrameReceipts) {
+		t.Fatalf("frame receipts mismatch: got %#v want %#v", dec.FrameReceipts, stored.FrameReceipts)
+	}
+}
+
+func TestReceiptForStorageLegacyDecodeClearsFrameFields(t *testing.T) {
+	legacy := &ReceiptForStorage{
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Logs:              []*Log{},
+	}
+	enc, err := rlp.EncodeToBytes(legacy)
+	if err != nil {
+		t.Fatalf("encode error: %v", err)
+	}
+	dec := &ReceiptForStorage{
+		Type:  FrameTxType,
+		Payer: common.HexToAddress("0xdead"),
+		FrameReceipts: []FrameReceipt{
+			{Status: 1, GasUsed: 1},
+		},
+	}
+	if err := rlp.DecodeBytes(enc, dec); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if dec.Type != LegacyTxType {
+		t.Fatalf("type mismatch: got %d want %d", dec.Type, LegacyTxType)
+	}
+	if dec.Payer != (common.Address{}) {
+		t.Fatalf("payer should be cleared, got %s", dec.Payer)
+	}
+	if dec.FrameReceipts != nil {
+		t.Fatalf("frame receipts should be cleared, got %#v", dec.FrameReceipts)
+	}
+}
+
+func TestFrameReceiptJSON(t *testing.T) {
+	receipt := &Receipt{
+		Type:              FrameTxType,
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 123,
+		Payer:             common.HexToAddress("0x7777"),
+		FrameReceipts: []FrameReceipt{
+			{
+				Status:  FrameReceiptStatusSkipped,
+				GasUsed: 21,
+				Logs: []*Log{
+					{
+						Address: common.HexToAddress("0x8888"),
+						Topics:  []common.Hash{common.HexToHash("0x04")},
+						Data:    []byte{0x04},
+					},
+				},
+			},
+		},
+		GasUsed: 21,
+	}
+	receipt.Logs = flattenFrameLogs(receipt.FrameReceipts)
+	receipt.Bloom = CreateBloom(receipt)
+
+	blob, err := receipt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal json error: %v", err)
+	}
+	var dec Receipt
+	if err := dec.UnmarshalJSON(blob); err != nil {
+		t.Fatalf("unmarshal json error: %v", err)
+	}
+	if dec.Payer != receipt.Payer {
+		t.Fatalf("payer mismatch: got %s want %s", dec.Payer, receipt.Payer)
+	}
+	if len(dec.FrameReceipts) != 1 {
+		t.Fatalf("frame receipt count mismatch: got %d want 1", len(dec.FrameReceipts))
+	}
+	if dec.FrameReceipts[0].Status != receipt.FrameReceipts[0].Status {
+		t.Fatalf("frame receipt status mismatch: got %d want %d", dec.FrameReceipts[0].Status, receipt.FrameReceipts[0].Status)
+	}
+	if dec.FrameReceipts[0].GasUsed != receipt.FrameReceipts[0].GasUsed {
+		t.Fatalf("frame receipt gasUsed mismatch: got %d want %d", dec.FrameReceipts[0].GasUsed, receipt.FrameReceipts[0].GasUsed)
+	}
+}
+
+func TestFrameReceiptJSONZeroPayerIsPresent(t *testing.T) {
+	receipt := &Receipt{
+		Type:              FrameTxType,
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Payer:             common.Address{},
+		FrameReceipts: []FrameReceipt{
+			{Status: FrameReceiptStatusSkipped, GasUsed: 1, Logs: []*Log{}},
+		},
+		Logs:    []*Log{},
+		GasUsed: 1,
+	}
+	receipt.Bloom = CreateBloom(receipt)
+	blob, err := receipt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal json error: %v", err)
+	}
+	if !bytes.Contains(blob, []byte(`"payer":"`+common.Address{}.Hex()+`"`)) {
+		t.Fatalf("expected explicit zero payer in frame receipt json, got %s", blob)
+	}
+}
+
+func TestLegacyReceiptJSONOmitsPayer(t *testing.T) {
+	receipt := &Receipt{
+		Type:              LegacyTxType,
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Logs:              []*Log{},
+		GasUsed:           1,
+	}
+	receipt.Bloom = CreateBloom(receipt)
+	blob, err := receipt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal json error: %v", err)
+	}
+	if bytes.Contains(blob, []byte(`"payer"`)) {
+		t.Fatalf("legacy receipt json must not include payer, got %s", blob)
+	}
+}
+
+func TestFrameReceiptJSONRejectsMissingPayer(t *testing.T) {
+	receipt := &Receipt{
+		Type:              FrameTxType,
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Payer:             common.HexToAddress("0x1111"),
+		FrameReceipts: []FrameReceipt{
+			{Status: FrameReceiptStatusSkipped, GasUsed: 1, Logs: []*Log{}},
+		},
+		Logs:    []*Log{},
+		GasUsed: 1,
+	}
+	receipt.Bloom = CreateBloom(receipt)
+	blob, err := receipt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal json error: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(blob, &payload); err != nil {
+		t.Fatalf("unmarshal payload error: %v", err)
+	}
+	delete(payload, "payer")
+	mutated, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload error: %v", err)
+	}
+	var dec Receipt
+	if err := dec.UnmarshalJSON(mutated); err == nil {
+		t.Fatalf("expected error for missing payer, got nil (json=%s)", mutated)
+	}
+}
+
+func TestFrameReceiptJSONRejectsInvalidStatus(t *testing.T) {
+	receipt := &Receipt{
+		Type:              FrameTxType,
+		Status:            ReceiptStatusSuccessful,
+		CumulativeGasUsed: 1,
+		Payer:             common.HexToAddress("0x1111"),
+		FrameReceipts: []FrameReceipt{
+			{Status: 1, GasUsed: 1, Logs: []*Log{}},
+		},
+		Logs:    []*Log{},
+		GasUsed: 1,
+	}
+	receipt.Bloom = CreateBloom(receipt)
+	blob, err := receipt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal json error: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(blob, &payload); err != nil {
+		t.Fatalf("unmarshal payload error: %v", err)
+	}
+	frameReceipts, ok := payload["frameReceipts"].([]any)
+	if !ok || len(frameReceipts) == 0 {
+		t.Fatalf("unexpected frameReceipts payload: %#v", payload["frameReceipts"])
+	}
+	first, ok := frameReceipts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected frameReceipts[0] payload: %#v", frameReceipts[0])
+	}
+	first["status"] = "0x02"
+	mutated, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload error: %v", err)
+	}
+	var dec Receipt
+	if err := dec.UnmarshalJSON(mutated); err == nil {
+		t.Fatalf("expected error for invalid frame status, got nil (json=%s)", mutated)
+	}
+}
+
 func clearComputedFieldsOnReceipts(receipts []*Receipt) []*Receipt {
 	r := make([]*Receipt, len(receipts))
 	for i, receipt := range receipts {

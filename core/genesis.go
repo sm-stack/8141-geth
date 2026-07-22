@@ -714,10 +714,13 @@ func DeveloperGenesisBlock(gasLimit uint64, faucet *common.Address) *Genesis {
 			common.BytesToAddress([]byte{0x11}):    {Balance: big.NewInt(1)}, // BLSG2MapG2
 			common.BytesToAddress([]byte{0x1, 00}): {Balance: big.NewInt(1)}, // P256Verify
 			// Pre-deploy system contracts
-			params.BeaconRootsAddress:        {Nonce: 1, Code: params.BeaconRootsCode, Balance: common.Big0},
-			params.HistoryStorageAddress:     {Nonce: 1, Code: params.HistoryStorageCode, Balance: common.Big0},
-			params.WithdrawalQueueAddress:    {Nonce: 1, Code: params.WithdrawalQueueCode, Balance: common.Big0},
-			params.ConsolidationQueueAddress: {Nonce: 1, Code: params.ConsolidationQueueCode, Balance: common.Big0},
+			params.BeaconRootsAddress:         {Nonce: 1, Code: params.BeaconRootsCode, Balance: common.Big0},
+			params.HistoryStorageAddress:      {Nonce: 1, Code: params.HistoryStorageCode, Balance: common.Big0},
+			params.WithdrawalQueueAddress:     {Nonce: 1, Code: params.WithdrawalQueueCode, Balance: common.Big0},
+			params.ConsolidationQueueAddress:  {Nonce: 1, Code: params.ConsolidationQueueCode, Balance: common.Big0},
+			params.FrameExpiryVerifierAddress: {Nonce: 1, Code: params.FrameExpiryVerifierCode, Balance: common.Big0},
+			params.NonceManagerAddress:        {Nonce: 1, Code: params.NonceManagerCode, Balance: common.Big0},
+			params.RecentRootAddress:          {Nonce: 1, Code: params.RecentRootCode, Balance: common.Big0},
 		},
 	}
 	if faucet != nil {

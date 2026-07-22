@@ -261,6 +261,11 @@ func (s *StateDB) AddLog(log *types.Log) {
 	s.logSize++
 }
 
+// TxLogSize returns the number of logs collected for the current transaction.
+func (s *StateDB) TxLogSize() int {
+	return len(s.logs[s.thash])
+}
+
 // GetLogs returns the logs matching the specified transaction hash, and annotates
 // them with the given blockNumber and blockHash.
 func (s *StateDB) GetLogs(hash common.Hash, blockNumber uint64, blockHash common.Hash, blockTime uint64) []*types.Log {
@@ -565,6 +570,12 @@ func (s *StateDB) setTransientState(addr common.Address, key, value common.Hash)
 // GetTransientState gets transient storage for a given account.
 func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common.Hash {
 	return s.transientStorage.Get(addr, key)
+}
+
+// ResetTransientStorage clears all transient storage. Used between EIP-8141
+// frame executions where transient storage must be discarded.
+func (s *StateDB) ResetTransientStorage() {
+	s.transientStorage = newTransientStorage()
 }
 
 //

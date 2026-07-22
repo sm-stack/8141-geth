@@ -80,19 +80,28 @@ func (tt *TransactionTest) Run() error {
 		if err != nil {
 			return
 		}
-		// Intrinsic cost
-		cost, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules, params.CostPerStateByte)
+		// Intrinsic gas
+		frameTx := tx.GetFrameTx()
+		if frameTx != nil {
+			requiredGas, err = frameTx.IntrinsicGas()
+		} else {
+			cost, costErr := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules, params.CostPerStateByte)
+			requiredGas, err = cost.RegularGas, costErr
+		}
 		if err != nil {
 			return
 		}
-		requiredGas = cost.RegularGas
 		if requiredGas > tx.Gas() {
 			return sender, hash, 0, fmt.Errorf("insufficient gas ( %d < %d )", tx.Gas(), requiredGas)
 		}
 
 		if rules.IsPrague {
 			var floorDataGas uint64
-			floorDataGas, err = core.FloorDataGas(rules, tx.Data(), tx.AccessList())
+			if frameTx != nil {
+				floorDataGas, err = frameTx.FloorDataGas()
+			} else {
+				floorDataGas, err = core.FloorDataGas(rules, tx.Data(), tx.AccessList())
+			}
 			if err != nil {
 				return
 			}

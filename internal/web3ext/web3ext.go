@@ -745,6 +745,11 @@ web3._extend({
 			call: 'dev_setFeeRecipient',
 			params: 1
 		}),
+		new web3._extend.Method({
+			name: 'advanceTime',
+			call: 'dev_advanceTime',
+			params: 1
+		}),
 	],
 });
 `

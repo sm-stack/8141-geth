@@ -19,11 +19,13 @@ package catalyst
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -138,6 +140,34 @@ func TestSimulatedBeaconSendWithdrawals(t *testing.T) {
 		case <-timer.C:
 			t.Fatal("timed out without including all withdrawals/txs")
 		}
+	}
+}
+
+func TestSimulatedBeaconAdvanceTime(t *testing.T) {
+	var gasLimit uint64 = 10_000_000
+	genesis := core.DeveloperGenesisBlock(gasLimit, nil)
+	node, ethService, beacon := startSimulatedBeaconEthService(t, genesis, 0)
+	defer node.Close()
+
+	before := ethService.BlockChain().CurrentBlock()
+	advance := uint64(8192) * params.SecondsPerSlot
+	if err := beacon.AdvanceTime(time.Duration(advance) * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	after := ethService.BlockChain().CurrentBlock()
+	if after.Number.Uint64() != before.Number.Uint64()+1 {
+		t.Fatalf("block number = %d, want %d", after.Number.Uint64(), before.Number.Uint64()+1)
+	}
+	if after.Time != before.Time+advance {
+		t.Fatalf("timestamp = %d, want %d", after.Time, before.Time+advance)
+	}
+}
+
+func TestSimulatedBeaconAPIRejectsAdvanceTimeOverflow(t *testing.T) {
+	api := &simulatedBeaconAPI{}
+	seconds := hexutil.Uint64(uint64(math.MaxInt64)/uint64(time.Second) + 1)
+	if err := api.AdvanceTime(context.Background(), seconds); err == nil {
+		t.Fatal("oversized time adjustment accepted")
 	}
 }
 

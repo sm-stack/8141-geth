@@ -41,6 +41,7 @@ import (
 // or a message call.
 type TransactionArgs struct {
 	From                 *common.Address `json:"from"`
+	Sender               *common.Address `json:"sender,omitempty"`
 	To                   *common.Address `json:"to"`
 	Gas                  *hexutil.Uint64 `json:"gas"`
 	GasPrice             *hexutil.Big    `json:"gasPrice"`
@@ -70,6 +71,13 @@ type TransactionArgs struct {
 
 	// For SetCodeTxType
 	AuthorizationList []types.SetCodeAuthorization `json:"authorizationList"`
+
+	// For FrameTxType
+	Frames               *[]types.Frame         `json:"frames,omitempty"`
+	Signatures           *[]types.TxSignature   `json:"signatures,omitempty"`
+	NonceKeys            []*hexutil.Big         `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64        `json:"nonceSeq,omitempty"`
+	RecentRootReferences *[]types.RecentRootRef `json:"recentRootReferences,omitempty"`
 }
 
 // from retrieves the transaction sender address.
@@ -78,6 +86,17 @@ func (args *TransactionArgs) from() common.Address {
 		return common.Address{}
 	}
 	return *args.From
+}
+
+func (args *TransactionArgs) frameSender() common.Address {
+	if args.Sender != nil {
+		return *args.Sender
+	}
+	return args.from()
+}
+
+func (args *TransactionArgs) isFrameTx() bool {
+	return args.Frames != nil || args.Signatures != nil || args.NonceKeys != nil || args.NonceSeq != nil || args.RecentRootReferences != nil
 }
 
 // data retrieves the transaction calldata. Input field is preferred.
@@ -111,7 +130,43 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 	if args.Value == nil {
 		args.Value = new(hexutil.Big)
 	}
-	if args.Nonce == nil {
+	if args.isFrameTx() {
+		if args.NonceKeys == nil {
+			if args.Nonce == nil {
+				nonce, err := b.GetPoolNonce(ctx, args.frameSender())
+				if err != nil {
+					return err
+				}
+				args.Nonce = (*hexutil.Uint64)(&nonce)
+			}
+			args.NonceKeys = []*hexutil.Big{(*hexutil.Big)(new(big.Int))}
+			seq := *args.Nonce
+			args.NonceSeq = &seq
+		} else {
+			if args.NonceSeq == nil {
+				return errors.New(`frame transaction with "nonceKeys" requires "nonceSeq"`)
+			}
+			if args.Nonce != nil {
+				return errors.New(`frame transaction cannot specify both "nonce" and "nonceKeys"`)
+			}
+			seq := *args.NonceSeq
+			args.Nonce = &seq
+		}
+		keys := make([]*uint256.Int, len(args.NonceKeys))
+		for i, key := range args.NonceKeys {
+			if key == nil {
+				return fmt.Errorf("nonceKeys[%d] is null", i)
+			}
+			var overflow bool
+			keys[i], overflow = uint256.FromBig(key.ToInt())
+			if overflow {
+				return fmt.Errorf("nonceKeys[%d] exceeds uint256", i)
+			}
+		}
+		if err := types.ValidateNonceKeys(keys); err != nil {
+			return err
+		}
+	} else if args.Nonce == nil {
 		nonce, err := b.GetPoolNonce(ctx, args.from())
 		if err != nil {
 			return err
@@ -131,7 +186,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 	}
 
 	// create check
-	if args.To == nil {
+	if args.To == nil && !args.isFrameTx() {
 		if args.BlobHashes != nil {
 			return errors.New(`missing "to" in blob transaction`)
 		}
@@ -143,7 +198,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 		}
 	}
 
-	if args.Gas == nil {
+	if args.Gas == nil && !args.isFrameTx() {
 		// These fields are immutable during the estimation, safe to
 		// pass the pointer directly.
 		data := args.data()
@@ -184,8 +239,11 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 
 // setFeeDefaults fills in default fee values for unspecified tx fields.
 func (args *TransactionArgs) setFeeDefaults(ctx context.Context, b Backend, head *types.Header) error {
+	if args.isFrameTx() && args.GasPrice != nil {
+		return errors.New("gasPrice is not supported for frame transactions")
+	}
 	// Sanity check the EIP-4844 fee parameters.
-	if args.BlobFeeCap != nil && args.BlobFeeCap.ToInt().Sign() == 0 {
+	if !args.isFrameTx() && args.BlobFeeCap != nil && args.BlobFeeCap.ToInt().Sign() == 0 {
 		return errors.New("maxFeePerBlobGas, if specified, must be non-zero")
 	}
 	if b.ChainConfig().IsCancun(head.Number, head.Time) {
@@ -416,7 +474,39 @@ func (args *TransactionArgs) CallDefaults(globalGasCap uint64, baseFee *big.Int,
 			args.Gas = (*hexutil.Uint64)(&globalGasCap)
 		}
 	}
-	if args.Nonce == nil {
+	if args.isFrameTx() {
+		if args.NonceKeys == nil {
+			if args.Nonce == nil {
+				args.Nonce = new(hexutil.Uint64)
+			}
+			args.NonceKeys = []*hexutil.Big{(*hexutil.Big)(new(big.Int))}
+			seq := *args.Nonce
+			args.NonceSeq = &seq
+		} else {
+			if args.NonceSeq == nil {
+				return errors.New(`frame transaction with "nonceKeys" requires "nonceSeq"`)
+			}
+			if args.Nonce != nil {
+				return errors.New(`frame transaction cannot specify both "nonce" and "nonceKeys"`)
+			}
+			seq := *args.NonceSeq
+			args.Nonce = &seq
+		}
+		keys := make([]*uint256.Int, len(args.NonceKeys))
+		for i, key := range args.NonceKeys {
+			if key == nil {
+				return fmt.Errorf("nonceKeys[%d] is null", i)
+			}
+			var overflow bool
+			keys[i], overflow = uint256.FromBig(key.ToInt())
+			if overflow {
+				return fmt.Errorf("nonceKeys[%d] exceeds uint256", i)
+			}
+		}
+		if err := types.ValidateNonceKeys(keys); err != nil {
+			return err
+		}
+	} else if args.Nonce == nil {
 		args.Nonce = new(hexutil.Uint64)
 	}
 	if args.Value == nil {
@@ -506,6 +596,8 @@ func (args *TransactionArgs) ToMessage(baseFee *big.Int, skipNonceCheck bool) *c
 func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 	usedType := types.LegacyTxType
 	switch {
+	case args.isFrameTx() || defaultType == types.FrameTxType:
+		usedType = types.FrameTxType
 	case args.AuthorizationList != nil || defaultType == types.SetCodeTxType:
 		usedType = types.SetCodeTxType
 	case args.BlobHashes != nil || defaultType == types.BlobTxType:
@@ -516,11 +608,56 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		usedType = types.AccessListTxType
 	}
 	// Make it possible to default to newer tx, but use legacy if gasprice is provided
-	if args.GasPrice != nil {
+	if args.GasPrice != nil && usedType != types.FrameTxType {
 		usedType = types.LegacyTxType
 	}
 	var data types.TxData
 	switch usedType {
+	case types.FrameTxType:
+		nonceKeyArgs := args.NonceKeys
+		nonceSeq := args.NonceSeq
+		if nonceKeyArgs == nil {
+			nonceKeyArgs = []*hexutil.Big{(*hexutil.Big)(new(big.Int))}
+			seq := hexutil.Uint64(0)
+			if args.Nonce != nil {
+				seq = *args.Nonce
+			}
+			nonceSeq = &seq
+		}
+		nonceKeys := make([]*uint256.Int, len(nonceKeyArgs))
+		for i, key := range nonceKeyArgs {
+			nonceKeys[i] = uint256.MustFromBig(key.ToInt())
+		}
+		frames := []types.Frame{}
+		if args.Frames != nil {
+			frames = *args.Frames
+		}
+		signatures := []types.TxSignature{}
+		if args.Signatures != nil {
+			signatures = *args.Signatures
+		}
+		recentRootRefs := []types.RecentRootRef{}
+		if args.RecentRootReferences != nil {
+			recentRootRefs = *args.RecentRootReferences
+		}
+		blobFeeCap := new(big.Int)
+		if args.BlobFeeCap != nil {
+			blobFeeCap = (*big.Int)(args.BlobFeeCap)
+		}
+		data = &types.FrameTx{
+			ChainID:        uint256.MustFromBig(args.ChainID.ToInt()),
+			NonceKeys:      nonceKeys,
+			NonceSeq:       uint64(*nonceSeq),
+			Sender:         args.frameSender(),
+			Frames:         frames,
+			Signatures:     signatures,
+			GasTipCap:      uint256.MustFromBig((*big.Int)(args.MaxPriorityFeePerGas)),
+			GasFeeCap:      uint256.MustFromBig((*big.Int)(args.MaxFeePerGas)),
+			BlobFeeCap:     uint256.MustFromBig(blobFeeCap),
+			BlobHashes:     args.BlobHashes,
+			RecentRootRefs: recentRootRefs,
+		}
+
 	case types.SetCodeTxType:
 		al := types.AccessList{}
 		if args.AccessList != nil {

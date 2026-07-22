@@ -44,6 +44,7 @@ var activators = map[int]func(*JumpTable){
 	8024: enable8024,
 	7843: enable7843,
 	8037: enable8037,
+	8141: enable8141,
 }
 
 // EnableEIP enables the given EIP on the config.
@@ -590,4 +591,55 @@ func enable8037(jt *JumpTable) {
 	jt[CREATE2].constantGas = params.CreateGasAmsterdam
 	jt[SELFDESTRUCT].dynamicGas = gasSelfdestruct8037
 	jt[SSTORE].dynamicGas = gasSStore8037
+}
+
+// enable8141 applies EIP-8141 (Frame Transaction) opcodes.
+func enable8141(jt *JumpTable) {
+	jt[APPROVE] = &operation{
+		execute:    opApprove,
+		dynamicGas: gasReturn, // Memory expansion gas only.
+		minStack:   minStack(3, 0),
+		maxStack:   maxStack(3, 0),
+		memorySize: memoryReturn,
+	}
+	jt[TXPARAM] = &operation{
+		execute:     opTxParam,
+		constantGas: GasQuickStep,
+		minStack:    minStack(1, 1),
+		maxStack:    maxStack(1, 1),
+	}
+	jt[FRAMEDATALOAD] = &operation{
+		execute:     opFrameDataLoad,
+		constantGas: GasFastestStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
+	jt[FRAMEDATACOPY] = &operation{
+		execute:     opFrameDataCopy,
+		constantGas: GasFastestStep,
+		dynamicGas:  gasFrameDataCopy,
+		minStack:    minStack(4, 0),
+		maxStack:    maxStack(4, 0),
+		memorySize:  memoryFrameDataCopy,
+	}
+	jt[FRAMEPARAM] = &operation{
+		execute:     opFrameParam,
+		constantGas: GasQuickStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
+	jt[SIGPARAM] = &operation{
+		execute:     opSigParam,
+		constantGas: GasQuickStep,
+		dynamicGas:  gasSigParam,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+		memorySize:  memorySigParam,
+	}
+	jt[RECENTROOTREFLOAD] = &operation{
+		execute:     opRecentRootRefLoad,
+		constantGas: GasQuickStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
 }

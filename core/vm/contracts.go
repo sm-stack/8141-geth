@@ -168,6 +168,9 @@ var PrecompiledContractsOsaka = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
+	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
+	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
+
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
 
@@ -175,6 +178,13 @@ var PrecompiledContractsOsaka = PrecompiledContracts{
 // contract specified in EIP-7212. This is exported for testing purposes.
 var PrecompiledContractsP256Verify = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
+}
+
+// PrecompiledContractsMLDSA contains the precompiled Ethereum contracts
+// specified in EIP-8051. This is exported for testing purposes.
+var PrecompiledContractsMLDSA = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
+	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
 }
 
 var (

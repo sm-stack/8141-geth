@@ -251,11 +251,45 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 
 	// Set the receipt logs and create the bloom filter.
 	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash, blockTime)
+	if tx.Type() == types.FrameTxType {
+		receipt.Payer = result.payer
+		receipt.FrameReceipts = makeFrameReceipts(result, receipt.Logs)
+	}
 	receipt.Bloom = types.CreateBloom(receipt)
 	receipt.BlockHash = blockHash
 	receipt.BlockNumber = blockNumber
 	receipt.TransactionIndex = uint(statedb.TxIndex())
 	return receipt
+}
+
+func makeFrameReceipts(result *ExecutionResult, txLogs []*types.Log) []types.FrameReceipt {
+	if len(result.frameResults) == 0 {
+		return nil
+	}
+	frames := make([]types.FrameReceipt, len(result.frameResults))
+	for i, status := range result.frameResults {
+		frames[i].Status = status
+		if i < len(result.frameGasUsed) {
+			frames[i].GasUsed = result.frameGasUsed[i]
+		}
+		if i < len(result.frameLogRange) {
+			frames[i].Logs = logsInRange(txLogs, result.frameLogRange[i])
+		}
+	}
+	return frames
+}
+
+func logsInRange(logs []*types.Log, bounds frameLogRange) []*types.Log {
+	if bounds.start < 0 {
+		bounds.start = 0
+	}
+	if bounds.end > len(logs) {
+		bounds.end = len(logs)
+	}
+	if bounds.end < bounds.start {
+		return nil
+	}
+	return logs[bounds.start:bounds.end]
 }
 
 // ApplyTransaction attempts to apply a transaction to the given state database

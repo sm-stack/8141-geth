@@ -132,6 +132,10 @@ var (
 
 	// -- EIP-7825 errors --
 	ErrGasLimitTooHigh = errors.New("transaction gas limit too high")
+
+	// -- EIP-8141 errors --
+	ErrFrameTxPayerNotApproved = errors.New("frame tx: payer not approved after all frames")
+	ErrFrameTxInvalid          = errors.New("frame tx invalid")
 )
 
 // EIP-7702 state transition errors.

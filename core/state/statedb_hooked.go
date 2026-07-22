@@ -107,6 +107,10 @@ func (s *hookedStateDB) SetTransientState(addr common.Address, key, value common
 	s.inner.SetTransientState(addr, key, value)
 }
 
+func (s *hookedStateDB) ResetTransientStorage() {
+	s.inner.ResetTransientStorage()
+}
+
 func (s *hookedStateDB) HasSelfDestructed(addr common.Address) bool {
 	return s.inner.HasSelfDestructed(addr)
 }
@@ -232,6 +236,10 @@ func (s *hookedStateDB) AddLog(log *types.Log) {
 
 func (s *hookedStateDB) LogsForBurnAccounts() []*types.Log {
 	return s.inner.LogsForBurnAccounts()
+}
+
+func (s *hookedStateDB) TxLogSize() int {
+	return s.inner.TxLogSize()
 }
 
 func (s *hookedStateDB) Finalise(deleteEmptyObjects bool) *bal.ConstructionBlockAccessList {

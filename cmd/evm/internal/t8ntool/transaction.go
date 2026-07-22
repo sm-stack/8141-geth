@@ -133,21 +133,33 @@ func Transaction(ctx *cli.Context) error {
 		}
 		// Check intrinsic gas
 		rules := chainConfig.Rules(common.Big0, true, 0)
-		cost, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules, params.CostPerStateByte)
+		frameTx := tx.GetFrameTx()
+		var intrinsicGas uint64
+		if frameTx != nil {
+			intrinsicGas, err = frameTx.IntrinsicGas()
+		} else {
+			cost, costErr := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, rules, params.CostPerStateByte)
+			intrinsicGas, err = cost.RegularGas, costErr
+		}
 		if err != nil {
 			r.Error = err
 			results = append(results, r)
 			continue
 		}
-		r.IntrinsicGas = cost.RegularGas
-		if tx.Gas() < cost.RegularGas {
-			r.Error = fmt.Errorf("%w: have %d, want %d", core.ErrIntrinsicGas, tx.Gas(), cost.RegularGas)
+		r.IntrinsicGas = intrinsicGas
+		if tx.Gas() < intrinsicGas {
+			r.Error = fmt.Errorf("%w: have %d, want %d", core.ErrIntrinsicGas, tx.Gas(), intrinsicGas)
 			results = append(results, r)
 			continue
 		}
 		// For Prague txs, validate the floor data gas.
 		if rules.IsPrague {
-			floorDataGas, err := core.FloorDataGas(rules, tx.Data(), tx.AccessList())
+			var floorDataGas uint64
+			if frameTx != nil {
+				floorDataGas, err = frameTx.FloorDataGas()
+			} else {
+				floorDataGas, err = core.FloorDataGas(rules, tx.Data(), tx.AccessList())
+			}
 			if err != nil {
 				r.Error = err
 				results = append(results, r)

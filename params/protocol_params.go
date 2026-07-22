@@ -37,6 +37,13 @@ const (
 	CallNewAccountGas     uint64 = 25000 // Paid for CALL when the destination address didn't exist prior.
 	TxGas                 uint64 = 21000 // Per transaction not creating a contract. NOTE: Not payable on data of calls between transactions.
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract. NOTE: Not payable on data of calls between transactions.
+	TxGasEIP8141          uint64 = 15000 // Per frame transaction (EIP-8141). NOTE: Not payable on data of calls between transactions.
+	FrameTxPerFrameGas    uint64 = 475   // Per EIP-8141 frame transaction frame.
+	RecentRootBaseGas     uint64 = 2400  // Base intrinsic gas when recent-root references are present.
+	RecentRootPerRefGas   uint64 = 2002  // Per-reference intrinsic gas for EIP-8272.
+	SigGasArbitrary       uint64 = 100   // Per EIP-8141 arbitrary transaction-level signature structural validation.
+	SigGasSecp256k1       uint64 = 2800  // Per EIP-8141 secp256k1 transaction-level signature verification.
+	SigGasP256            uint64 = 6700  // Per EIP-8141 P256 transaction-level signature verification.
 	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions.
 	QuadCoeffDiv          uint64 = 512   // Divisor for the quadratic particle of the memory cost equation.
 	LogDataGas            uint64 = 8     // Per byte in a LOG* operation's data.
@@ -172,6 +179,8 @@ const (
 
 	P256VerifyGas uint64 = 6900 // secp256r1 elliptic curve signature verifier gas price
 
+	VerifyMLDSAGas uint64 = 4500 // ML-DSA-44 lattice-based signature verification gas price
+
 	// The Refund Quotient is the cap on how much of the used gas can be refunded. Before EIP-3529,
 	// up to half the consumed gas could be refunded. Redefined as 1/5th in EIP-3529
 	RefundQuotient        uint64 = 2
@@ -199,11 +208,13 @@ const (
 	// don't consume block gas.
 	BALItemCost uint64 = 2000
 
-	AccountCreationSize       = 120
-	StorageCreationSize       = 64
-	AuthorizationCreationSize = 23
-	CostPerStateByte          = 1530
-	SystemMaxSStoresPerCall   = 16
+	AccountCreationSize           = 120
+	StorageCreationSize           = 64
+	AuthorizationCreationSize     = 23
+	CostPerStateByte              = 1530
+	SystemMaxSStoresPerCall       = 16
+	MaxFrames                 int = 64 // Maximum number of frames per frame transaction.
+	MaxRecentRootReferences       = 16
 )
 
 // Bls12381G1MultiExpDiscountTable is the gas discount table for BLS12-381 G1 multi exponentiation operation
@@ -240,6 +251,19 @@ var (
 	// EIP-7251 - Increase the MAX_EFFECTIVE_BALANCE
 	ConsolidationQueueAddress = common.HexToAddress("0x0000BBdDc7CE488642fb579F8B00f3a590007251")
 	ConsolidationQueueCode    = common.FromHex("3373fffffffffffffffffffffffffffffffffffffffe1460d35760115f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1461019a57600182026001905f5b5f82111560685781019083028483029004916001019190604d565b9093900492505050366060146088573661019a573461019a575f5260205ff35b341061019a57600154600101600155600354806004026004013381556001015f358155600101602035815560010160403590553360601b5f5260605f60143760745fa0600101600355005b6003546002548082038060021160e7575060025b5f5b8181146101295782810160040260040181607402815460601b815260140181600101548152602001816002015481526020019060030154905260010160e9565b910180921461013b5790600255610146565b90505f6002555f6003555b5f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff141561017357505f5b6001546001828201116101885750505f61018e565b01600190035b5f555f6001556074025ff35b5f5ffd")
+
+	// EIP-8141 - Frame Transaction
+	FrameEntryPointAddress     = common.HexToAddress("0x00000000000000000000000000000000000000aa")
+	FrameExpiryVerifierAddress = common.HexToAddress("0x0000000000000000000000000000000000008141")
+	FrameExpiryVerifierCode    = common.FromHex("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd")
+	FrameExpiryDataLength      = 8
+	NonceManagerAddress        = common.HexToAddress("0x0000000000000000000000000000000000008250")
+	NonceManagerCode           = common.FromHex("60006000fd")
+	KeyedNonceFirstUseGas      = uint64(20_000)
+	RecentRootAddress          = common.HexToAddress("0x0000000000000000000000000000000000008272")
+	RecentRootCode             = common.FromHex("60006000fd00")
+	RecentRootWindow           = uint64(8192)
+	SecondsPerSlot             = uint64(12)
 )
 
 // System log events.

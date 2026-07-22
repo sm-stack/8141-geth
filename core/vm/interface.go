@@ -56,6 +56,7 @@ type StateDB interface {
 
 	GetTransientState(addr common.Address, key common.Hash) common.Hash
 	SetTransientState(addr common.Address, key, value common.Hash)
+	ResetTransientStorage()
 
 	SelfDestruct(common.Address)
 	HasSelfDestructed(common.Address) bool
@@ -92,6 +93,8 @@ type StateDB interface {
 	AddLog(*types.Log)
 	LogsForBurnAccounts() []*types.Log
 	AddPreimage(common.Hash, []byte)
+	// TxLogSize returns the number of logs currently collected for this tx.
+	TxLogSize() int
 
 	Witness() *stateless.Witness
 

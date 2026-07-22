@@ -221,6 +221,44 @@ func TestGenesisCommit(t *testing.T) {
 	}
 }
 
+func TestDeveloperGenesisIncludesFrameExpiryVerifier(t *testing.T) {
+	genesis := DeveloperGenesisBlock(0, nil)
+	account, ok := genesis.Alloc[params.FrameExpiryVerifierAddress]
+	if !ok {
+		t.Fatal("developer genesis missing frame expiry verifier predeploy")
+	}
+	if account.Nonce != 1 {
+		t.Fatalf("expiry verifier nonce: got %d want 1", account.Nonce)
+	}
+	if !bytes.Equal(account.Code, params.FrameExpiryVerifierCode) {
+		t.Fatalf("expiry verifier code mismatch: got %x want %x", account.Code, params.FrameExpiryVerifierCode)
+	}
+	nonceManager, ok := genesis.Alloc[params.NonceManagerAddress]
+	if !ok {
+		t.Fatal("developer genesis missing nonce manager predeploy")
+	}
+	if nonceManager.Nonce != 1 {
+		t.Fatalf("nonce manager nonce: got %d want 1", nonceManager.Nonce)
+	}
+	if !bytes.Equal(nonceManager.Code, params.NonceManagerCode) {
+		t.Fatalf("nonce manager code mismatch: got %x want %x", nonceManager.Code, params.NonceManagerCode)
+	}
+}
+
+func TestDeveloperGenesisIncludesRecentRootContract(t *testing.T) {
+	genesis := DeveloperGenesisBlock(30_000_000, nil)
+	account, ok := genesis.Alloc[params.RecentRootAddress]
+	if !ok {
+		t.Fatal("recent root contract missing from developer genesis")
+	}
+	if account.Nonce != 1 {
+		t.Fatalf("recent root nonce = %d, want 1", account.Nonce)
+	}
+	if !bytes.Equal(account.Code, params.RecentRootCode) {
+		t.Fatalf("recent root code = %x, want %x", account.Code, params.RecentRootCode)
+	}
+}
+
 func TestReadWriteGenesisAlloc(t *testing.T) {
 	var (
 		db    = rawdb.NewMemoryDatabase()
