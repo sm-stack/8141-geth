@@ -20,6 +20,7 @@ package framepool
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -509,9 +510,17 @@ func (p *FramePool) validateFrameSignatures(frameTx *types.FrameTx) (uint64, err
 }
 
 func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, signatureGas uint64) (frameTxMeta, error) {
+	meta, _, err := p.simulateVerifyFramesWithSignatureGasOutcome(tx, signatureGas)
+	return meta, err
+}
+
+// simulateVerifyFramesWithSignatureGasOutcome runs the production validation
+// path while retaining the final VERIFY execution outcome for benchmarks and
+// corpus qualification. Admission callers intentionally discard the outcome.
+func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transaction, signatureGas uint64) (frameTxMeta, verifyResult, error) {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
-		return frameTxMeta{}, fmt.Errorf("not a frame transaction")
+		return frameTxMeta{}, verifyResult{}, fmt.Errorf("not a frame transaction")
 	}
 	head := p.currentHead
 	rules := p.chainconfig.Rules(head.Number, head.Difficulty.Sign() == 0, head.Time)
@@ -563,16 +572,16 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, 
 
 	plan, err := p.validationPrefixPlan(frameTx, p.currentState, blockCtx.Time)
 	if err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, verifyResult{}, err
 	}
 	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, false, p.verifyGasCap); err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, verifyResult{}, err
 	}
 	baseState := p.currentState.Copy()
 
 	if plan.deployIndex >= 0 {
 		if len(baseState.GetCode(frameTx.Sender)) != 0 {
-			return frameTxMeta{}, fmt.Errorf("deploy frame requires code-less sender in transaction pre-state")
+			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame requires code-less sender in transaction pre-state")
 		}
 		i := plan.deployIndex
 		frame := frameTx.Frames[i]
@@ -596,56 +605,56 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, 
 		_, _, vmerr := evm.Call(params.FrameEntryPointAddress, target, frame.Data, frame.GasLimit, new(uint256.Int))
 		evm.FrameCtx = nil
 		if violation := tracer.Violation(); violation != nil {
-			return frameTxMeta{}, fmt.Errorf("deploy frame %d: %w", i, violation)
+			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame %d: %w", i, violation)
 		}
 		if vmerr != nil {
-			return frameTxMeta{}, fmt.Errorf("deploy frame %d simulation failed: %v", i, vmerr)
+			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame %d simulation failed: %v", i, vmerr)
 		}
 		if hasNoCode(baseState, frameTx.Sender) {
-			return frameTxMeta{}, fmt.Errorf("deploy frame %d did not install sender code", i)
+			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame %d did not install sender code", i)
 		}
 	}
 
 	senderResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.senderVerifyIndex, true)
 	if err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, senderResult, err
 	}
 	if senderResult.approveScope == vm.ApproveBoth {
 		if err := p.validateNonceSurcharge(frameTx, senderResult.gasRemaining); err != nil {
-			return frameTxMeta{}, err
+			return frameTxMeta{}, senderResult, err
 		}
 		return frameTxMeta{
 			payer:   frameTx.Sender,
 			maxCost: tx.Cost(),
-		}, nil
+		}, senderResult, nil
 	}
 	if senderResult.approveScope != vm.ApproveExecution {
-		return frameTxMeta{}, fmt.Errorf("VERIFY frame %d approved scope %d, want self approval 3 or execution approval 2", plan.senderVerifyIndex, senderResult.approveScope)
+		return frameTxMeta{}, senderResult, fmt.Errorf("VERIFY frame %d approved scope %d, want self approval 3 or execution approval 2", plan.senderVerifyIndex, senderResult.approveScope)
 	}
 	if plan.payVerifyIndex < 0 {
-		return frameTxMeta{}, fmt.Errorf("execution-only validation prefix missing payment VERIFY frame")
+		return frameTxMeta{}, senderResult, fmt.Errorf("execution-only validation prefix missing payment VERIFY frame")
 	}
 	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, senderResult, err
 	}
 	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
 	canonical := p.isCanonicalPaymaster(payTarget)
 	payResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !canonical)
 	if err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, payResult, err
 	}
 	if payResult.approveScope != vm.ApprovePayment {
-		return frameTxMeta{}, fmt.Errorf("VERIFY frame %d approved scope %d, want payment approval 1", plan.payVerifyIndex, payResult.approveScope)
+		return frameTxMeta{}, payResult, fmt.Errorf("VERIFY frame %d approved scope %d, want payment approval 1", plan.payVerifyIndex, payResult.approveScope)
 	}
 	if err := p.validateNonceSurcharge(frameTx, payResult.gasRemaining); err != nil {
-		return frameTxMeta{}, err
+		return frameTxMeta{}, payResult, err
 	}
 	return frameTxMeta{
 		payer:              payResult.target,
 		usesPaymaster:      payResult.target != frameTx.Sender,
 		canonicalPaymaster: canonical,
 		maxCost:            tx.Cost(),
-	}, nil
+	}, payResult, nil
 }
 
 type validationPrefixPlan struct {
@@ -795,23 +804,40 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 		_, gasRemaining, vmerr = evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
 	}
 	evm.FrameCtx = nil
+	result := verifyResult{
+		frameIndex:   index,
+		target:       target,
+		gasLimit:     frame.GasLimit,
+		gasRemaining: gasRemaining,
+	}
 	if tracer != nil {
 		if violation := tracer.Violation(); violation != nil {
-			return verifyResult{}, fmt.Errorf("VERIFY frame %d: %w", index, violation)
+			if violation.Rule == "OP-020" {
+				result.failureClass = verifyFailureOutOfGas
+			} else {
+				result.failureClass = verifyFailureTracerViolation
+			}
+			return result, fmt.Errorf("VERIFY frame %d: %w", index, violation)
 		}
 	}
 	scope := evm.ApproveScope
 	if scope == vm.ApproveNone {
 		if vmerr != nil {
-			return verifyResult{}, fmt.Errorf("VERIFY frame %d execution failed: %v", index, vmerr)
+			switch {
+			case errors.Is(vmerr, vm.ErrOutOfGas):
+				result.failureClass = verifyFailureOutOfGas
+			case errors.Is(vmerr, vm.ErrExecutionReverted):
+				result.failureClass = verifyFailureReverted
+			default:
+				result.failureClass = verifyFailureEVM
+			}
+			return result, fmt.Errorf("VERIFY frame %d execution failed: %v", index, vmerr)
 		}
-		return verifyResult{}, fmt.Errorf("VERIFY frame %d did not APPROVE", index)
+		result.failureClass = verifyFailureDidNotApprove
+		return result, fmt.Errorf("VERIFY frame %d did not APPROVE", index)
 	}
-	return verifyResult{
-		approveScope: scope,
-		target:       target,
-		gasRemaining: gasRemaining,
-	}, nil
+	result.approveScope = scope
+	return result, nil
 }
 
 func (p *FramePool) validateNonceSurcharge(frameTx *types.FrameTx, gasRemaining uint64) error {
@@ -860,11 +886,33 @@ func hasNoCode(statedb *state.StateDB, addr common.Address) bool {
 	return false
 }
 
-// verifyResult records the approval scope and target of a simulated VERIFY frame.
+// verifyFailureClass is a stable classification of post-execution VERIFY outcomes.
+type verifyFailureClass string
+
+const (
+	verifyFailureNone            verifyFailureClass = ""
+	verifyFailureDidNotApprove   verifyFailureClass = "did_not_approve"
+	verifyFailureReverted        verifyFailureClass = "evm_revert"
+	verifyFailureOutOfGas        verifyFailureClass = "out_of_gas"
+	verifyFailureTracerViolation verifyFailureClass = "tracer_violation"
+	verifyFailureEVM             verifyFailureClass = "evm_error"
+)
+
+// verifyResult records the structured outcome of a simulated VERIFY frame.
 type verifyResult struct {
 	approveScope uint8
+	frameIndex   int
 	target       common.Address
+	gasLimit     uint64
 	gasRemaining uint64
+	failureClass verifyFailureClass
+}
+
+func (r verifyResult) gasUsed() uint64 {
+	if r.gasRemaining > r.gasLimit {
+		return 0
+	}
+	return r.gasLimit - r.gasRemaining
 }
 
 // validateFrameOrdering performs pre-simulation static validation of frame ordering.
