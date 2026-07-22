@@ -18,9 +18,12 @@ package ethapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +41,7 @@ import (
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/holiman/uint256"
 )
 
 // TestSetFeeDefaults tests the logic for filling in default fee values works as expected.
@@ -261,6 +265,105 @@ func TestSetFeeDefaults(t *testing.T) {
 		if !reflect.DeepEqual(got, test.want) {
 			t.Fatalf("test %d (%s): did not fill defaults as expected: (got: %v, want: %v)", i, test.name, got, test.want)
 		}
+	}
+}
+
+func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
+	t.Parallel()
+
+	signature := "0x" + strings.Repeat("11", 65)
+	input := fmt.Sprintf(`{
+		"from":"0x0000000000000000000000000000000000001111",
+		"sender":"0x000000000000000000000000000000000000abcd",
+		"nonceKeys":["0x7","0xb"],
+		"nonceSeq":"0x3",
+		"chainId":"0x2a",
+		"maxFeePerGas":"0x64",
+		"maxPriorityFeePerGas":"0x2",
+		"maxFeePerBlobGas":"0x0",
+		"frames":[
+			{"mode":"0x1","flags":"0x3","target":null,"gasLimit":"0xc350","value":"0x0","data":"0x736967"},
+			{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
+		],
+		"signatures":[{"scheme":"0x1","signer":"0x000000000000000000000000000000000000abcd","msg":"0x","signature":"%s"}]
+		,"recentRootReferences":[{"sourceId":"0x0101010101010101010101010101010101010101010101010101010101010101","slot":"0x9","root":"0x0202020202020202020202020202020202020202020202020202020202020202"}]
+	}`, signature)
+
+	var args TransactionArgs
+	if err := json.Unmarshal([]byte(input), &args); err != nil {
+		t.Fatalf("unmarshal frame tx args: %v", err)
+	}
+	tx := args.ToTransaction(types.FrameTxType)
+	if tx.Type() != types.FrameTxType {
+		t.Fatalf("type mismatch: got %d want %d", tx.Type(), types.FrameTxType)
+	}
+	ftx := tx.GetFrameTx()
+	if ftx == nil {
+		t.Fatal("missing frame tx payload")
+	}
+	if err := ftx.Validate(); err != nil {
+		t.Fatalf("frame tx args produced invalid transaction: %v", err)
+	}
+	if want := common.HexToAddress("0xabcd"); ftx.Sender != want {
+		t.Fatalf("sender mismatch: got %s want %s", ftx.Sender, want)
+	}
+	if len(ftx.Frames) != 2 {
+		t.Fatalf("frames length mismatch: got %d want 2", len(ftx.Frames))
+	}
+	if ftx.Frames[0].Flags != 3 || ftx.Frames[1].Value == nil || ftx.Frames[1].Value.Uint64() != 123 {
+		t.Fatalf("unexpected frame args: %#v", ftx.Frames)
+	}
+	if len(ftx.Signatures) != 1 || len(ftx.Signatures[0].Signature) != 65 {
+		t.Fatalf("unexpected signatures: %#v", ftx.Signatures)
+	}
+	if ftx.NonceSeq != 3 || len(ftx.NonceKeys) != 2 || ftx.NonceKeys[0].Uint64() != 7 || ftx.NonceKeys[1].Uint64() != 11 {
+		t.Fatalf("unexpected keyed nonce: keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
+	}
+	if len(ftx.RecentRootRefs) != 1 || ftx.RecentRootRefs[0].Slot != 9 {
+		t.Fatalf("unexpected recent root references: %#v", ftx.RecentRootRefs)
+	}
+}
+
+func TestTransactionArgsFrameTxLegacyNonceAlias(t *testing.T) {
+	nonce := hexutil.Uint64(7)
+	chainID := (*hexutil.Big)(big.NewInt(42))
+	frames := []types.Frame{{Mode: types.FrameModeDefault, GasLimit: 1, Value: new(uint256.Int)}}
+	args := &TransactionArgs{
+		Nonce: &nonce, ChainID: chainID, Frames: &frames,
+		MaxFeePerGas: (*hexutil.Big)(big.NewInt(1)), MaxPriorityFeePerGas: new(hexutil.Big), BlobFeeCap: new(hexutil.Big),
+	}
+	ftx := args.ToTransaction(types.FrameTxType).GetFrameTx()
+	if !ftx.UsesLegacyNonce() || ftx.NonceSeq != 7 {
+		t.Fatalf("legacy nonce alias produced keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
+	}
+}
+
+func TestCallDefaultsRejectsFrameNonceKeysWithoutSequence(t *testing.T) {
+	frames := []types.Frame{}
+	args := &TransactionArgs{
+		Frames:    &frames,
+		NonceKeys: []*hexutil.Big{(*hexutil.Big)(big.NewInt(1))},
+	}
+	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err == nil || !strings.Contains(err.Error(), "requires \"nonceSeq\"") {
+		t.Fatalf("CallDefaults error = %v, want missing nonceSeq", err)
+	}
+}
+
+func TestSetFeeDefaultsRejectsFrameTxGasPrice(t *testing.T) {
+	t.Parallel()
+
+	b := newBackendMock()
+	if err := b.setFork("london"); err != nil {
+		t.Fatalf("failed to set fork: %v", err)
+	}
+	frames := []types.Frame{}
+	args := &TransactionArgs{
+		GasPrice: (*hexutil.Big)(big.NewInt(1)),
+		Frames:   &frames,
+	}
+	err := args.setFeeDefaults(context.Background(), b, b.CurrentHeader())
+	if err == nil || err.Error() != "gasPrice is not supported for frame transactions" {
+		t.Fatalf("unexpected error: got %v", err)
 	}
 }
 

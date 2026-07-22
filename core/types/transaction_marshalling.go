@@ -19,6 +19,7 @@ package types
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -32,7 +33,11 @@ type txJSON struct {
 	Type hexutil.Uint64 `json:"type"`
 
 	ChainID              *hexutil.Big           `json:"chainId,omitempty"`
-	Nonce                *hexutil.Uint64        `json:"nonce"`
+	Nonce                *hexutil.Uint64        `json:"nonce,omitempty"`
+	NonceKeys            []*hexutil.Big         `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64        `json:"nonceSeq,omitempty"`
+	From                 *common.Address        `json:"from,omitempty"`
+	Sender               *common.Address        `json:"sender,omitempty"`
 	To                   *common.Address        `json:"to"`
 	Gas                  *hexutil.Uint64        `json:"gas"`
 	GasPrice             *hexutil.Big           `json:"gasPrice"`
@@ -44,6 +49,9 @@ type txJSON struct {
 	AccessList           *AccessList            `json:"accessList,omitempty"`
 	BlobVersionedHashes  []common.Hash          `json:"blobVersionedHashes,omitempty"`
 	AuthorizationList    []SetCodeAuthorization `json:"authorizationList,omitempty"`
+	Frames               *[]Frame               `json:"frames,omitempty"`
+	Signatures           *[]TxSignature         `json:"signatures,omitempty"`
+	RecentRootReferences *[]RecentRootRef       `json:"recentRootReferences,omitempty"`
 	V                    *hexutil.Big           `json:"v"`
 	R                    *hexutil.Big           `json:"r"`
 	S                    *hexutil.Big           `json:"s"`
@@ -154,6 +162,7 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 			enc.Commitments = itx.Sidecar.Commitments
 			enc.Proofs = itx.Sidecar.Proofs
 		}
+
 	case *SetCodeTx:
 		enc.ChainID = (*hexutil.Big)(itx.ChainID.ToBig())
 		enc.Nonce = (*hexutil.Uint64)(&itx.Nonce)
@@ -170,6 +179,28 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		enc.S = (*hexutil.Big)(itx.S.ToBig())
 		yparity := itx.V.Uint64()
 		enc.YParity = (*hexutil.Uint64)(&yparity)
+
+	case *FrameTx:
+		enc.ChainID = (*hexutil.Big)(itx.ChainID.ToBig())
+		enc.NonceKeys = make([]*hexutil.Big, len(itx.NonceKeys))
+		for i, key := range itx.NonceKeys {
+			enc.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
+		}
+		enc.NonceSeq = (*hexutil.Uint64)(&itx.NonceSeq)
+		enc.Sender = &itx.Sender
+		gas := itx.TotalGas()
+		enc.Gas = (*hexutil.Uint64)(&gas)
+		enc.MaxFeePerGas = (*hexutil.Big)(itx.GasFeeCap.ToBig())
+		enc.MaxPriorityFeePerGas = (*hexutil.Big)(itx.GasTipCap.ToBig())
+		enc.MaxFeePerBlobGas = (*hexutil.Big)(itx.BlobFeeCap.ToBig())
+		value := new(big.Int)
+		input := hexutil.Bytes{}
+		enc.Value = (*hexutil.Big)(value)
+		enc.Input = &input
+		enc.BlobVersionedHashes = itx.BlobHashes
+		enc.Frames = &itx.Frames
+		enc.Signatures = &itx.Signatures
+		enc.RecentRootReferences = &itx.RecentRootRefs
 	}
 	return json.Marshal(&enc)
 }
@@ -508,6 +539,74 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 			if err := sanityCheckSignature(vbig, itx.R.ToBig(), itx.S.ToBig(), false); err != nil {
 				return err
 			}
+		}
+
+	case FrameTxType:
+		var itx FrameTx
+		inner = &itx
+		if dec.ChainID == nil {
+			return errors.New("missing required field 'chainId' in transaction")
+		}
+		var overflow bool
+		itx.ChainID, overflow = uint256.FromBig(dec.ChainID.ToInt())
+		if overflow {
+			return errors.New("'chainId' value overflows uint256")
+		}
+		if len(dec.NonceKeys) == 0 {
+			return errors.New("missing required field 'nonceKeys' in frame transaction")
+		}
+		itx.NonceKeys = make([]*uint256.Int, len(dec.NonceKeys))
+		for i, key := range dec.NonceKeys {
+			if key == nil {
+				return fmt.Errorf("nonceKeys[%d] is null", i)
+			}
+			itx.NonceKeys[i], overflow = uint256.FromBig(key.ToInt())
+			if overflow {
+				return fmt.Errorf("nonceKeys[%d] overflows uint256", i)
+			}
+		}
+		if dec.NonceSeq == nil {
+			return errors.New("missing required field 'nonceSeq' in frame transaction")
+		}
+		itx.NonceSeq = uint64(*dec.NonceSeq)
+		switch {
+		case dec.Sender != nil:
+			itx.Sender = *dec.Sender
+		case dec.From != nil:
+			itx.Sender = *dec.From
+		default:
+			return errors.New("missing required field 'sender' in frame transaction")
+		}
+		if dec.Frames == nil {
+			return errors.New("missing required field 'frames' in frame transaction")
+		}
+		itx.Frames = *dec.Frames
+		if dec.Signatures == nil {
+			return errors.New("missing required field 'signatures' in frame transaction")
+		}
+		itx.Signatures = *dec.Signatures
+		if dec.RecentRootReferences == nil {
+			return errors.New("missing required field 'recentRootReferences' in frame transaction")
+		}
+		itx.RecentRootRefs = *dec.RecentRootReferences
+		if dec.MaxPriorityFeePerGas == nil {
+			return errors.New("missing required field 'maxPriorityFeePerGas' for frame transaction")
+		}
+		itx.GasTipCap = uint256.MustFromBig((*big.Int)(dec.MaxPriorityFeePerGas))
+		if dec.MaxFeePerGas == nil {
+			return errors.New("missing required field 'maxFeePerGas' for frame transaction")
+		}
+		itx.GasFeeCap = uint256.MustFromBig((*big.Int)(dec.MaxFeePerGas))
+		if dec.MaxFeePerBlobGas == nil {
+			itx.BlobFeeCap = new(uint256.Int)
+		} else {
+			itx.BlobFeeCap = uint256.MustFromBig((*big.Int)(dec.MaxFeePerBlobGas))
+		}
+		if dec.BlobVersionedHashes != nil {
+			itx.BlobHashes = dec.BlobVersionedHashes
+		}
+		if err := itx.Validate(); err != nil {
+			return err
 		}
 
 	default:

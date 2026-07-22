@@ -1064,30 +1064,36 @@ func RPCMarshalBlock(block *types.Block, inclTx bool, fullTx bool, config *param
 
 // RPCTransaction represents a transaction that will serialize to the RPC representation of a transaction
 type RPCTransaction struct {
-	BlockHash           *common.Hash                 `json:"blockHash"`
-	BlockNumber         *hexutil.Big                 `json:"blockNumber"`
-	BlockTimestamp      *hexutil.Uint64              `json:"blockTimestamp"`
-	From                common.Address               `json:"from"`
-	Gas                 hexutil.Uint64               `json:"gas"`
-	GasPrice            *hexutil.Big                 `json:"gasPrice"`
-	GasFeeCap           *hexutil.Big                 `json:"maxFeePerGas,omitempty"`
-	GasTipCap           *hexutil.Big                 `json:"maxPriorityFeePerGas,omitempty"`
-	MaxFeePerBlobGas    *hexutil.Big                 `json:"maxFeePerBlobGas,omitempty"`
-	Hash                common.Hash                  `json:"hash"`
-	Input               hexutil.Bytes                `json:"input"`
-	Nonce               hexutil.Uint64               `json:"nonce"`
-	To                  *common.Address              `json:"to"`
-	TransactionIndex    *hexutil.Uint64              `json:"transactionIndex"`
-	Value               *hexutil.Big                 `json:"value"`
-	Type                hexutil.Uint64               `json:"type"`
-	Accesses            *types.AccessList            `json:"accessList,omitempty"`
-	ChainID             *hexutil.Big                 `json:"chainId,omitempty"`
-	BlobVersionedHashes []common.Hash                `json:"blobVersionedHashes,omitempty"`
-	AuthorizationList   []types.SetCodeAuthorization `json:"authorizationList,omitempty"`
-	V                   *hexutil.Big                 `json:"v"`
-	R                   *hexutil.Big                 `json:"r"`
-	S                   *hexutil.Big                 `json:"s"`
-	YParity             *hexutil.Uint64              `json:"yParity,omitempty"`
+	BlockHash            *common.Hash                 `json:"blockHash"`
+	BlockNumber          *hexutil.Big                 `json:"blockNumber"`
+	BlockTimestamp       *hexutil.Uint64              `json:"blockTimestamp"`
+	From                 common.Address               `json:"from"`
+	Sender               *common.Address              `json:"sender,omitempty"`
+	Gas                  hexutil.Uint64               `json:"gas"`
+	GasPrice             *hexutil.Big                 `json:"gasPrice"`
+	GasFeeCap            *hexutil.Big                 `json:"maxFeePerGas,omitempty"`
+	GasTipCap            *hexutil.Big                 `json:"maxPriorityFeePerGas,omitempty"`
+	MaxFeePerBlobGas     *hexutil.Big                 `json:"maxFeePerBlobGas,omitempty"`
+	Hash                 common.Hash                  `json:"hash"`
+	Input                hexutil.Bytes                `json:"input"`
+	Nonce                *hexutil.Uint64              `json:"nonce,omitempty"`
+	NonceKeys            []*hexutil.Big               `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64              `json:"nonceSeq,omitempty"`
+	To                   *common.Address              `json:"to"`
+	TransactionIndex     *hexutil.Uint64              `json:"transactionIndex"`
+	Value                *hexutil.Big                 `json:"value"`
+	Type                 hexutil.Uint64               `json:"type"`
+	Accesses             *types.AccessList            `json:"accessList,omitempty"`
+	ChainID              *hexutil.Big                 `json:"chainId,omitempty"`
+	BlobVersionedHashes  []common.Hash                `json:"blobVersionedHashes,omitempty"`
+	AuthorizationList    []types.SetCodeAuthorization `json:"authorizationList,omitempty"`
+	Frames               *[]types.Frame               `json:"frames,omitempty"`
+	Signatures           *[]types.TxSignature         `json:"signatures,omitempty"`
+	RecentRootReferences *[]types.RecentRootRef       `json:"recentRootReferences,omitempty"`
+	V                    *hexutil.Big                 `json:"v"`
+	R                    *hexutil.Big                 `json:"r"`
+	S                    *hexutil.Big                 `json:"s"`
+	YParity              *hexutil.Uint64              `json:"yParity,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
@@ -1096,6 +1102,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 	signer := types.MakeSigner(config, new(big.Int).SetUint64(blockNumber), blockTime)
 	from, _ := types.Sender(signer, tx)
 	v, r, s := tx.RawSignatureValues()
+	nonce := hexutil.Uint64(tx.Nonce())
 	result := &RPCTransaction{
 		Type:     hexutil.Uint64(tx.Type()),
 		From:     from,
@@ -1103,7 +1110,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		GasPrice: (*hexutil.Big)(tx.GasPrice()),
 		Hash:     tx.Hash(),
 		Input:    hexutil.Bytes(tx.Data()),
-		Nonce:    hexutil.Uint64(tx.Nonce()),
+		Nonce:    &nonce,
 		To:       tx.To(),
 		Value:    (*hexutil.Big)(tx.Value()),
 		V:        (*hexutil.Big)(v),
@@ -1179,6 +1186,29 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
 		}
 		result.AuthorizationList = tx.SetCodeAuthorizations()
+
+	case types.FrameTxType:
+		frameTx := tx.GetFrameTx()
+		result.Nonce = nil
+		result.NonceKeys = make([]*hexutil.Big, len(frameTx.NonceKeys))
+		for i, key := range frameTx.NonceKeys {
+			result.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
+		}
+		result.NonceSeq = (*hexutil.Uint64)(&frameTx.NonceSeq)
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.Sender = &frameTx.Sender
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			result.GasPrice = (*hexutil.Big)(effectiveGasPrice(tx, baseFee))
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+		result.MaxFeePerBlobGas = (*hexutil.Big)(tx.BlobGasFeeCap())
+		result.BlobVersionedHashes = tx.BlobHashes()
+		result.Frames = &frameTx.Frames
+		result.Signatures = &frameTx.Signatures
+		result.RecentRootReferences = &frameTx.RecentRootRefs
 	}
 	return result
 }
@@ -1616,11 +1646,42 @@ func MarshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 		fields["blobGasPrice"] = (*hexutil.Big)(receipt.BlobGasPrice)
 	}
 
+	// EIP-8141: include payer and frame receipts for frame transactions.
+	if tx.Type() == types.FrameTxType {
+		fields["payer"] = receipt.Payer
+		type frameReceiptJSON struct {
+			Status  hexutil.Uint64 `json:"status"`
+			GasUsed hexutil.Uint64 `json:"gasUsed"`
+			Logs    []*types.Log   `json:"logs"`
+		}
+		frs := make([]frameReceiptJSON, len(receipt.FrameReceipts))
+		for i, fr := range receipt.FrameReceipts {
+			frs[i] = frameReceiptJSON{
+				Status:  hexutil.Uint64(normalizeFrameReceiptStatus(fr.Status)),
+				GasUsed: hexutil.Uint64(fr.GasUsed),
+				Logs:    fr.Logs,
+			}
+			if frs[i].Logs == nil {
+				frs[i].Logs = []*types.Log{}
+			}
+		}
+		fields["frameReceipts"] = frs
+	}
+
 	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
 	if receipt.ContractAddress != (common.Address{}) {
 		fields["contractAddress"] = receipt.ContractAddress
 	}
 	return fields
+}
+
+func normalizeFrameReceiptStatus(status uint8) uint8 {
+	switch status {
+	case types.FrameReceiptStatusSuccessful, types.FrameReceiptStatusSkipped:
+		return status
+	default:
+		return types.FrameReceiptStatusFailed
+	}
 }
 
 // sign is a helper function that signs a transaction with the private key of the given address.

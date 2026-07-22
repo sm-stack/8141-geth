@@ -35,6 +35,13 @@ const (
 	CallNewAccountGas     uint64 = 25000 // Paid for CALL when the destination address didn't exist prior.
 	TxGas                 uint64 = 21000 // Per transaction not creating a contract. NOTE: Not payable on data of calls between transactions.
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract. NOTE: Not payable on data of calls between transactions.
+	TxGasEIP8141          uint64 = 15000 // Per frame transaction (EIP-8141). NOTE: Not payable on data of calls between transactions.
+	FrameTxPerFrameGas    uint64 = 475   // Per EIP-8141 frame transaction frame.
+	RecentRootBaseGas     uint64 = 2400  // Base intrinsic gas when recent-root references are present.
+	RecentRootPerRefGas   uint64 = 2002  // Per-reference intrinsic gas for EIP-8272.
+	SigGasArbitrary       uint64 = 100   // Per EIP-8141 arbitrary transaction-level signature structural validation.
+	SigGasSecp256k1       uint64 = 2800  // Per EIP-8141 secp256k1 transaction-level signature verification.
+	SigGasP256            uint64 = 6700  // Per EIP-8141 P256 transaction-level signature verification.
 	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions.
 	QuadCoeffDiv          uint64 = 512   // Divisor for the quadratic particle of the memory cost equation.
 	LogDataGas            uint64 = 8     // Per byte in a LOG* operation's data.
@@ -192,6 +199,8 @@ const (
 
 	P256VerifyGas uint64 = 6900 // secp256r1 elliptic curve signature verifier gas price
 
+	VerifyMLDSAGas uint64 = 4500 // ML-DSA-44 lattice-based signature verification gas price
+
 	// The Refund Quotient is the cap on how much of the used gas can be refunded. Before EIP-3529,
 	// up to half the consumed gas could be refunded. Redefined as 1/5th in EIP-3529
 	RefundQuotient        uint64 = 2
@@ -219,11 +228,13 @@ const (
 	// don't consume block gas.
 	BALItemCost uint64 = 2000
 
-	AccountCreationSize       = 120
-	StorageCreationSize       = 64
-	AuthorizationCreationSize = 23
-	CostPerStateByte          = 1530
-	SystemMaxSStoresPerCall   = 16
+	AccountCreationSize           = 120
+	StorageCreationSize           = 64
+	AuthorizationCreationSize     = 23
+	CostPerStateByte              = 1530
+	SystemMaxSStoresPerCall       = 16
+	MaxFrames                 int = 64 // Maximum number of frames per frame transaction.
+	MaxRecentRootReferences       = 16
 )
 
 // Bls12381G1MultiExpDiscountTable is the gas discount table for BLS12-381 G1 multi exponentiation operation
@@ -270,6 +281,19 @@ var (
 	// EIP-7997 - Deterministic deployment factory (keyless CREATE2 factory)
 	DeterministicFactoryAddress = common.HexToAddress("0x4e59b44847b379578588920cA78FbF26c0B4956C")
 	DeterministicFactoryCode    = common.FromHex("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3")
+
+	// EIP-8141 - Frame Transaction
+	FrameEntryPointAddress     = common.HexToAddress("0x00000000000000000000000000000000000000aa")
+	FrameExpiryVerifierAddress = common.HexToAddress("0x0000000000000000000000000000000000008141")
+	FrameExpiryVerifierCode    = common.FromHex("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd")
+	FrameExpiryDataLength      = 8
+	NonceManagerAddress        = common.HexToAddress("0x0000000000000000000000000000000000008250")
+	NonceManagerCode           = common.FromHex("60006000fd")
+	KeyedNonceFirstUseGas      = uint64(20_000)
+	RecentRootAddress          = common.HexToAddress("0x0000000000000000000000000000000000008272")
+	RecentRootCode             = common.FromHex("60006000fd00")
+	RecentRootWindow           = uint64(8192)
+	SecondsPerSlot             = uint64(12)
 )
 
 // System log events.

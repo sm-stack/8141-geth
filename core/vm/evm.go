@@ -68,8 +68,17 @@ type BlockContext struct {
 	Random      *common.Hash   // Provides information for PREVRANDAO
 	SlotNum     uint64         // Provides information for SLOTNUM
 
-	CostPerStateByte uint64 // CostPerByte for new state after EIP-8037
+	CostPerStateByte uint64       // CostPerByte for new state after EIP-8037
+	SlotProvider     SlotProvider // Optional consensus slot source for EIP-8272.
 }
+
+type SlotProvider interface {
+	CurrentSlot() uint64
+}
+
+type TimestampSlotProvider struct{ Timestamp uint64 }
+
+func (p TimestampSlotProvider) CurrentSlot() uint64 { return p.Timestamp / params.SecondsPerSlot }
 
 // TxContext provides the EVM with information about a transaction.
 // All fields can change between transactions.
@@ -134,6 +143,9 @@ type EVM struct {
 	returnData []byte // Last CALL's return data for subsequent reuse
 
 	arena *stackArena
+	// EIP-8141: Frame transaction context.
+	FrameCtx     *FrameContext // Set when executing a frame transaction.
+	ApproveScope uint8         // Set by APPROVE opcode (0=not set, 1/2/3=approval scope bitmask).
 }
 
 // NewEVM constructs an EVM instance with the supplied block context, state
@@ -141,6 +153,9 @@ type EVM struct {
 // state transition of a block, with the transaction context switched as
 // needed by calling evm.SetTxContext.
 func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+	if blockCtx.SlotProvider == nil {
+		blockCtx.SlotProvider = TimestampSlotProvider{Timestamp: blockCtx.Time}
+	}
 	evm := &EVM{
 		Context:     blockCtx,
 		StateDB:     statedb,
@@ -205,6 +220,8 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 	evm.Config.ExtraEips = extraEips
 	return evm
 }
+
+func (evm *EVM) CurrentSlot() uint64 { return evm.Context.SlotProvider.CurrentSlot() }
 
 // SetPrecompiles sets the precompiled contracts for the EVM.
 // This method is only used through RPC calls.
@@ -312,6 +329,16 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 	if !syscall {
 		evm.Context.Transfer(evm.StateDB, caller, addr, value, &evm.chainRules)
 	}
+	if evm.chainRules.IsPrague && addr == params.RecentRootAddress {
+		ret, gas, err = evm.callRecentRoot(caller, input, gas, value)
+		if err != nil {
+			evm.StateDB.RevertToSnapshot(snapshot)
+			if err != ErrExecutionReverted {
+				gas = gas.ExitHalt()
+			}
+		}
+		return ret, gas, err
+	}
 
 	if isPrecompile {
 		ret, gas, err = RunPrecompiledContract(evm.StateDB, p, addr, input, gas, evm.Config.Tracer, evm.chainRules, evm.precompileCache)
@@ -342,6 +369,40 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		}
 	}
 	return ret, exitGas, err
+}
+
+func (evm *EVM) callRecentRoot(caller common.Address, input []byte, gas GasBudget, value *uint256.Int) ([]byte, GasBudget, error) {
+	if evm.readOnly {
+		return nil, gas, ErrWriteProtection
+	}
+	if len(input) != 64 || !value.IsZero() {
+		return nil, gas, ErrExecutionReverted
+	}
+	const hashGas = 3*params.Keccak256Gas + 9*params.Keccak256WordGas
+	if _, ok := gas.ChargeExecution(hashGas); !ok {
+		return nil, gas.ExitHalt(), ErrOutOfGas
+	}
+	salt := common.BytesToHash(input[:32])
+	root := common.BytesToHash(input[32:])
+	sourceID := types.RecentRootSourceID(caller, salt)
+	slot := evm.CurrentSlot()
+	key := types.RecentRootStorageKey(sourceID, slot)
+	entry := types.RecentRootEntryHash(sourceID, slot, root)
+
+	stack := evm.arena.stack()
+	defer stack.release()
+	stack.push(new(uint256.Int).SetBytes(entry[:]))
+	stack.push(new(uint256.Int).SetBytes(key[:]))
+	contract := NewContract(caller, params.RecentRootAddress, value, gas, evm.jumpDests)
+	cost, err := gasSStoreEIP3529(evm, contract, stack, nil, 0)
+	if err != nil {
+		return nil, gas.ExitHalt(), ErrOutOfGas
+	}
+	if _, ok := gas.Charge(cost); !ok {
+		return nil, gas.ExitHalt(), ErrOutOfGas
+	}
+	evm.StateDB.SetState(params.RecentRootAddress, key, entry)
+	return nil, gas, nil
 }
 
 // CallCode executes the contract associated with the addr with the given input

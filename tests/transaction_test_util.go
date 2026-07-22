@@ -86,18 +86,26 @@ func (tt *TransactionTest) Run() error {
 		if overflow {
 			return sender, hash, 0, errors.New("value exceeds 256 bits")
 		}
-		cost, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), sender, tx.To(), value, rules)
+		frameTx := tx.GetFrameTx()
+		if frameTx != nil {
+			requiredGas, err = frameTx.IntrinsicGas()
+		} else {
+			requiredGas, err = core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), sender, tx.To(), value, rules)
+		}
 		if err != nil {
 			return
 		}
-		requiredGas = cost
 		if requiredGas > tx.Gas() {
 			return sender, hash, 0, fmt.Errorf("insufficient gas ( %d < %d )", tx.Gas(), requiredGas)
 		}
 
 		if rules.IsPrague {
 			var floorDataGas uint64
-			floorDataGas, err = core.FloorDataGas(rules, sender, tx.To(), value, tx.Data(), tx.AccessList())
+			if frameTx != nil {
+				floorDataGas, err = frameTx.FloorDataGas()
+			} else {
+				floorDataGas, err = core.FloorDataGas(rules, sender, tx.To(), value, tx.Data(), tx.AccessList())
+			}
 			if err != nil {
 				return
 			}

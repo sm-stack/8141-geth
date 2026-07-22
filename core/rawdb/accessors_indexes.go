@@ -231,33 +231,34 @@ func ReadCanonicalReceipt(db ethdb.Reader, hash common.Hash, config *params.Chai
 // specific fields from it.
 func extractReceiptFields(receiptRLP rlp.RawValue) (uint64, uint, error) {
 	receiptList, _, err := rlp.SplitList(receiptRLP)
-	if err != nil {
+	if err == nil {
+		// Skip the post-state or status field.
+		_, _, rest, err := rlp.Split(receiptList)
+		if err != nil {
+			return 0, 0, err
+		}
+		gasUsed, rest, err := rlp.SplitUint64(rest)
+		if err != nil {
+			return 0, 0, err
+		}
+		logList, _, err := rlp.SplitList(rest)
+		if err != nil {
+			return 0, 0, err
+		}
+		logCount, err := rlp.CountValues(logList)
+		if err != nil {
+			return 0, 0, err
+		}
+		return gasUsed, uint(logCount), nil
+	}
+	if !errors.Is(err, rlp.ErrExpectedList) {
 		return 0, 0, err
 	}
-	// Decode the field: receipt status
-	// for receipt before the byzantium fork:
-	// - bytes: post state root
-	// for receipt after the byzantium fork:
-	// - bytes: receipt status flag
-	_, _, rest, err := rlp.Split(receiptList)
-	if err != nil {
+	var receipt types.ReceiptForStorage
+	if err = rlp.DecodeBytes(receiptRLP, &receipt); err != nil {
 		return 0, 0, err
 	}
-	// Decode the field: cumulative gas used (type: uint64)
-	gasUsed, rest, err := rlp.SplitUint64(rest)
-	if err != nil {
-		return 0, 0, err
-	}
-	// Decode the field: logs (type: rlp list)
-	logList, _, err := rlp.SplitList(rest)
-	if err != nil {
-		return 0, 0, err
-	}
-	logCount, err := rlp.CountValues(logList)
-	if err != nil {
-		return 0, 0, err
-	}
-	return gasUsed, uint(logCount), nil
+	return receipt.CumulativeGasUsed, uint(len(receipt.Logs)), nil
 }
 
 // RawReceiptContext carries the contextual information that is needed to derive

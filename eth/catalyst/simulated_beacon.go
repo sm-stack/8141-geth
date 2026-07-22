@@ -100,6 +100,7 @@ type SimulatedBeacon struct {
 	engineAPI          *ConsensusAPI
 	curForkchoiceState engine.ForkchoiceStateV1
 	lastBlockTime      uint64
+	sealLock           sync.Mutex
 }
 
 func payloadVersion(config *params.ChainConfig, time uint64) engine.PayloadVersion {
@@ -173,6 +174,12 @@ func (c *SimulatedBeacon) Stop() error {
 // sealBlock initiates payload building for a new block and creates a new block
 // with the completed payload.
 func (c *SimulatedBeacon) sealBlock(withdrawals []*types.Withdrawal, timestamp uint64) error {
+	c.sealLock.Lock()
+	defer c.sealLock.Unlock()
+	return c.sealBlockLocked(withdrawals, timestamp)
+}
+
+func (c *SimulatedBeacon) sealBlockLocked(withdrawals []*types.Withdrawal, timestamp uint64) error {
 	if timestamp <= c.lastBlockTime {
 		timestamp = c.lastBlockTime + 1
 	}
@@ -316,6 +323,19 @@ func (c *SimulatedBeacon) sealBlock(withdrawals []*types.Withdrawal, timestamp u
 	}
 	c.lastBlockTime = payload.Timestamp
 	return nil
+}
+
+// AdvanceTime seals a block at the requested offset even if transactions are
+// pending. It is exposed only by the developer-mode RPC API for time-sensitive
+// protocol tests.
+func (c *SimulatedBeacon) AdvanceTime(adjustment time.Duration) error {
+	c.sealLock.Lock()
+	defer c.sealLock.Unlock()
+	parent := c.eth.BlockChain().CurrentBlock()
+	if parent == nil {
+		return errors.New("parent not found")
+	}
+	return c.sealBlockLocked(c.withdrawals.pop(10), parent.Time+uint64(adjustment/time.Second))
 }
 
 // loop runs the block production loop for non-zero period configuration

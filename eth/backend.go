@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/pruner"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/framepool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/txpool/locals"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -144,6 +145,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 	if !config.HistoryMode.IsValid() {
 		return nil, fmt.Errorf("invalid history mode %d", config.HistoryMode)
+	}
+	if err := validateFramePoolNetworkPolicy(config.FramePool.MaxVerifyGas, stack.Config().P2P); err != nil {
+		return nil, err
 	}
 	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Sign() <= 0 {
 		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
@@ -329,8 +333,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		config.BlobPool.Datadir = stack.ResolvePath(config.BlobPool.Datadir)
 	}
 	eth.blobTxPool = blobpool.New(config.BlobPool, eth.blockchain, legacyPool.HasPendingAuth)
+	framePool := framepool.NewWithConfig(config.FramePool, eth.blockchain)
 
-	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, []txpool.SubPool{legacyPool, eth.blobTxPool})
+	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, []txpool.SubPool{framePool, legacyPool, eth.blobTxPool})
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +395,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	eth.shutdownTracker.MarkStartup()
 
 	return eth, nil
+}
+
+func validateFramePoolNetworkPolicy(maxVerifyGas uint64, p2pConfig p2p.Config) error {
+	if maxVerifyGas <= framepool.PublicMaxVerifyGas {
+		return nil
+	}
+	isolated := p2pConfig.MaxPeers == 0 && p2pConfig.NoDial && p2pConfig.NoDiscovery &&
+		p2pConfig.ListenAddr == "" && !p2pConfig.DiscoveryV4 && !p2pConfig.DiscoveryV5 &&
+		len(p2pConfig.StaticNodes) == 0 && len(p2pConfig.TrustedNodes) == 0
+	if !isolated {
+		return fmt.Errorf("framepool validation gas %d exceeds public limit %d without fully isolated P2P", maxVerifyGas, framepool.PublicMaxVerifyGas)
+	}
+	return nil
 }
 
 func makeExtraData(extra []byte) []byte {
