@@ -212,6 +212,33 @@ func addFramePoolEOASignatureForMsg(ftx *types.FrameTx, chainID *big.Int, key *e
 	ftx.Signatures[len(ftx.Signatures)-1].Signature = vrs
 }
 
+// addFramePoolDefaultCodeSponsorSignatures installs the two protocol signatures
+// expected by a contract sender with an EOA payment target. The payment default
+// code reads signature index 1; both descriptors must be present before SigHash
+// is computed because the signature list itself is hash-committed.
+func addFramePoolDefaultCodeSponsorSignatures(ftx *types.FrameTx, chainID *big.Int, key *ecdsa.PrivateKey) {
+	if len(ftx.Signatures) != 0 {
+		panic("default-code sponsor test helper requires an empty signature list")
+	}
+	signer := crypto.PubkeyToAddress(key.PublicKey)
+	ftx.Signatures = []types.TxSignature{
+		{Scheme: types.SignatureSchemeSecp256k1, Signer: signer},
+		{Scheme: types.SignatureSchemeSecp256k1, Signer: signer},
+	}
+	sigHash := ftx.SigHash(chainID)
+	sig, err := crypto.Sign(sigHash[:], key)
+	if err != nil {
+		panic(err)
+	}
+	vrs := make([]byte, 65)
+	vrs[0] = sig[64]
+	copy(vrs[1:33], sig[0:32])
+	copy(vrs[33:65], sig[32:64])
+	for i := range ftx.Signatures {
+		ftx.Signatures[i].Signature = common.CopyBytes(vrs)
+	}
+}
+
 // --- Tests ---
 
 func TestFramePoolFilter(t *testing.T) {
@@ -1214,35 +1241,97 @@ func TestScopeOrderingExecThenPay(t *testing.T) {
 }
 
 func TestFramePoolNonCanonicalPaymasterPendingLimit(t *testing.T) {
-	pool, statedb, config := newTestEnv()
+	for _, test := range []struct {
+		name      string
+		delegated bool
+	}{
+		{name: "contract"},
+		{name: "eip7702-delegation", delegated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool, statedb, config := newTestEnv()
 
-	senderA := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	senderB := common.HexToAddress("0x2222222222222222222222222222222222222222")
-	payer := common.HexToAddress("0x3333333333333333333333333333333333333333")
-	for _, sender := range []common.Address{senderA, senderB} {
+			senderA := common.HexToAddress("0x1111111111111111111111111111111111111111")
+			senderB := common.HexToAddress("0x2222222222222222222222222222222222222222")
+			payer := common.HexToAddress("0x3333333333333333333333333333333333333333")
+			for _, sender := range []common.Address{senderA, senderB} {
+				statedb.CreateAccount(sender)
+				statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+				statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+			}
+			statedb.CreateAccount(payer)
+			if test.delegated {
+				delegate := common.HexToAddress("0x4444444444444444444444444444444444444444")
+				statedb.CreateAccount(delegate)
+				statedb.SetCode(delegate, approvePayCode, tracing.CodeChangeUnspecified)
+				statedb.SetCode(payer, types.AddressToDelegation(delegate), tracing.CodeChangeUnspecified)
+			} else {
+				statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+			}
+			statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+			makeTx := func(sender common.Address, data byte) *types.Transaction {
+				ftx := baseFTX(sender, 0, config)
+				ftx.Frames = []types.Frame{
+					{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 40000, Data: []byte{data}},
+					{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{data + 1}},
+				}
+				return makeFrameTx(ftx)
+			}
+			errs := pool.Add([]*types.Transaction{makeTx(senderA, 0x01)}, false)
+			if errs[0] != nil {
+				t.Fatalf("first non-canonical paymaster tx rejected: %v", errs[0])
+			}
+			errs = pool.Add([]*types.Transaction{makeTx(senderB, 0x03)}, false)
+			if errs[0] == nil {
+				t.Fatal("expected second pending tx using same non-canonical paymaster to be rejected")
+			}
+			if pending := pool.paymasterPending[payer]; pending != 1 {
+				t.Fatalf("non-canonical payer pending accounting: have %d want 1", pending)
+			}
+		})
+	}
+}
+
+func TestFramePoolDefaultCodeSponsorAllowsMultiplePending(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payer := crypto.PubkeyToAddress(key.PublicKey)
+	senders := []common.Address{
+		common.HexToAddress("0x1111111111111111111111111111111111111111"),
+		common.HexToAddress("0x2222222222222222222222222222222222222222"),
+	}
+	for _, sender := range senders {
 		statedb.CreateAccount(sender)
 		statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
-		statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 	}
 	statedb.CreateAccount(payer)
-	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	makeTx := func(sender common.Address, data byte) *types.Transaction {
+	for index, sender := range senders {
 		ftx := baseFTX(sender, 0, config)
 		ftx.Frames = []types.Frame{
-			{Mode: types.FrameModeVerify, Flags: 2, Target: nil, GasLimit: 40000, Data: []byte{data}},
-			{Mode: types.FrameModeVerify, Flags: 1, Target: &payer, GasLimit: 40000, Data: []byte{data + 1}},
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000, Data: []byte{byte(index + 1)}},
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &payer, GasLimit: 40_000},
 		}
-		return makeFrameTx(ftx)
+		addFramePoolDefaultCodeSponsorSignatures(ftx, config.ChainID, key)
+		tx := makeFrameTx(ftx)
+		if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+			t.Fatalf("default-code sponsor transaction %d rejected: %v", index, err)
+		}
+		meta := pool.meta[tx.Hash()]
+		if !meta.usesPaymaster || meta.canonicalPaymaster || meta.nonCanonicalPaymaster {
+			t.Fatalf("default-code sponsor metadata %d: %+v", index, meta)
+		}
 	}
-	errs := pool.Add([]*types.Transaction{makeTx(senderA, 0x01)}, false)
-	if errs[0] != nil {
-		t.Fatalf("first non-canonical paymaster tx rejected: %v", errs[0])
+	if pending, _ := pool.Stats(); pending != len(senders) {
+		t.Fatalf("default-code sponsor pending transactions: have %d want %d", pending, len(senders))
 	}
-	errs = pool.Add([]*types.Transaction{makeTx(senderB, 0x03)}, false)
-	if errs[0] == nil {
-		t.Fatal("expected second pending tx using same non-canonical paymaster to be rejected")
+	if pending := pool.paymasterPending[payer]; pending != 0 {
+		t.Fatalf("default-code sponsor non-canonical accounting: have %d want 0", pending)
 	}
 }
 

@@ -18,9 +18,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/devp2p/internal/ethtest"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -65,6 +68,9 @@ var (
 			rlpxEthTestCommand,
 			rlpxSnapTestCommand,
 			rlpxSnap2TestCommand,
+			rlpxFrameLoadCommand,
+			rlpxFrameMassCommand,
+			rlpxFrameMassStreamCommand,
 		},
 	}
 	rlpxPingCommand = &cli.Command{
@@ -112,6 +118,55 @@ var (
 			testNodeFlag,
 			testNodeJWTFlag,
 			testNodeEngineFlag,
+		},
+	}
+	rlpxFrameLoadCommand = &cli.Command{
+		Name:      "frame-load",
+		Usage:     "Send adversarial frame transactions over real RLPx peers",
+		ArgsUsage: "<node>",
+		Action:    rlpxFrameLoad,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "corpus", Value: "bls", Usage: "workload corpus: arithmetic or bls"},
+			&cli.Uint64Flag{Name: "chain-id", Value: 1337, Usage: "frame transaction chain ID"},
+			&cli.Uint64Flag{Name: "verify-gas", Value: 100_000, Usage: "VERIFY frame gas limit"},
+			&cli.IntFlag{Name: "peers", Value: 16, Usage: "parallel RLPx peers"},
+			&cli.IntFlag{Name: "batch", Value: 1, Usage: "transactions per eth/Transactions packet"},
+			&cli.IntFlag{Name: "rate", Value: 100, Usage: "total requested transactions per second (0 is unbounded)"},
+			&cli.DurationFlag{Name: "duration", Value: 30 * time.Second, Usage: "load duration"},
+		},
+	}
+	rlpxFrameMassCommand = &cli.Command{
+		Name:      "frame-mass",
+		Usage:     "Fill the framepool once with valid shared-payer transactions",
+		ArgsUsage: "<node>",
+		Action:    rlpxFrameMass,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "corpus", Value: "bls", Usage: "workload corpus (bls)"},
+			&cli.StringFlag{Name: "payer-mode", Value: "canonical", Usage: "payer fixture: canonical or default-eoa"},
+			&cli.Uint64Flag{Name: "chain-id", Value: 1337, Usage: "frame transaction chain ID"},
+			&cli.Uint64Flag{Name: "verify-gas", Value: 100_000, Usage: "combined signature and VERIFY-frame gas"},
+			&cli.IntFlag{Name: "count", Value: 256, Usage: "unique sender transactions to write"},
+			&cli.IntFlag{Name: "peers", Value: 1, Usage: "parallel RLPx peers"},
+			&cli.IntFlag{Name: "batch", Value: 16, Usage: "transactions per eth/Transactions packet"},
+			&cli.DurationFlag{Name: "settle", Value: time.Second, Usage: "time to keep peers open after the final write"},
+		},
+	}
+	rlpxFrameMassStreamCommand = &cli.Command{
+		Name:      "frame-mass-stream",
+		Usage:     "Continuously replay shared-payer frame transactions over real RLPx peers",
+		ArgsUsage: "<node>",
+		Action:    rlpxFrameMassStream,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "corpus", Value: "bls", Usage: "workload corpus (bls)"},
+			&cli.StringFlag{Name: "payer-mode", Value: "canonical", Usage: "payer fixture: canonical or default-eoa"},
+			&cli.StringFlag{Name: "hash-mode", Value: "exact", Usage: "transaction hash mode: exact or unique"},
+			&cli.Uint64Flag{Name: "chain-id", Value: 1337, Usage: "frame transaction chain ID"},
+			&cli.Uint64Flag{Name: "verify-gas", Value: 100_000, Usage: "combined signature and VERIFY-frame gas"},
+			&cli.IntFlag{Name: "count", Value: 256, Usage: "unique sender transactions per manifest"},
+			&cli.IntFlag{Name: "peers", Value: 16, Usage: "parallel RLPx peers"},
+			&cli.IntFlag{Name: "batch", Value: 128, Usage: "transactions per eth/Transactions packet (must not exceed count)"},
+			&cli.IntFlag{Name: "rate", Value: 25, Usage: "total requested transactions per second"},
+			&cli.DurationFlag{Name: "duration", Value: 30 * time.Second, Usage: "stream duration"},
 		},
 	}
 )
@@ -187,6 +242,67 @@ func rlpxSnap2Test(ctx *cli.Context) error {
 		exit(err)
 	}
 	return runTests(ctx, suite.Snap2Tests())
+}
+
+func rlpxFrameLoad(ctx *cli.Context) error {
+	result, err := ethtest.RunFrameLoad(ctx.Context, ethtest.FrameLoadConfig{
+		Dest:      getNodeArg(ctx),
+		Corpus:    ctx.String("corpus"),
+		ChainID:   ctx.Uint64("chain-id"),
+		VerifyGas: ctx.Uint64("verify-gas"),
+		Peers:     ctx.Int("peers"),
+		Batch:     ctx.Int("batch"),
+		Rate:      ctx.Int("rate"),
+		Duration:  ctx.Duration("duration"),
+	})
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+func rlpxFrameMass(ctx *cli.Context) error {
+	result, err := ethtest.RunFrameMass(ctx.Context, ethtest.FrameMassConfig{
+		Dest:      getNodeArg(ctx),
+		Corpus:    ctx.String("corpus"),
+		PayerMode: ctx.String("payer-mode"),
+		ChainID:   ctx.Uint64("chain-id"),
+		VerifyGas: ctx.Uint64("verify-gas"),
+		Count:     ctx.Int("count"),
+		Peers:     ctx.Int("peers"),
+		Batch:     ctx.Int("batch"),
+		Settle:    ctx.Duration("settle"),
+	})
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+func rlpxFrameMassStream(ctx *cli.Context) error {
+	result, err := ethtest.RunFrameMassStream(ctx.Context, ethtest.FrameMassStreamConfig{
+		Dest:      getNodeArg(ctx),
+		Corpus:    ctx.String("corpus"),
+		PayerMode: ctx.String("payer-mode"),
+		HashMode:  ctx.String("hash-mode"),
+		ChainID:   ctx.Uint64("chain-id"),
+		VerifyGas: ctx.Uint64("verify-gas"),
+		Count:     ctx.Int("count"),
+		Peers:     ctx.Int("peers"),
+		Batch:     ctx.Int("batch"),
+		Rate:      ctx.Int("rate"),
+		Duration:  ctx.Duration("duration"),
+	})
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
 }
 
 type testParams struct {
