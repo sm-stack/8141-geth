@@ -527,6 +527,34 @@ func TestSTO010_SenderOwnStorage(t *testing.T) {
 	}
 }
 
+func TestFrameValidationTracerRecordsDependencies(t *testing.T) {
+	t.Run("sender storage", func(t *testing.T) {
+		tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+		tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scopeForSload(testSender, testSlot), nil, 1, nil)
+		reads := tracer.StorageReads()
+		if len(reads) != 1 || reads[0] != testSlot {
+			t.Fatalf("storage reads: have %v want [%s]", reads, testSlot)
+		}
+	})
+
+	t.Run("external code", func(t *testing.T) {
+		tracer := newTestTracer()
+		tracer.OnOpcode(0, byte(EXTCODEHASH), 100000, 200, scopeForExt(testContract), nil, 1, nil)
+		reads := tracer.CodeReads()
+		if len(reads) != 1 || reads[0] != testContract {
+			t.Fatalf("code reads: have %v want [%s]", reads, testContract)
+		}
+	})
+
+	t.Run("precompile excluded", func(t *testing.T) {
+		tracer := newTestTracer()
+		tracer.OnOpcode(0, byte(EXTCODEHASH), 100000, 200, scopeForExt(testPrecompile1), nil, 1, nil)
+		if reads := tracer.CodeReads(); len(reads) != 0 {
+			t.Fatalf("precompile code reads: have %v want none", reads)
+		}
+	})
+}
+
 func TestFrameValidationRejectsStorageOutsideSender(t *testing.T) {
 	for _, addr := range []common.Address{testExternalContract, common.HexToAddress("0x5555555555555555555555555555555555555555")} {
 		t.Run(addr.Hex(), func(t *testing.T) {

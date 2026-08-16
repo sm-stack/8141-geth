@@ -67,10 +67,12 @@ var bannedOpcodes = map[OpCode]bool{
 // It is designed to be lightweight and fail-fast: it records the first violation
 // and short-circuits all subsequent hooks.
 type FrameValidationTracer struct {
-	stateDB     StateDB        // For validation target code inspection.
-	sender      common.Address // tx.sender — exempt from OP-041, owns storage (STO-010)
-	frameTarget common.Address // VERIFY frame target
-	precompiles map[common.Address]bool
+	stateDB      StateDB        // For validation target code inspection.
+	sender       common.Address // tx.sender — exempt from OP-041, owns storage (STO-010)
+	frameTarget  common.Address // VERIFY frame target
+	precompiles  map[common.Address]bool
+	storageReads map[common.Hash]struct{}
+	codeReads    map[common.Address]struct{}
 
 	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
 	lastOpValid    bool   // Whether lastOp is meaningful
@@ -107,9 +109,32 @@ func NewFrameValidationTracerWithOptions(stateDB StateDB, sender common.Address,
 		sender:         sender,
 		frameTarget:    frameTarget,
 		precompiles:    pm,
+		storageReads:   make(map[common.Hash]struct{}),
+		codeReads:      make(map[common.Address]struct{}),
 		allowTimestamp: frameTarget == params.FrameExpiryVerifierAddress && bytes.Equal(stateDB.GetCode(frameTarget), params.FrameExpiryVerifierCode),
 		options:        opts,
 	}
+}
+
+// StorageReads returns the tx.sender storage slots read by the validation frame.
+// The validation rules reject storage reads in any other account.
+func (t *FrameValidationTracer) StorageReads() []common.Hash {
+	reads := make([]common.Hash, 0, len(t.storageReads))
+	for slot := range t.storageReads {
+		reads = append(reads, slot)
+	}
+	return reads
+}
+
+// CodeReads returns non-precompile addresses reached through CALL*/EXTCODE*.
+// Callers can snapshot their code hashes to decide whether a pending validation
+// result remains reusable at a later head.
+func (t *FrameValidationTracer) CodeReads() []common.Address {
+	reads := make([]common.Address, 0, len(t.codeReads))
+	for addr := range t.codeReads {
+		reads = append(reads, addr)
+	}
+	return reads
 }
 
 // Violation returns the first detected rule violation, or nil.
@@ -179,6 +204,9 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		}
 		if len(stackData) > addrIdx {
 			addr := common.BytesToAddress(stackData[len(stackData)-addrIdx-1].Bytes())
+			if !t.precompiles[addr] {
+				t.codeReads[addr] = struct{}{}
+			}
 			// Skip precompiles and sender (OP-042 exception).
 			if !t.precompiles[addr] && addr != t.sender {
 				code := t.stateDB.GetCode(addr)
@@ -202,6 +230,10 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 				Message: fmt.Sprintf("storage read outside sender at %s", addr.Hex()),
 			}
 			return
+		}
+		stackData := scope.StackData()
+		if len(stackData) > 0 {
+			t.storageReads[common.Hash(stackData[len(stackData)-1].Bytes32())] = struct{}{}
 		}
 	}
 

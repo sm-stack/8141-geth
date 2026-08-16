@@ -1,0 +1,208 @@
+// Copyright 2026 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+
+package framepool
+
+import (
+	"fmt"
+	"math/big"
+	"runtime"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
+)
+
+func resetWithStateChange(pool *FramePool, chain *testChain, mutate func(*state.StateDB)) *state.StateDB {
+	nextState := pool.currentState.Copy()
+	mutate(nextState)
+	oldHead := chain.head
+	newHead := types.CopyHeader(oldHead)
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	newHead.Time = oldHead.Time + params.SecondsPerSlot
+	chain.statedb = nextState
+	chain.head = newHead
+	pool.Reset(oldHead, newHead)
+	return nextState
+}
+
+func TestSelectiveRevalidationSkipsUnrelatedHeads(t *testing.T) {
+	const count = 16
+	fixture := newPayerCodeToggleFixture(t, count, false)
+	fixture.fill(t)
+
+	for head := 0; head < 3; head++ {
+		reusedBefore := resetReusedMeter.Snapshot().Count()
+		revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+		signatureBefore := signatureRunMeter.Snapshot().Count()
+		verifyBefore := verifyRunMeter.Snapshot().Count()
+		senderBefore := senderVerifyRunMeter.Snapshot().Count()
+		fixture.unrelatedReset()
+
+		if pending, _ := fixture.pool.Stats(); pending != count {
+			t.Fatalf("head %d pending: have %d want %d", head, pending, count)
+		}
+		if delta := resetReusedMeter.Snapshot().Count() - reusedBefore; delta != count {
+			t.Fatalf("head %d reused: have %d want %d", head, delta, count)
+		}
+		if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 0 {
+			t.Fatalf("head %d revalidated: have %d want 0", head, delta)
+		}
+		if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+			t.Fatalf("head %d signature runs: have %d want 0", head, delta)
+		}
+		if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+			t.Fatalf("head %d validation-prefix runs: have %d want 0", head, delta)
+		}
+		if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 0 {
+			t.Fatalf("head %d sender VERIFY runs: have %d want 0", head, delta)
+		}
+	}
+}
+
+func TestSelectiveRevalidationDetectsSenderStorageChange(t *testing.T) {
+	fixture := newPayerCodeToggleFixture(t, 1, false)
+	sender := massInvalidationSender(0)
+	storageReadApproveCode := append([]byte{0x5f, 0x54, 0x50}, approveExecCode...)
+	fixture.state.SetCode(sender, storageReadApproveCode, tracing.CodeChangeUnspecified)
+	fixture.fill(t)
+
+	changedBefore := resetDependencyChangedMeter.Snapshot().Count()
+	revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+	senderBefore := senderVerifyRunMeter.Snapshot().Count()
+	fixture.state = resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
+		nextState.SetState(sender, common.Hash{}, common.HexToHash("0x01"))
+	})
+	if pending, _ := fixture.pool.Stats(); pending != 1 {
+		t.Fatalf("pending after sender storage change: have %d want 1", pending)
+	}
+	if delta := resetDependencyChangedMeter.Snapshot().Count() - changedBefore; delta != 1 {
+		t.Fatalf("dependency changes: have %d want 1", delta)
+	}
+	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 1 {
+		t.Fatalf("revalidated after sender storage change: have %d want 1", delta)
+	}
+	if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 1 {
+		t.Fatalf("sender VERIFY after storage change: have %d want 1", delta)
+	}
+}
+
+func TestSelectiveRevalidationDetectsHelperCodeChange(t *testing.T) {
+	fixture := newPayerCodeToggleFixture(t, 1, false)
+	sender := massInvalidationSender(0)
+	helper := common.HexToAddress("0x7777777777777777777777777777777777777777")
+	fixture.state.CreateAccount(helper)
+	fixture.state.SetCode(helper, []byte{0x00}, tracing.CodeChangeUnspecified)
+	senderCode := []byte{0x73}
+	senderCode = append(senderCode, helper.Bytes()...)
+	senderCode = append(senderCode, 0x3f, 0x50) // EXTCODEHASH, POP
+	senderCode = append(senderCode, approveExecCode...)
+	fixture.state.SetCode(sender, senderCode, tracing.CodeChangeUnspecified)
+	fixture.fill(t)
+
+	changedBefore := resetDependencyChangedMeter.Snapshot().Count()
+	revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+	fixture.state = resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
+		nextState.SetCode(helper, []byte{0x5b, 0x00}, tracing.CodeChangeUnspecified)
+	})
+	if pending, _ := fixture.pool.Stats(); pending != 1 {
+		t.Fatalf("pending after helper code change: have %d want 1", pending)
+	}
+	if delta := resetDependencyChangedMeter.Snapshot().Count() - changedBefore; delta != 1 {
+		t.Fatalf("helper dependency changes: have %d want 1", delta)
+	}
+	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 1 {
+		t.Fatalf("revalidated after helper code change: have %d want 1", delta)
+	}
+}
+
+func TestSelectiveRevalidationRejectsCanonicalWithdrawalWithoutEVM(t *testing.T) {
+	const count = 16
+	fixture := newMassInvalidationFixture(t, "bls", count)
+	fixture.pool.selectiveRevalidation = true
+	fixture.fill(t)
+
+	revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	senderBefore := senderVerifyRunMeter.Snapshot().Count()
+	oldHead, newHead := fixture.prepareReset(true, 0)
+	fixture.reset(oldHead, newHead)
+	if pending, _ := fixture.pool.Stats(); pending != 0 {
+		t.Fatalf("pending after canonical withdrawal: have %d want 0", pending)
+	}
+	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 0 {
+		t.Fatalf("canonical withdrawal revalidations: have %d want 0", delta)
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("canonical withdrawal signature runs: have %d want 0", delta)
+	}
+	if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 0 {
+		t.Fatalf("canonical withdrawal sender VERIFY runs: have %d want 0", delta)
+	}
+}
+
+func TestSelectiveRevalidationDetectsCanonicalSignerChange(t *testing.T) {
+	fixture := newMassInvalidationFixture(t, "bls", 1)
+	fixture.pool.selectiveRevalidation = true
+	fixture.fill(t)
+
+	changedBefore := resetDependencyChangedMeter.Snapshot().Count()
+	revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+	fixture.state = resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
+		nextSigner := common.HexToAddress("0x8888888888888888888888888888888888888888")
+		nextState.SetState(fixture.payer, common.Hash{}, common.BytesToHash(nextSigner.Bytes()))
+	})
+	if pending, _ := fixture.pool.Stats(); pending != 0 {
+		t.Fatalf("pending after canonical signer change: have %d want 0", pending)
+	}
+	if delta := resetDependencyChangedMeter.Snapshot().Count() - changedBefore; delta != 1 {
+		t.Fatalf("canonical signer dependency changes: have %d want 1", delta)
+	}
+	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 1 {
+		t.Fatalf("revalidated after canonical signer change: have %d want 1", delta)
+	}
+}
+
+func BenchmarkUnrelatedHeadReset(b *testing.B) {
+	for _, selective := range []bool{false, true} {
+		name := "full-sweep"
+		if selective {
+			name = "selective"
+		}
+		b.Run(fmt.Sprintf("%s/N=256", name), func(b *testing.B) {
+			b.ReportAllocs()
+			var (
+				senderRuns  int64
+				revalidated int64
+				reused      int64
+			)
+			for b.Loop() {
+				b.StopTimer()
+				fixture := newPayerCodeToggleFixture(b, 256, false)
+				fixture.pool.selectiveRevalidation = selective
+				fixture.fill(b)
+				runtime.GC()
+				senderBefore := senderVerifyRunMeter.Snapshot().Count()
+				revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+				reusedBefore := resetReusedMeter.Snapshot().Count()
+				b.StartTimer()
+				fixture.unrelatedReset()
+				b.StopTimer()
+				if pending, _ := fixture.pool.Stats(); pending != 256 {
+					b.Fatalf("pending after unrelated head: have %d want 256", pending)
+				}
+				senderRuns += senderVerifyRunMeter.Snapshot().Count() - senderBefore
+				revalidated += resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore
+				reused += resetReusedMeter.Snapshot().Count() - reusedBefore
+				b.StartTimer()
+			}
+			b.ReportMetric(256, "tx/op")
+			b.ReportMetric(float64(senderRuns)/float64(b.N), "sender-runs/op")
+			b.ReportMetric(float64(revalidated)/float64(b.N), "revalidated/op")
+			b.ReportMetric(float64(reused)/float64(b.N), "reused/op")
+		})
+	}
+}

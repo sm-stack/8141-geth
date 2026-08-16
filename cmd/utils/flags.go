@@ -484,6 +484,24 @@ var (
 		Value:    ethconfig.Defaults.FramePool.MaxVerifyGas,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolPayerSolvencyPreflightFlag = &cli.BoolFlag{
+		Name:     "framepool.payersolvencypreflight",
+		Usage:    "Reject frame transactions with a structurally resolved insolvent payer before VERIFY simulation (research A/B)",
+		Value:    ethconfig.Defaults.FramePool.PayerSolvencyPreflight,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolPayerCodeIdentityPreflightFlag = &cli.BoolFlag{
+		Name:     "framepool.payercodeidentitypreflight",
+		Usage:    "Reject replayed frame transactions when payer code changed since admission (research A/B)",
+		Value:    ethconfig.Defaults.FramePool.PayerCodeIdentityPreflight,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolSelectiveRevalidationFlag = &cli.BoolFlag{
+		Name:     "framepool.selectiverevalidation",
+		Usage:    "Reuse pending frame validation when all tracked state dependencies are unchanged",
+		Value:    ethconfig.Defaults.FramePool.SelectiveRevalidation,
+		Category: flags.TxPoolCategory,
+	}
 	// Blob transaction pool settings
 	BlobPoolDataDirFlag = &cli.StringFlag{
 		Name:     "blobpool.datadir",
@@ -1731,6 +1749,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setTxPool(ctx, &cfg.TxPool)
 	if ctx.IsSet(FramePoolMaxVerifyGasFlag.Name) {
 		cfg.FramePool.MaxVerifyGas = ctx.Uint64(FramePoolMaxVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolPayerSolvencyPreflightFlag.Name) {
+		cfg.FramePool.PayerSolvencyPreflight = ctx.Bool(FramePoolPayerSolvencyPreflightFlag.Name)
+	}
+	if ctx.IsSet(FramePoolPayerCodeIdentityPreflightFlag.Name) {
+		cfg.FramePool.PayerCodeIdentityPreflight = ctx.Bool(FramePoolPayerCodeIdentityPreflightFlag.Name)
+	}
+	if ctx.IsSet(FramePoolSelectiveRevalidationFlag.Name) {
+		cfg.FramePool.SelectiveRevalidation = ctx.Bool(FramePoolSelectiveRevalidationFlag.Name)
 	}
 	setBlobPool(ctx, &cfg.BlobPool)
 	setMiner(ctx, &cfg.Miner)
