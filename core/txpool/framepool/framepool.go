@@ -629,14 +629,18 @@ func (p *FramePool) GetMetadata(hash common.Hash) *txpool.TxMetadata {
 
 // ValidateTxBasics performs stateless validation of a frame transaction.
 func (p *FramePool) ValidateTxBasics(tx *types.Transaction) error {
+	p.mu.RLock()
+	head := types.CopyHeader(p.currentHead)
+	minTip := p.gasTip.ToBig()
+	p.mu.RUnlock()
 	opts := &txpool.ValidationOptions{
 		Config:       p.chainconfig,
 		Accept:       1 << types.FrameTxType,
 		MaxSize:      txMaxSize,
 		MaxBlobCount: params.BlobTxMaxBlobs,
-		MinTip:       p.gasTip.ToBig(),
+		MinTip:       minTip,
 	}
-	return txpool.ValidateTransaction(tx, p.currentHead, p.signer, opts)
+	return txpool.ValidateTransaction(tx, head, p.signer, opts)
 }
 
 // Add validates and adds frame transactions to the pool.
@@ -780,6 +784,9 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 	p.validationMu.Lock()
 	defer p.validationMu.Unlock()
+	if err := p.ValidateTxBasics(tx); err != nil {
+		return err
+	}
 
 	p.mu.Lock()
 	_, err := p.checkAdmissionCheap(tx, true)
@@ -822,10 +829,11 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		}
 		held = true
 	}
+	validationView := p.validationViewLocked()
 	p.mu.Unlock()
 
 	// Simulate the validation prefix.
-	meta, err := p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
+	meta, err := validationView.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
 	if err != nil {
 		if held && p.reserver != nil {
 			p.reserver.Release(sender)
@@ -857,6 +865,29 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	p.reserveTxAccounting(tx.Hash(), meta)
 	delete(p.stalePayerCode, tx.Hash())
 	return nil
+}
+
+// validationViewLocked snapshots all state used by validation-prefix execution.
+// The caller holds p.mu for writing, excluding StateDB reads that may populate
+// internal caches while Copy iterates over them.
+func (p *FramePool) validationViewLocked() *FramePool {
+	canonicalPaymasters := make(map[common.Hash]common.Hash, len(p.canonicalPaymasters))
+	for codeHash, slot := range p.canonicalPaymasters {
+		canonicalPaymasters[codeHash] = slot
+	}
+	return &FramePool{
+		chain:                      p.chain,
+		chainconfig:                p.chainconfig,
+		signer:                     p.signer,
+		currentHead:                types.CopyHeader(p.currentHead),
+		currentState:               p.currentState.Copy(),
+		slotProvider:               p.slotProvider,
+		verifyGasCap:               p.verifyGasCap,
+		payerSolvencyPreflight:     p.payerSolvencyPreflight,
+		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
+		selectiveRevalidation:      p.selectiveRevalidation,
+		canonicalPaymasters:        canonicalPaymasters,
+	}
 }
 
 // simulateVerifyFrames validates the EIP-8141 validation prefix and returns the
@@ -1820,8 +1851,8 @@ func (p *FramePool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs boo
 
 // Nonce returns the next nonce for the given address.
 func (p *FramePool) Nonce(addr common.Address) uint64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	nonce := p.currentState.GetNonce(addr)
 	if txs := p.pending[addr]; len(txs) > 0 {
