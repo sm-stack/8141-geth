@@ -244,6 +244,15 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig, 
 		misc.ApplyDAOHardFork(statedb)
 	}
 	evm := vm.NewEVM(vmContext, statedb, chainConfig, vmConfig)
+	if pre.Env.Number > 0 {
+		parent := &types.Header{
+			Number: new(big.Int).SetUint64(pre.Env.Number - 1),
+			Time:   pre.Env.ParentTimestamp,
+		}
+		if err := core.ApplyBogotaSystemContracts(parent, chainConfig, evm, vmContext.BlockNumber, vmContext.Time, blockAccessList); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	if beaconRoot := pre.Env.ParentBeaconBlockRoot; beaconRoot != nil {
 		core.ProcessBeaconBlockRoot(*beaconRoot, evm, blockAccessList)
 	}
@@ -261,7 +270,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig, 
 			rejectedTxs = append(rejectedTxs, &rejectedTx{i, err.Error()})
 			continue
 		}
-		if tx.Type() == types.BlobTxType && vmContext.BlobBaseFee == nil {
+		if tx.BlobGas() > 0 && vmContext.BlobBaseFee == nil {
 			errMsg := "blob tx used but field env.ExcessBlobGas missing"
 			log.Warn("rejected tx", "index", i, "hash", tx.Hash(), "error", errMsg)
 			rejectedTxs = append(rejectedTxs, &rejectedTx{i, errMsg})
@@ -274,8 +283,8 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig, 
 			continue
 		}
 		txBlobGas := uint64(0)
-		if tx.Type() == types.BlobTxType {
-			txBlobGas = uint64(params.BlobTxBlobGasPerBlob * len(tx.BlobHashes()))
+		if tx.BlobGas() > 0 {
+			txBlobGas = tx.BlobGas()
 			max := eip4844.MaxBlobGasPerBlock(chainConfig, pre.Env.Timestamp)
 			if used := blobGasUsed + txBlobGas; used > max {
 				err := fmt.Errorf("blob gas (%d) would exceed maximum allowance %d", used, max)
