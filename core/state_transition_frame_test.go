@@ -64,6 +64,7 @@ var (
 func newFrameTestEnv() (*vm.EVM, *state.StateDB, *params.ChainConfig) {
 	config := *params.MergedTestChainConfig
 	zero := uint64(0)
+	config.AmsterdamTime = &zero
 	config.BogotaTime = &zero
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 
@@ -1585,7 +1586,8 @@ func TestFrameTxFrameGasSumOverflow(t *testing.T) {
 // per-transaction gas limit cap (params.MaxTxGas) when Osaka is active.
 func TestFrameTxOsakaGasCap(t *testing.T) {
 	// MergedTestChainConfig has OsakaTime=0, so Osaka is always active.
-	evm, _, _ := newFrameTestEnv()
+	evm, _, config := newFrameTestEnv()
+	config.AmsterdamTime = nil
 
 	sender := common.HexToAddress("0xbbbb")
 	// Construct a message whose GasLimit exceeds MaxTxGas.

@@ -136,6 +136,7 @@ var (
 func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
 	configCopy := *params.MergedTestChainConfig
 	zero := uint64(0)
+	configCopy.AmsterdamTime = &zero
 	configCopy.BogotaTime = &zero
 	config := &configCopy
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())

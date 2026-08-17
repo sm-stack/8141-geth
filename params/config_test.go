@@ -139,6 +139,20 @@ func TestConfigRules(t *testing.T) {
 	}
 }
 
+func TestBogotaRequiresAmsterdam(t *testing.T) {
+	config := *MergedTestChainConfig
+	bogota := uint64(10)
+	config.BogotaTime = &bogota
+	if err := config.CheckConfigForkOrder(); err == nil {
+		t.Fatal("Bogota config without Amsterdam was accepted")
+	}
+	amsterdam := uint64(9)
+	config.AmsterdamTime = &amsterdam
+	if err := config.CheckConfigForkOrder(); err != nil {
+		t.Fatalf("ordered Amsterdam and Bogota config rejected: %v", err)
+	}
+}
+
 func TestTimestampCompatError(t *testing.T) {
 	require.Equal(t, new(ConfigCompatError).Error(), "")
 

@@ -233,7 +233,6 @@ var (
 		TerminalTotalDifficulty: big.NewInt(0),
 		PragueTime:              newUint64(0),
 		OsakaTime:               newUint64(0),
-		BogotaTime:              newUint64(0),
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 			Prague: DefaultPragueBlobConfig,
@@ -969,7 +968,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "bpo3", timestamp: c.BPO3Time, optional: true},
 		{name: "bpo4", timestamp: c.BPO4Time, optional: true},
 		{name: "bpo5", timestamp: c.BPO5Time, optional: true},
-		{name: "amsterdam", timestamp: c.AmsterdamTime, optional: true},
+		{name: "amsterdam", timestamp: c.AmsterdamTime},
 		{name: "bogota", timestamp: c.BogotaTime, optional: true},
 	} {
 		if lastFork.name != "" {
