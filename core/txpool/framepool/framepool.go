@@ -247,8 +247,8 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		log.Error("Failed to reset frame pool state", "err", err)
 		return
 	}
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.cacheIncludedBlobSidecars(included, newHead.Number.Uint64())
 	for i, tx := range reinject {
 		if tx.BlobGas() == 0 || tx.BlobTxSidecar() != nil {
@@ -258,13 +258,13 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 			reinject[i] = tx.WithBlobTxSidecar(cached.sidecar)
 		}
 	}
-
-	p.currentHead = newHead
-	p.currentState = statedb
-
 	var txs []*types.Transaction
 	seen := make(map[common.Hash]struct{})
-	for _, senderTxs := range p.pending {
+	existingSenders := make(map[common.Address]struct{}, len(p.pending))
+	for sender, senderTxs := range p.pending {
+		if len(senderTxs) > 0 {
+			existingSenders[sender] = struct{}{}
+		}
 		for _, tx := range senderTxs {
 			txs = append(txs, tx)
 			seen[tx.Hash()] = struct{}{}
@@ -275,8 +275,91 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 			txs = append(txs, tx)
 		}
 	}
-	resetCandidateMeter.Mark(int64(len(txs)))
 	oldMeta := p.meta
+	stalePayerCode := make(map[common.Hash]payerCodeIdentity, len(p.stalePayerCode))
+	for hash, identity := range p.stalePayerCode {
+		stalePayerCode[hash] = identity
+	}
+	reserver := &resetReserver{base: p.reserver, existing: existingSenders, acquired: make(map[common.Address]struct{})}
+	candidate := &FramePool{
+		chain:                      p.chain,
+		chainconfig:                p.chainconfig,
+		signer:                     p.signer,
+		gasTip:                     p.gasTip,
+		currentHead:                newHead,
+		currentState:               statedb,
+		slotProvider:               p.slotProvider,
+		verifyGasCap:               p.verifyGasCap,
+		payerSolvencyPreflight:     p.payerSolvencyPreflight,
+		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
+		selectiveRevalidation:      p.selectiveRevalidation,
+		canonicalPaymasters:        p.canonicalPaymasters,
+		reserver:                   reserver,
+		pending:                    make(map[common.Address][]*types.Transaction),
+		all:                        make(map[common.Hash]*types.Transaction),
+		meta:                       make(map[common.Hash]frameTxMeta),
+		stalePayerCode:             stalePayerCode,
+		paymasterReserved:          make(map[common.Address]*big.Int),
+		paymasterPending:           make(map[common.Address]int),
+	}
+	p.mu.Unlock()
+
+	candidate.revalidate(txs, oldMeta)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for sender := range existingSenders {
+		if len(candidate.pending[sender]) == 0 && p.reserver != nil {
+			p.reserver.Release(sender)
+		}
+	}
+	p.currentHead = newHead
+	p.currentState = statedb
+	p.pending = candidate.pending
+	p.all = candidate.all
+	p.meta = candidate.meta
+	p.stalePayerCode = candidate.stalePayerCode
+	p.paymasterReserved = candidate.paymasterReserved
+	p.paymasterPending = candidate.paymasterPending
+}
+
+type resetReserver struct {
+	base     txpool.Reserver
+	existing map[common.Address]struct{}
+	acquired map[common.Address]struct{}
+}
+
+func (r *resetReserver) Hold(addr common.Address) error {
+	if r.base == nil {
+		return nil
+	}
+	if _, ok := r.existing[addr]; ok {
+		return nil
+	}
+	if err := r.base.Hold(addr); err != nil {
+		return err
+	}
+	r.acquired[addr] = struct{}{}
+	return nil
+}
+
+func (r *resetReserver) Release(addr common.Address) error {
+	if r.base == nil {
+		return nil
+	}
+	if _, ok := r.existing[addr]; ok {
+		return nil
+	}
+	delete(r.acquired, addr)
+	return r.base.Release(addr)
+}
+
+func (r *resetReserver) Has(addr common.Address) bool {
+	return r.base != nil && r.base.Has(addr)
+}
+
+func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash]frameTxMeta) {
+	resetCandidateMeter.Mark(int64(len(txs)))
 	sortResetTransactions(txs, oldMeta)
 	// revalidated counts full validation-prefix simulations. Transactions rejected
 	// by the payer solvency preflight are candidates and evictions, but not revalidations.
@@ -291,17 +374,6 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		resetRetainedMeter.Mark(retained)
 		resetEvictedMeter.Mark(int64(len(txs)) - retained)
 	}()
-	for addr := range p.pending {
-		if p.reserver != nil {
-			p.reserver.Release(addr)
-		}
-	}
-	p.pending = make(map[common.Address][]*types.Transaction)
-	p.all = make(map[common.Hash]*types.Transaction)
-	p.meta = make(map[common.Hash]frameTxMeta)
-	p.paymasterReserved = make(map[common.Address]*big.Int)
-	p.paymasterPending = make(map[common.Address]int)
-
 	for _, tx := range txs {
 		frameTx := tx.GetFrameTx()
 		if frameTx == nil {
@@ -311,10 +383,10 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 			continue
 		}
 		sender := frameTx.Sender
-		if err := validateFrameNonce(frameTx, statedb); err != nil {
+		if err := validateFrameNonce(frameTx, p.currentState); err != nil {
 			continue
 		}
-		if err := p.validateRecentRootReferences(frameTx, statedb, newHead); err != nil {
+		if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
 			continue
 		}
 		if len(p.pending[sender]) >= maxFrameTxsPerAccount {
@@ -325,7 +397,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 			continue
 		}
 		if p.selectiveRevalidation {
-			simulationTime := newHead.Time + params.SecondsPerSlot
+			simulationTime := p.currentHead.Time + params.SecondsPerSlot
 			if _, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime); err != nil {
 				continue
 			}
@@ -463,6 +535,9 @@ func (p *FramePool) cacheIncludedBlobSidecars(included types.Transactions, block
 
 // SetGasTip updates the minimum gas tip and evicts underpriced transactions.
 func (p *FramePool) SetGasTip(tip *big.Int) {
+	p.validationMu.Lock()
+	defer p.validationMu.Unlock()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1794,6 +1869,9 @@ func (p *FramePool) Status(hash common.Hash) txpool.TxStatus {
 
 // Clear removes all transactions from the pool.
 func (p *FramePool) Clear() {
+	p.validationMu.Lock()
+	defer p.validationMu.Unlock()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

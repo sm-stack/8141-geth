@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -574,6 +575,55 @@ func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 	pool.Reset(pool.currentHead, &newHead)
 	if pending, _ := pool.Stats(); pending != 0 {
 		t.Fatalf("expected expired tx to be dropped during reset, got %d pending", pending)
+	}
+}
+
+func TestFramePoolResetDoesNotHoldPoolLockDuringValidation(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx)
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("add frame transaction: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	pool.slotProvider = func(head *types.Header) vm.SlotProvider {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return vm.TimestampSlotProvider{Timestamp: head.Time}
+	}
+	newHead := types.CopyHeader(pool.currentHead)
+	newHead.Time++
+	done := make(chan struct{})
+	go func() {
+		pool.Reset(pool.currentHead, newHead)
+		close(done)
+	}()
+	<-entered
+
+	read := make(chan *types.Transaction, 1)
+	go func() { read <- pool.Get(tx.Hash()) }()
+	select {
+	case got := <-read:
+		close(release)
+		<-done
+		if got == nil {
+			t.Fatal("transaction disappeared while reset validation was in progress")
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("pool read blocked on reset validation")
 	}
 }
 
