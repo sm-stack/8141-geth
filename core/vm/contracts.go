@@ -177,23 +177,7 @@ var PrecompiledContractsP256Verify = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
 
-// PrecompiledContractsMLDSA contains the precompiled Ethereum contracts
-// specified in EIP-8051. This is exported for testing purposes.
-var PrecompiledContractsMLDSA = PrecompiledContracts{
-	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
-	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
-}
-
-// PrecompiledContractsAmsterdam contains the set of pre-compiled Ethereum
-// contracts used in the Amsterdam release.
-var PrecompiledContractsAmsterdam = func() PrecompiledContracts {
-	contracts := maps.Clone(PrecompiledContractsOsaka)
-	maps.Copy(contracts, PrecompiledContractsMLDSA)
-	return contracts
-}()
-
 var (
-	PrecompiledAddressesAmsterdam []common.Address
 	PrecompiledAddressesOsaka     []common.Address
 	PrecompiledAddressesPrague    []common.Address
 	PrecompiledAddressesCancun    []common.Address
@@ -225,9 +209,6 @@ func init() {
 	for k := range PrecompiledContractsOsaka {
 		PrecompiledAddressesOsaka = append(PrecompiledAddressesOsaka, k)
 	}
-	for k := range PrecompiledContractsAmsterdam {
-		PrecompiledAddressesAmsterdam = append(PrecompiledAddressesAmsterdam, k)
-	}
 }
 
 // activePrecompiledContracts returns a pointer to the precompile set variable
@@ -237,8 +218,6 @@ func activePrecompiledContracts(rules params.Rules) *PrecompiledContracts {
 	switch {
 	case rules.IsUBT:
 		return &PrecompiledContractsVerkle
-	case rules.IsAmsterdam:
-		return &PrecompiledContractsAmsterdam
 	case rules.IsBogota:
 		return &PrecompiledContractsOsaka
 	case rules.IsOsaka:
@@ -266,8 +245,6 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
-	case rules.IsAmsterdam:
-		return PrecompiledAddressesAmsterdam
 	case rules.IsBogota:
 		return PrecompiledAddressesOsaka
 	case rules.IsOsaka:
