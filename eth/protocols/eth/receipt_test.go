@@ -64,6 +64,19 @@ var receiptsTests = []struct {
 		txs:   []*types.Transaction{types.NewTx(&types.AccessListTx{})},
 	},
 	{
+		input: []types.ReceiptForStorage{{
+			CumulativeGasUsed: 555,
+			Payer:             common.Address{4},
+			FrameReceipts: []types.FrameReceipt{{
+				Status:  types.FrameReceiptStatusSuccessful,
+				GasUsed: types.FrameGasUsed{Execution: 123, State: 45},
+				Logs:    receiptsTestLogs2,
+			}},
+			Logs: receiptsTestLogs2,
+		}},
+		txs: []*types.Transaction{types.NewTx(&types.FrameTx{})},
+	},
+	{
 		input: []types.ReceiptForStorage{
 			{CumulativeGasUsed: 111, PostState: common.HexToHash("0x1111").Bytes(), Logs: receiptsTestLogs1},
 			{CumulativeGasUsed: 222, Status: 0, Logs: receiptsTestLogs2},

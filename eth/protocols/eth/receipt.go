@@ -37,7 +37,9 @@ type Receipt struct {
 
 func newReceipt(tr *types.Receipt) Receipt {
 	r := Receipt{TxType: tr.Type, GasUsed: tr.CumulativeGasUsed}
-	if tr.PostState != nil {
+	if tr.Type == types.FrameTxType {
+		r.PostStateOrStatus, _ = tr.MarshalBinary()
+	} else if tr.PostState != nil {
 		r.PostStateOrStatus = tr.PostState
 	} else {
 		r.PostStateOrStatus = new(big.Int).SetUint64(tr.Status).Bytes()
@@ -48,6 +50,12 @@ func newReceipt(tr *types.Receipt) Receipt {
 
 // encodeForHash encodes a receipt for the block receiptsRoot derivation.
 func (r *Receipt) encodeForHash(bloomBuf *[6]byte, out *bytes.Buffer) {
+	if r.TxType == types.FrameTxType {
+		if len(r.PostStateOrStatus) > 1 && r.PostStateOrStatus[0] == types.FrameTxType {
+			out.Write(r.PostStateOrStatus)
+		}
+		return
+	}
 	// For typed receipts, add the tx type.
 	if r.TxType != 0 {
 		out.WriteByte(r.TxType)
@@ -113,7 +121,7 @@ func (r *Receipt) decode(input []byte) error {
 	if err != nil {
 		return fmt.Errorf("invalid postStateOrStatus: %w", err)
 	}
-	if len(r.PostStateOrStatus) > 1 && len(r.PostStateOrStatus) != 32 {
+	if r.TxType != types.FrameTxType && len(r.PostStateOrStatus) > 1 && len(r.PostStateOrStatus) != 32 {
 		return fmt.Errorf("invalid postStateOrStatus length %d", len(r.PostStateOrStatus))
 	}
 
@@ -132,6 +140,25 @@ func (r *Receipt) decode(input []byte) error {
 		return fmt.Errorf("junk at end of receipt")
 	}
 	r.Logs = input
+	if r.TxType == types.FrameTxType {
+		var receipt types.Receipt
+		if err := receipt.UnmarshalBinary(r.PostStateOrStatus); err != nil {
+			return fmt.Errorf("invalid frame receipt payload: %w", err)
+		}
+		if receipt.Type != types.FrameTxType {
+			return fmt.Errorf("invalid frame receipt payload type %d", receipt.Type)
+		}
+		if receipt.CumulativeGasUsed != r.GasUsed {
+			return fmt.Errorf("frame receipt cumulative gas mismatch: payload %d, envelope %d", receipt.CumulativeGasUsed, r.GasUsed)
+		}
+		logs, err := rlp.EncodeToBytes(receipt.Logs)
+		if err != nil {
+			return fmt.Errorf("invalid frame receipt logs: %w", err)
+		}
+		if !bytes.Equal(logs, r.Logs) {
+			return fmt.Errorf("frame receipt logs mismatch")
+		}
+	}
 	return nil
 }
 
