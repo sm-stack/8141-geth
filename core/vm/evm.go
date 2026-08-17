@@ -135,6 +135,9 @@ type EVM struct {
 	// precompiles holds the precompiled contracts for the current epoch
 	precompiles map[common.Address]PrecompiledContract
 
+	// systemContracts holds fork-specific native system contract handlers.
+	systemContracts map[common.Address]nativeSystemContract
+
 	// jumpDests stores results of JUMPDEST analysis.
 	jumpDests JumpDestCache
 
@@ -165,6 +168,7 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 		arena:       newArena(),
 	}
 	evm.precompiles = *activePrecompiledContracts(evm.chainRules)
+	evm.systemContracts = activeNativeSystemContracts(evm.chainRules)
 
 	switch {
 	case evm.chainRules.IsBogota:
@@ -330,8 +334,8 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 	if !syscall {
 		evm.Context.Transfer(evm.StateDB, caller, addr, value, &evm.chainRules)
 	}
-	if evm.chainRules.IsBogota && addr == params.RecentRootAddress {
-		ret, gas, err = evm.callRecentRoot(caller, input, gas, value)
+	if systemContract, ok := evm.systemContracts[addr]; ok {
+		ret, gas, err = systemContract.Run(evm, caller, input, gas, value)
 		if err != nil {
 			evm.StateDB.RevertToSnapshot(snapshot)
 			evm.TxContext.FrameCtx.Restore(frameSnapshot)
@@ -371,40 +375,6 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		}
 	}
 	return ret, exitGas, err
-}
-
-func (evm *EVM) callRecentRoot(caller common.Address, input []byte, gas GasBudget, value *uint256.Int) ([]byte, GasBudget, error) {
-	if evm.readOnly {
-		return nil, gas, ErrWriteProtection
-	}
-	if len(input) != 64 || !value.IsZero() {
-		return nil, gas, ErrExecutionReverted
-	}
-	const hashGas = 3*params.Keccak256Gas + 9*params.Keccak256WordGas
-	if _, ok := gas.ChargeExecution(hashGas); !ok {
-		return nil, gas.ExitHalt(), ErrOutOfGas
-	}
-	salt := common.BytesToHash(input[:32])
-	root := common.BytesToHash(input[32:])
-	sourceID := types.RecentRootSourceID(caller, salt)
-	slot := evm.CurrentSlot()
-	key := types.RecentRootStorageKey(sourceID, slot)
-	entry := types.RecentRootEntryHash(sourceID, slot, root)
-
-	stack := evm.arena.stack()
-	defer stack.release()
-	stack.push(new(uint256.Int).SetBytes(entry[:]))
-	stack.push(new(uint256.Int).SetBytes(key[:]))
-	contract := NewContract(caller, params.RecentRootAddress, value, gas, evm.jumpDests)
-	cost, err := gasSStoreEIP3529(evm, contract, stack, nil, 0)
-	if err != nil {
-		return nil, gas.ExitHalt(), ErrOutOfGas
-	}
-	if _, ok := gas.Charge(cost); !ok {
-		return nil, gas.ExitHalt(), ErrOutOfGas
-	}
-	evm.StateDB.SetState(params.RecentRootAddress, key, entry)
-	return nil, gas, nil
 }
 
 // CallCode executes the contract associated with the addr with the given input
