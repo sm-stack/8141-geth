@@ -533,7 +533,7 @@ func (h *handler) BroadcastTransactions(txs types.Transactions) {
 	for _, tx := range txs {
 		var directSet map[*ethPeer]struct{}
 		switch {
-		case tx.Type() == types.BlobTxType:
+		case tx.BlobGas() > 0:
 			blobTxs++
 		case tx.Size() > txMaxBroadcastSize:
 			largeTxs++

@@ -52,7 +52,7 @@ func TestFrameOpcodeNames(t *testing.T) {
 
 func TestSigParamWithoutSignaturesHalts(t *testing.T) {
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-	evm.FrameCtx = &FrameContext{}
+	evm.TxContext.FrameCtx = &FrameContext{}
 
 	stack := newStackForTesting()
 	defer stack.release()
@@ -74,7 +74,7 @@ func TestSigParamWithoutSignaturesHalts(t *testing.T) {
 func TestFrameParamStatusOnlyPastFrames(t *testing.T) {
 	run := func(frameIndex, currentIndex uint64, results []uint8) (uint256.Int, error) {
 		evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-		evm.FrameCtx = &FrameContext{
+		evm.TxContext.FrameCtx = &FrameContext{
 			Frames:       make([]types.Frame, 3),
 			FrameIndex:   int(currentIndex),
 			FrameResults: results,
@@ -143,14 +143,10 @@ func TestTxParamKeyedNonceSelectors(t *testing.T) {
 		want     *uint256.Int
 	}{
 		{txParamNonce, uint256.NewInt(3)},
-		{txParamNonceKey0, uint256.NewInt(7)},
-		{txParamLegacyNonce, uint256.NewInt(19)},
-		{txParamNonceKeyCount, uint256.NewInt(2)},
-		{txParamNonceKeysHash, new(uint256.Int).SetBytes(fc.NonceKeysHash[:])},
 	}
 	for _, tt := range tests {
 		evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-		evm.FrameCtx = fc
+		evm.TxContext.FrameCtx = fc
 		stack := newStackForTesting()
 		stack.push(new(uint256.Int).SetUint64(tt.selector))
 		pc := uint64(0)
@@ -171,13 +167,13 @@ func TestRecentRootIntrospection(t *testing.T) {
 	if RECENTROOTREFLOAD != 0xb5 || RECENTROOTREFLOAD.String() != "RECENTROOTREFLOAD" {
 		t.Fatalf("unexpected recent-root opcode assignment: %#x %s", RECENTROOTREFLOAD, RECENTROOTREFLOAD)
 	}
-	if op := pragueInstructionSet[RECENTROOTREFLOAD]; op == nil || op.undefined || op.constantGas != GasQuickStep {
+	if op := bogotaInstructionSet[RECENTROOTREFLOAD]; op == nil || op.undefined || op.constantGas != GasQuickStep {
 		t.Fatalf("recent-root opcode not enabled with gas 3: %#v", op)
 	}
 	ref := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: 77, Root: common.HexToHash("0x5678")}
 	fc := &FrameContext{RecentRootRefs: []types.RecentRootRef{ref}}
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-	evm.FrameCtx = fc
+	evm.TxContext.FrameCtx = fc
 
 	stack := newStackForTesting()
 	stack.push(uint256.NewInt(txParamRecentRootRefCount))
@@ -230,7 +226,7 @@ func TestSigParamReturnsSignatureMetadata(t *testing.T) {
 	msg := common.HexToHash("0x1234").Bytes()
 	sigBytes := make([]byte, 65)
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-	evm.FrameCtx = &FrameContext{
+	evm.TxContext.FrameCtx = &FrameContext{
 		Signatures: []types.TxSignature{
 			{
 				Scheme:    types.SignatureSchemeSecp256k1,
@@ -271,7 +267,7 @@ func TestSigParamReturnsSignatureMetadata(t *testing.T) {
 
 func TestSigParamArbitrarySignatureCopy(t *testing.T) {
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-	evm.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{
+	evm.TxContext.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{
 		Scheme:    types.SignatureSchemeArbitrary,
 		Signature: []byte{0x11, 0x22, 0x33},
 	}}}
@@ -295,7 +291,7 @@ func TestSigParamArbitrarySignatureCopy(t *testing.T) {
 
 func TestSigParamArbitrarySignerHalts(t *testing.T) {
 	evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
-	evm.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeArbitrary}}}
+	evm.TxContext.FrameCtx = &FrameContext{Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeArbitrary}}}
 	stack := newStackForTesting()
 	defer stack.release()
 	stack.push(uint256.NewInt(sigParamSigner))

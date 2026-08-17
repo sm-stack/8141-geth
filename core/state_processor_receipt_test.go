@@ -32,7 +32,7 @@ func TestMakeFrameReceipts(t *testing.T) {
 	}
 	result := &ExecutionResult{
 		frameResults: []uint8{1, 3, 0, 1},
-		frameGasUsed: []uint64{11, 22},
+		frameGasUsed: []types.FrameGasUsed{{Execution: 11}, {Execution: 22}},
 		frameLogRange: []frameLogRange{
 			{start: 0, end: 1},
 			{start: 1, end: 3},
@@ -46,7 +46,7 @@ func TestMakeFrameReceipts(t *testing.T) {
 	if frames[0].Status != 1 || frames[1].Status != 3 || frames[2].Status != 0 || frames[3].Status != 1 {
 		t.Fatalf("unexpected frame statuses: %#v", frames)
 	}
-	if frames[0].GasUsed != 11 || frames[1].GasUsed != 22 || frames[2].GasUsed != 0 || frames[3].GasUsed != 0 {
+	if frames[0].GasUsed.Execution != 11 || frames[1].GasUsed.Execution != 22 || frames[2].GasUsed != (types.FrameGasUsed{}) || frames[3].GasUsed != (types.FrameGasUsed{}) {
 		t.Fatalf("unexpected frame gas usage: %#v", frames)
 	}
 	if !reflect.DeepEqual(frames[0].Logs, txLogs[0:1]) {

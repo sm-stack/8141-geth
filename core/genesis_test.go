@@ -233,16 +233,6 @@ func TestDeveloperGenesisIncludesFrameExpiryVerifier(t *testing.T) {
 	if !bytes.Equal(account.Code, params.FrameExpiryVerifierCode) {
 		t.Fatalf("expiry verifier code mismatch: got %x want %x", account.Code, params.FrameExpiryVerifierCode)
 	}
-	nonceManager, ok := genesis.Alloc[params.NonceManagerAddress]
-	if !ok {
-		t.Fatal("developer genesis missing nonce manager predeploy")
-	}
-	if nonceManager.Nonce != 1 {
-		t.Fatalf("nonce manager nonce: got %d want 1", nonceManager.Nonce)
-	}
-	if !bytes.Equal(nonceManager.Code, params.NonceManagerCode) {
-		t.Fatalf("nonce manager code mismatch: got %x want %x", nonceManager.Code, params.NonceManagerCode)
-	}
 }
 
 func TestDeveloperGenesisIncludesRecentRootContract(t *testing.T) {

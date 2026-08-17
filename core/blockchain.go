@@ -1453,7 +1453,7 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 		// contain a sidecar. While the sidecar does not affect the block hash
 		// or tx hash, sending blobs within a block is not allowed.
 		for txIndex, tx := range block.Transactions() {
-			if tx.Type() == types.BlobTxType && tx.BlobTxSidecar() != nil {
+			if tx.BlobGas() > 0 && tx.BlobTxSidecar() != nil {
 				return 0, fmt.Errorf("block #%d contains unexpected blob sidecar in tx at index %d", block.NumberU64(), txIndex)
 			}
 		}

@@ -39,7 +39,10 @@ func newRecentRootEVM(t *testing.T, timestamp uint64) (*vm.EVM, *state.StateDB) 
 	db.SetCode(params.RecentRootAddress, params.RecentRootCode, 0)
 	random := common.Hash{1}
 	ctx := vm.BlockContext{CanTransfer: CanTransfer, Transfer: Transfer, GetHash: func(uint64) common.Hash { return common.Hash{} }, BlockNumber: big.NewInt(1), Time: timestamp, BaseFee: big.NewInt(1), BlobBaseFee: big.NewInt(1), Difficulty: big.NewInt(0), Random: &random}
-	return vm.NewEVM(ctx, db, params.MergedTestChainConfig, vm.Config{}), db
+	config := *params.MergedTestChainConfig
+	bogotaTime := uint64(0)
+	config.BogotaTime = &bogotaTime
+	return vm.NewEVM(ctx, db, &config, vm.Config{}), db
 }
 
 func TestRecentRootNativeWriteLastWriteWins(t *testing.T) {

@@ -501,7 +501,12 @@ func opSstore(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		return nil, ErrWriteProtection
 	}
 	loc, val := scope.Stack.pop2()
-	evm.StateDB.SetState(scope.Contract.Address(), loc.Bytes32(), val.Bytes32())
+	address, slot, value := scope.Contract.Address(), loc.Bytes32(), val.Bytes32()
+	current, original := evm.StateDB.GetStateAndCommittedState(address, slot)
+	evm.StateDB.SetState(address, slot, value)
+	if evm.TxContext.FrameCtx != nil && original == (common.Hash{}) && current == (common.Hash{}) && value != (common.Hash{}) {
+		evm.TxContext.FrameCtx.recordStateGas(address, slot)
+	}
 	return nil, nil
 }
 

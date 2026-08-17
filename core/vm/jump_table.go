@@ -94,6 +94,7 @@ func validate(jt JumpTable) JumpTable {
 
 func newBogotaInstructionSet() JumpTable {
 	instructionSet := newAmsterdamInstructionSet()
+	enable8141(&instructionSet) // EIP-8141 Frame transaction opcodes
 	return validate(instructionSet)
 }
 
@@ -120,7 +121,6 @@ func newOsakaInstructionSet() JumpTable {
 func newPragueInstructionSet() JumpTable {
 	instructionSet := newCancunInstructionSet()
 	enable7702(&instructionSet) // EIP-7702 Setcode transaction type
-	enable8141(&instructionSet) // EIP-8141 Frame transaction opcodes
 	return validate(instructionSet)
 }
 

@@ -1077,8 +1077,6 @@ type RPCTransaction struct {
 	Hash                 common.Hash                  `json:"hash"`
 	Input                hexutil.Bytes                `json:"input"`
 	Nonce                *hexutil.Uint64              `json:"nonce,omitempty"`
-	NonceKeys            []*hexutil.Big               `json:"nonceKeys,omitempty"`
-	NonceSeq             *hexutil.Uint64              `json:"nonceSeq,omitempty"`
 	To                   *common.Address              `json:"to"`
 	TransactionIndex     *hexutil.Uint64              `json:"transactionIndex"`
 	Value                *hexutil.Big                 `json:"value"`
@@ -1189,12 +1187,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 
 	case types.FrameTxType:
 		frameTx := tx.GetFrameTx()
-		result.Nonce = nil
-		result.NonceKeys = make([]*hexutil.Big, len(frameTx.NonceKeys))
-		for i, key := range frameTx.NonceKeys {
-			result.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
-		}
-		result.NonceSeq = (*hexutil.Uint64)(&frameTx.NonceSeq)
+		result.Nonce = (*hexutil.Uint64)(&frameTx.NonceSeq)
 		result.ChainID = (*hexutil.Big)(tx.ChainId())
 		result.Sender = &frameTx.Sender
 		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
@@ -1641,7 +1634,7 @@ func MarshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 		fields["logs"] = []*types.Log{}
 	}
 
-	if tx.Type() == types.BlobTxType {
+	if tx.BlobGas() > 0 {
 		fields["blobGasUsed"] = hexutil.Uint64(receipt.BlobGasUsed)
 		fields["blobGasPrice"] = (*hexutil.Big)(receipt.BlobGasPrice)
 	}
@@ -1651,15 +1644,21 @@ func MarshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 		fields["payer"] = receipt.Payer
 		type frameReceiptJSON struct {
 			Status  hexutil.Uint64 `json:"status"`
-			GasUsed hexutil.Uint64 `json:"gasUsed"`
-			Logs    []*types.Log   `json:"logs"`
+			GasUsed struct {
+				Execution hexutil.Uint64 `json:"execution"`
+				State     hexutil.Uint64 `json:"state"`
+			} `json:"gasUsed"`
+			Logs []*types.Log `json:"logs"`
 		}
 		frs := make([]frameReceiptJSON, len(receipt.FrameReceipts))
 		for i, fr := range receipt.FrameReceipts {
 			frs[i] = frameReceiptJSON{
-				Status:  hexutil.Uint64(normalizeFrameReceiptStatus(fr.Status)),
-				GasUsed: hexutil.Uint64(fr.GasUsed),
-				Logs:    fr.Logs,
+				Status: hexutil.Uint64(normalizeFrameReceiptStatus(fr.Status)),
+				GasUsed: struct {
+					Execution hexutil.Uint64 `json:"execution"`
+					State     hexutil.Uint64 `json:"state"`
+				}{Execution: hexutil.Uint64(fr.GasUsed.Execution), State: hexutil.Uint64(fr.GasUsed.State)},
+				Logs: fr.Logs,
 			}
 			if frs[i].Logs == nil {
 				frs[i].Logs = []*types.Log{}

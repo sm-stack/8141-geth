@@ -27,6 +27,11 @@ import (
 
 var benchmarkPaymasterAuthShimRuntime = common.FromHex("0x361561004f57335f541461001257610082565b6044361461001f57610082565b5f3560e01c63da95ebf71461003357610082565b60043580156100825760015560243560025561a8c04201600355005b60015fb460011461005f57610082565b60025fb41561006d57610082565b5f5fb45f541461007c57610082565b60015f5faa5b5f5ffd")
 
+var (
+	benchmarkPaymasterAuthShimCodeHash      = common.HexToHash("0x0eaf76edbfffd6e5f136f53d137faabe417fc9cff28655308d6ed70d5ce9ea0b")
+	benchmarkPaymasterPendingWithdrawalSlot = common.Hash{31: 2}
+)
+
 const (
 	massInvalidationSignerKey  = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
 	massInvalidationPayerGas   = uint64(5_000)

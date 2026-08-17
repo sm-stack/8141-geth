@@ -63,6 +63,8 @@ var (
 // newFrameTestEnv creates a test EVM and state for frame transaction tests.
 func newFrameTestEnv() (*vm.EVM, *state.StateDB, *params.ChainConfig) {
 	config := *params.MergedTestChainConfig
+	zero := uint64(0)
+	config.BogotaTime = &zero
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 
 	random := common.Hash{0x01}
@@ -427,6 +429,7 @@ func TestFrameTxExpiryVerifierExpiredDeadlineFails(t *testing.T) {
 }
 
 func TestFrameTxKeyedNonceFirstUseGas(t *testing.T) {
+	t.Skip("keyed nonces were removed from the latest EIP-8141 draft")
 	evm, statedb, config := newFrameTestEnv()
 	sender := common.HexToAddress("0x1111")
 	key := uint256.NewInt(7)
@@ -448,7 +451,7 @@ func TestFrameTxKeyedNonceFirstUseGas(t *testing.T) {
 	}
 	first := run(0)
 	second := run(1)
-	if got, want := first.frameGasUsed[0]-second.frameGasUsed[0], params.KeyedNonceFirstUseGas; got != want {
+	if got, want := first.frameGasUsed[0].Execution-second.frameGasUsed[0].Execution, params.KeyedNonceFirstUseGas; got != want {
 		t.Fatalf("first-use gas delta = %d, want %d", got, want)
 	}
 	if got := statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(sender, key)).Big().Uint64(); got != 2 {
@@ -498,8 +501,8 @@ func TestFrameTxAtomicBatchFailureRollsBackAndSkips(t *testing.T) {
 	receipt := applyFrameTxAndReceipt(t, evm, statedb, config, tx)
 
 	assertFrameStatuses(t, receipt, []uint8{1, 1, 0, types.FrameReceiptStatusSkipped})
-	if got := receipt.FrameReceipts[3].GasUsed; got != 0 {
-		t.Fatalf("skipped frame gas used: got %d want 0", got)
+	if got := receipt.FrameReceipts[3].GasUsed; got != (types.FrameGasUsed{}) {
+		t.Fatalf("skipped frame gas used: got %v want 0", got)
 	}
 	if got := statedb.GetState(firstTarget, common.Hash{}); got != (common.Hash{}) {
 		t.Fatalf("first atomic frame storage was not rolled back: got %v", got)
@@ -536,7 +539,7 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 	sponsorBalBefore := statedb.GetBalance(sponsor).Clone()
 	ftx := &types.FrameTx{
 		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
-		NonceKeys: []*uint256.Int{uint256.NewInt(1), uint256.NewInt(2)},
+		NonceKeys: []*uint256.Int{new(uint256.Int)},
 		NonceSeq:  0,
 		Sender:    sender,
 		Frames: []types.Frame{
@@ -544,7 +547,7 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 			{Mode: types.FrameModeVerify, Flags: 1, Target: &sponsor, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeSender, Flags: types.FrameFlagAtomicBatch, Target: &failingTarget, GasLimit: 50000, Data: nil},
 			{Mode: types.FrameModeSender, Target: &skippedTarget, GasLimit: 50000, Data: nil},
-			{Mode: types.FrameModeSender, Target: &successTarget, GasLimit: 100000, Data: nil},
+			{Mode: types.FrameModeSender, Target: &successTarget, GasLimit: 100000, StateGasLimit: 100_000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -575,19 +578,52 @@ func TestFrameTxAtomicBatchPreservesApprovalEffects(t *testing.T) {
 			}
 		}
 	}
-	if got := statedb.GetNonce(sender); got != 0 {
-		t.Fatalf("sender account nonce: got %d, want 0", got)
-	}
-	for _, key := range ftx.NonceKeys {
-		if got := statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(sender, key)).Big().Uint64(); got != 1 {
-			t.Fatalf("keyed nonce %d after atomic rollback: got %d, want 1", key.Uint64(), got)
-		}
+	if got := statedb.GetNonce(sender); got != 1 {
+		t.Fatalf("sender account nonce: got %d, want 1", got)
 	}
 	if sponsorBalAfter := statedb.GetBalance(sponsor); sponsorBalAfter.Cmp(sponsorBalBefore) >= 0 {
 		t.Fatalf("sponsor balance should have paid gas: before=%s after=%s", sponsorBalBefore, sponsorBalAfter)
 	}
 	if got, want := statedb.GetState(successTarget, common.BytesToHash([]byte{0x01})), common.BytesToHash([]byte{0x02}); got != want {
 		t.Fatalf("post-batch SENDER frame storage: got %v, want %v", got, want)
+	}
+}
+
+func TestFrameTxStateGasRefundReturnsToCreatingFrame(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	evm.Context.CostPerStateByte = params.CostPerStateByte
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(target)
+	// SSTORE(0, CALLDATALOAD(0)); STOP.
+	statedb.SetCode(target, []byte{byte(vm.PUSH0), byte(vm.CALLDATALOAD), byte(vm.PUSH0), byte(vm.SSTORE), byte(vm.STOP)}, tracing.CodeChangeUnspecified)
+
+	nonzero := make([]byte, 32)
+	nonzero[31] = 1
+	stateLimit := uint64(params.StorageCreationSize * params.CostPerStateByte)
+	ftx := &types.FrameTx{
+		ChainID:   uint256.MustFromBig(config.ChainID),
+		NonceKeys: []*uint256.Int{new(uint256.Int)},
+		Sender:    sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveScopeMask, GasLimit: 50_000},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50_000, StateGasLimit: stateLimit, Data: nonzero},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50_000, Data: make([]byte, 32)},
+		},
+		GasTipCap:  new(uint256.Int),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	result, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.frameGasUsed[1].State != 0 || result.frameGasUsed[2].State != 0 {
+		t.Fatalf("state refund assigned to wrong frame: %#v", result.frameGasUsed)
 	}
 }
 

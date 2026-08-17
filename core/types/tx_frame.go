@@ -28,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	commonmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
@@ -77,15 +78,21 @@ const (
 
 // Frame represents a single execution frame in a frame transaction (EIP-8141).
 //
-// RLP encoding: [mode, flags, target, gas_limit, value, data]
+// RLP encoding: [mode, flags, target, [execution_gas_limit, state_gas_limit], value, data]
 // When target is nil, it resolves to tx.sender at execution time.
 type Frame struct {
-	Mode     uint8
-	Flags    uint8
-	Target   *common.Address // nil means tx.sender
-	GasLimit uint64
-	Value    *uint256.Int
-	Data     []byte
+	Mode          uint8
+	Flags         uint8
+	Target        *common.Address // nil means tx.sender
+	GasLimit      uint64          // execution gas limit
+	StateGasLimit uint64
+	Value         *uint256.Int
+	Data          []byte
+}
+
+type frameGasLimits struct {
+	Execution uint64
+	State     uint64
 }
 
 // EncodeRLP implements rlp.Encoder for Frame.
@@ -99,25 +106,27 @@ func (f *Frame) EncodeRLP(w io.Writer) error {
 	if value == nil {
 		value = new(uint256.Int)
 	}
-	return rlp.Encode(w, []any{f.Mode, f.Flags, target, f.GasLimit, value, f.Data})
+	limits := frameGasLimits{Execution: f.GasLimit, State: f.StateGasLimit}
+	return rlp.Encode(w, []any{f.Mode, f.Flags, target, limits, value, f.Data})
 }
 
 // DecodeRLP implements rlp.Decoder for Frame.
 func (f *Frame) DecodeRLP(s *rlp.Stream) error {
 	var dec struct {
-		Mode     uint8
-		Flags    uint8
-		Target   []byte
-		GasLimit uint64
-		Value    *uint256.Int
-		Data     []byte
+		Mode   uint8
+		Flags  uint8
+		Target []byte
+		Limits frameGasLimits
+		Value  *uint256.Int
+		Data   []byte
 	}
 	if err := s.Decode(&dec); err != nil {
 		return err
 	}
 	f.Mode = dec.Mode
 	f.Flags = dec.Flags
-	f.GasLimit = dec.GasLimit
+	f.GasLimit = dec.Limits.Execution
+	f.StateGasLimit = dec.Limits.State
 	f.Data = dec.Data
 	f.Value = new(uint256.Int)
 	if dec.Value != nil {
@@ -191,10 +200,8 @@ type RecentRootRef struct {
 
 // FrameTx implements the EIP-8141 frame transaction.
 //
-// RLP encoding:
-// [chain_id, nonce_keys, nonce_seq, sender, frames, signatures, max_priority_fee_per_gas, max_fee_per_gas,
-//
-//	max_fee_per_blob_gas, blob_versioned_hashes, recent_root_references]
+// RLP encoding: [chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes, recent_root_references]
+// where fees = [max_priority_fee_per_gas, max_fee_per_gas, max_fee_per_blob_gas].
 type FrameTx struct {
 	ChainID        *uint256.Int
 	NonceKeys      []*uint256.Int
@@ -202,15 +209,20 @@ type FrameTx struct {
 	Sender         common.Address
 	Frames         []Frame
 	Signatures     []TxSignature
-	GasTipCap      *uint256.Int  // max_priority_fee_per_gas
-	GasFeeCap      *uint256.Int  // max_fee_per_gas
-	BlobFeeCap     *uint256.Int  // max_fee_per_blob_gas
-	BlobHashes     []common.Hash // blob_versioned_hashes
+	GasTipCap      *uint256.Int   // max_priority_fee_per_gas
+	GasFeeCap      *uint256.Int   // max_fee_per_gas
+	BlobFeeCap     *uint256.Int   // max_fee_per_blob_gas
+	BlobHashes     []common.Hash  // blob_versioned_hashes
+	Sidecar        *BlobTxSidecar `rlp:"-"`
 	RecentRootRefs []RecentRootRef
 }
 
 // copy creates a deep copy of the transaction data and initializes all fields.
 func (tx *FrameTx) copy() TxData {
+	return tx.copyData(true)
+}
+
+func (tx *FrameTx) copyData(includeSidecar bool) *FrameTx {
 	cpy := &FrameTx{
 		NonceKeys:      make([]*uint256.Int, len(tx.NonceKeys)),
 		NonceSeq:       tx.NonceSeq,
@@ -232,11 +244,12 @@ func (tx *FrameTx) copy() TxData {
 	// Deep copy frames.
 	for i, f := range tx.Frames {
 		cpy.Frames[i] = Frame{
-			Mode:     f.Mode,
-			Flags:    f.Flags,
-			GasLimit: f.GasLimit,
-			Value:    new(uint256.Int),
-			Data:     common.CopyBytes(f.Data),
+			Mode:          f.Mode,
+			Flags:         f.Flags,
+			GasLimit:      f.GasLimit,
+			StateGasLimit: f.StateGasLimit,
+			Value:         new(uint256.Int),
+			Data:          common.CopyBytes(f.Data),
 		}
 		if f.Value != nil {
 			cpy.Frames[i].Value.Set(f.Value)
@@ -268,6 +281,9 @@ func (tx *FrameTx) copy() TxData {
 	}
 	if tx.BlobFeeCap != nil {
 		cpy.BlobFeeCap.Set(tx.BlobFeeCap)
+	}
+	if includeSidecar && tx.Sidecar != nil {
+		cpy.Sidecar = tx.Sidecar.Copy()
 	}
 	return cpy
 }
@@ -307,66 +323,155 @@ func (tx *FrameTx) rawSignatureValues() (v, r, s *big.Int) {
 // setSignatureValues is a no-op for frame transactions.
 func (tx *FrameTx) setSignatureValues(chainID, v, r, s *big.Int) {}
 
+func (tx *FrameTx) withoutSidecar() *FrameTx {
+	cpy := *tx
+	cpy.Sidecar = nil
+	return &cpy
+}
+
+func (tx *FrameTx) withSidecar(sidecar *BlobTxSidecar) *FrameTx {
+	cpy := *tx
+	cpy.Sidecar = sidecar
+	return &cpy
+}
+
 func (tx *FrameTx) encode(b *bytes.Buffer) error {
-	return rlp.Encode(b, &frameTxRLP{
-		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq,
-		Sender: tx.Sender, Frames: tx.Frames, Signatures: tx.Signatures,
-		GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,
-		BlobFeeCap: tx.BlobFeeCap, BlobHashes: tx.BlobHashes,
+	payload := tx.rlpPayload()
+	switch {
+	case tx.Sidecar == nil:
+		return rlp.Encode(b, payload)
+	case tx.Sidecar.Version == BlobSidecarVersion0:
+		return rlp.Encode(b, &frameTxWithBlobsV0{
+			FrameTx: payload, Blobs: tx.Sidecar.Blobs,
+			Commitments: tx.Sidecar.Commitments, Proofs: tx.Sidecar.Proofs,
+		})
+	case tx.Sidecar.Version == BlobSidecarVersion1:
+		return rlp.Encode(b, &frameTxWithBlobsV1{
+			FrameTx: payload, Version: tx.Sidecar.Version, Blobs: tx.Sidecar.Blobs,
+			Commitments: tx.Sidecar.Commitments, Proofs: tx.Sidecar.Proofs,
+		})
+	default:
+		return errors.New("unsupported sidecar version")
+	}
+}
+
+func (tx *FrameTx) rlpPayload() *frameTxRLP {
+	return &frameTxRLP{
+		ChainID: tx.ChainID, Nonce: tx.NonceSeq, Sender: tx.Sender,
+		Frames: tx.Frames, Signatures: tx.Signatures,
+		Fees:           frameTxFees{GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap, BlobFeeCap: tx.BlobFeeCap},
+		BlobHashes:     tx.BlobHashes,
 		RecentRootRefs: tx.RecentRootRefs,
-	})
+	}
 }
 
 func (tx *FrameTx) decode(input []byte) error {
-	var dec frameTxRLP
-	if err := rlp.DecodeBytes(input, &dec); err != nil {
+	tx.Sidecar = nil
+	firstElem, _, err := rlp.SplitList(input)
+	if err != nil {
 		return err
 	}
-	tx.ChainID, tx.NonceKeys, tx.NonceSeq = dec.ChainID, dec.NonceKeys, dec.NonceSeq
+	firstKind, _, rest, err := rlp.Split(firstElem)
+	if err != nil {
+		return err
+	}
+	var dec frameTxRLP
+	if firstKind != rlp.List {
+		if err := rlp.DecodeBytes(input, &dec); err != nil {
+			return err
+		}
+	} else {
+		secondKind, _, _, err := rlp.Split(rest)
+		if err != nil {
+			return err
+		}
+		sidecar := new(BlobTxSidecar)
+		if secondKind == rlp.List {
+			var wrapped frameTxWithBlobsV0
+			if err := rlp.DecodeBytes(input, &wrapped); err != nil {
+				return err
+			}
+			dec = *wrapped.FrameTx
+			sidecar.Version = BlobSidecarVersion0
+			sidecar.Blobs, sidecar.Commitments, sidecar.Proofs = wrapped.Blobs, wrapped.Commitments, wrapped.Proofs
+		} else {
+			var wrapped frameTxWithBlobsV1
+			if err := rlp.DecodeBytes(input, &wrapped); err != nil {
+				return err
+			}
+			if wrapped.Version != BlobSidecarVersion1 {
+				return fmt.Errorf("unsupported blob tx version %d", wrapped.Version)
+			}
+			dec = *wrapped.FrameTx
+			sidecar.Version = wrapped.Version
+			sidecar.Blobs, sidecar.Commitments, sidecar.Proofs = wrapped.Blobs, wrapped.Commitments, wrapped.Proofs
+		}
+		tx.Sidecar = sidecar
+	}
+	tx.ChainID, tx.NonceSeq = dec.ChainID, dec.Nonce
+	tx.NonceKeys = []*uint256.Int{new(uint256.Int)}
 	tx.Sender, tx.Frames, tx.Signatures = dec.Sender, dec.Frames, dec.Signatures
-	tx.GasTipCap, tx.GasFeeCap = dec.GasTipCap, dec.GasFeeCap
-	tx.BlobFeeCap, tx.BlobHashes = dec.BlobFeeCap, dec.BlobHashes
+	tx.GasTipCap, tx.GasFeeCap, tx.BlobFeeCap = dec.Fees.GasTipCap, dec.Fees.GasFeeCap, dec.Fees.BlobFeeCap
+	tx.BlobHashes = dec.BlobHashes
 	tx.RecentRootRefs = dec.RecentRootRefs
 	return tx.Validate()
 }
 
 type frameTxRLP struct {
 	ChainID        *uint256.Int
-	NonceKeys      []*uint256.Int
-	NonceSeq       uint64
+	Nonce          uint64
 	Sender         common.Address
 	Frames         []Frame
 	Signatures     []TxSignature
-	GasTipCap      *uint256.Int
-	GasFeeCap      *uint256.Int
-	BlobFeeCap     *uint256.Int
+	Fees           frameTxFees
 	BlobHashes     []common.Hash
 	RecentRootRefs []RecentRootRef
 }
 
-// rlpFramesData returns the RLP-encoded frames as a byte slice.
-func (tx *FrameTx) rlpFramesData() []byte {
-	var buf bytes.Buffer
-	rlp.Encode(&buf, tx.Frames)
-	return buf.Bytes()
+type frameTxWithBlobsV0 struct {
+	FrameTx     *frameTxRLP
+	Blobs       []kzg4844.Blob
+	Commitments []kzg4844.Commitment
+	Proofs      []kzg4844.Proof
 }
 
-// rlpSignaturesData returns the RLP-encoded signatures as a byte slice.
-func (tx *FrameTx) rlpSignaturesData() []byte {
-	var buf bytes.Buffer
-	rlp.Encode(&buf, tx.Signatures)
-	return buf.Bytes()
+type frameTxWithBlobsV1 struct {
+	FrameTx     *frameTxRLP
+	Version     byte
+	Blobs       []kzg4844.Blob
+	Commitments []kzg4844.Commitment
+	Proofs      []kzg4844.Proof
 }
 
+type frameTxFees struct {
+	GasTipCap  *uint256.Int
+	GasFeeCap  *uint256.Int
+	BlobFeeCap *uint256.Int
+}
+
+// rlpRecentRootRefsData returns the EIP-8272 reference list encoding.
 func (tx *FrameTx) rlpRecentRootRefsData() []byte {
 	var buf bytes.Buffer
 	rlp.Encode(&buf, tx.RecentRootRefs)
 	return buf.Bytes()
 }
 
-// frameTxCalldataBytes returns the byte blobs charged as frame tx data.
+// frameTxCalldataBytes returns the raw byte strings charged as frame tx data.
 func (tx *FrameTx) frameTxCalldataBytes() [][]byte {
-	return [][]byte{tx.rlpFramesData(), tx.rlpRecentRootRefsData(), tx.rlpSignaturesData()}
+	chunks := make([][]byte, 0, len(tx.Frames)+3*len(tx.Signatures)+1)
+	for i := range tx.Frames {
+		chunks = append(chunks, tx.Frames[i].Data)
+	}
+	for i := range tx.Signatures {
+		sig := &tx.Signatures[i]
+		var signer []byte
+		if sig.signerPresent || sig.Signer != (common.Address{}) {
+			signer = sig.Signer[:]
+		}
+		chunks = append(chunks, signer, sig.Msg, sig.Signature)
+	}
+	chunks = append(chunks, tx.rlpRecentRootRefsData())
+	return chunks
 }
 
 func countZeroNonZero(chunks ...[]byte) (uint64, uint64) {
@@ -430,16 +535,19 @@ func (tx *FrameTx) fixedGas() (uint64, error) {
 			return 0, errFrameGasUintOverflow
 		}
 	}
+	for _, frame := range tx.Frames {
+		value := frame.Value
+		if value != nil && !value.IsZero() && frame.Target != nil && *frame.Target != tx.Sender {
+			if total, overflow = commonmath.SafeAdd(total, params.TxValueCost2780); overflow {
+				return 0, errFrameGasUintOverflow
+			}
+		}
+	}
 	return total, nil
 }
 
-// CalldataGas returns the EIP-7623 calldata cost of the RLP-encoded frames,
-// recent-root references, and signatures.
-//
-// Per EIP-8141:
-//
-//	calldata_cost(rlp(tx.frames) || rlp(tx.recent_root_references))
-//	+ calldata_cost(rlp(tx.signatures))
+// CalldataGas returns the standard calldata cost of frame data and signature
+// byte strings. Zero bytes cost 4 and non-zero bytes cost 16.
 //
 // Returns errFrameGasUintOverflow if the result would exceed uint64.
 func (tx *FrameTx) CalldataGas() (uint64, error) {
@@ -452,10 +560,10 @@ func (tx *FrameTx) CalldataGas() (uint64, error) {
 		return 0, errFrameGasUintOverflow
 	}
 	tokens := nzTokens + z
-	if tokens > 0 && (math.MaxUint64/params.TxCostFloorPerToken) < tokens {
+	if tokens > 0 && (math.MaxUint64/params.TxDataZeroGas) < tokens {
 		return 0, errFrameGasUintOverflow
 	}
-	return tokens * params.TxCostFloorPerToken, nil
+	return tokens * params.TxDataZeroGas, nil
 }
 
 // IntrinsicGas returns the non-frame-execution gas charged by a frame
@@ -463,10 +571,9 @@ func (tx *FrameTx) CalldataGas() (uint64, error) {
 //
 //	FRAME_TX_INTRINSIC_COST
 //	+ len(frames) * FRAME_TX_PER_FRAME_COST
-//	+ calldata_cost(rlp(signatures))
-//	+ calldata_cost(rlp(frames))
+//	+ calldata_cost(frame and signature byte strings)
 //	+ signature_verification_cost
-//	+ (refs > 0 ? RECENT_ROOT_BASE_GAS + refs * RECENT_ROOT_PER_REF_GAS : 0)
+//	+ value_transfer_cost
 func (tx *FrameTx) IntrinsicGas() (uint64, error) {
 	total, err := tx.fixedGas()
 	if err != nil {
@@ -488,11 +595,10 @@ func (tx *FrameTx) IntrinsicGas() (uint64, error) {
 //
 //	FRAME_TX_INTRINSIC_COST
 //	+ len(frames) * FRAME_TX_PER_FRAME_COST
-//	+ calldata_cost(rlp(signatures))
-//	+ calldata_cost(rlp(frames))
+//	+ calldata_cost(frame and signature byte strings)
 //	+ signature_verification_cost
-//	+ (refs > 0 ? RECENT_ROOT_BASE_GAS + refs * RECENT_ROOT_PER_REF_GAS : 0)
-//	+ sum(frame.gas_limit)
+//	+ value_transfer_cost
+//	+ sum(frame execution and state gas limits)
 //
 // On overflow, math.MaxUint64 is returned; callers relying on this value for
 // gas pool or block limit checks will reject the transaction appropriately.
@@ -501,20 +607,51 @@ func (tx *FrameTx) TotalGas() uint64 {
 	if err != nil {
 		return math.MaxUint64
 	}
+	stateGas := uint64(0)
 	for _, f := range tx.Frames {
 		var overflow bool
 		if total, overflow = commonmath.SafeAdd(total, f.GasLimit); overflow {
 			return math.MaxUint64
 		}
+		if stateGas, overflow = commonmath.SafeAdd(stateGas, f.StateGasLimit); overflow {
+			return math.MaxUint64
+		}
 	}
-	return total
+	floor, err := tx.FloorDataGas()
+	if err != nil {
+		return math.MaxUint64
+	}
+	if floor > total {
+		total = floor
+	}
+	sum, overflow := commonmath.SafeAdd(total, stateGas)
+	if overflow {
+		return math.MaxUint64
+	}
+	return sum
 }
 
 // FloorDataGas returns the EIP-7623 floor data gas for a frame transaction.
-// EIP-8141 charges frame calldata with EIP-7623 rules up front, so the floor
-// matches the full intrinsic metadata gas.
 func (tx *FrameTx) FloorDataGas() (uint64, error) {
-	return tx.IntrinsicGas()
+	total, err := tx.fixedGas()
+	if err != nil {
+		return 0, err
+	}
+	z, nz := countZeroNonZero(tx.frameTxCalldataBytes()...)
+	if nz > 0 && math.MaxUint64/params.TxTokenPerNonZeroByte < nz {
+		return 0, errFrameGasUintOverflow
+	}
+	tokens := z + nz*params.TxTokenPerNonZeroByte
+	floorPerToken := params.TxCostFloorPerToken7976
+	if tokens > 0 && math.MaxUint64/floorPerToken < tokens {
+		return 0, errFrameGasUintOverflow
+	}
+	floor := tokens * floorPerToken
+	if sum, overflow := commonmath.SafeAdd(total, floor); overflow {
+		return 0, errFrameGasUintOverflow
+	} else {
+		return sum, nil
+	}
 }
 
 // SigHash returns the exported signature hash for the frame transaction.
@@ -570,8 +707,8 @@ func (tx *FrameTx) Validate() error {
 	if tx.BlobFeeCap == nil {
 		return errors.New("frame tx missing max_fee_per_blob_gas")
 	}
-	if err := ValidateNonceKeys(tx.NonceKeys); err != nil {
-		return err
+	if len(tx.NonceKeys) != 1 || tx.NonceKeys[0] == nil || !tx.NonceKeys[0].IsZero() {
+		return errors.New("frame tx uses obsolete keyed nonce encoding")
 	}
 	if len(tx.RecentRootRefs) > params.MaxRecentRootReferences {
 		return fmt.Errorf("frame tx has %d recent root references, max %d", len(tx.RecentRootRefs), params.MaxRecentRootReferences)
@@ -588,8 +725,9 @@ func (tx *FrameTx) Validate() error {
 		}
 	}
 	var (
-		totalFrameGas uint64
-		expiryFrames  int
+		totalFrameGas     uint64
+		totalExecutionGas uint64
+		expiryFrames      int
 	)
 	for i, frame := range tx.Frames {
 		if frame.Mode > FrameModeSender {
@@ -616,8 +754,20 @@ func (tx *FrameTx) Validate() error {
 				return fmt.Errorf("frame %d atomic batch includes VERIFY frame %d", i, i+1)
 			}
 		}
+		if frame.Flags&FrameFlagAtomicBatch != 0 || i > 0 && tx.Frames[i-1].Flags&FrameFlagAtomicBatch != 0 {
+			if frame.Flags&FrameFlagApproveScopeMask != 0 {
+				return fmt.Errorf("atomic batch frame %d has approval scope flags", i)
+			}
+		}
 		var overflow bool
-		if totalFrameGas, overflow = commonmath.SafeAdd(totalFrameGas, frame.GasLimit); overflow {
+		if totalExecutionGas, overflow = commonmath.SafeAdd(totalExecutionGas, frame.GasLimit); overflow {
+			return errFrameGasUintOverflow
+		}
+		frameTotal, overflow := commonmath.SafeAdd(frame.GasLimit, frame.StateGasLimit)
+		if overflow {
+			return errFrameGasUintOverflow
+		}
+		if totalFrameGas, overflow = commonmath.SafeAdd(totalFrameGas, frameTotal); overflow {
 			return errFrameGasUintOverflow
 		}
 		target := tx.Sender
@@ -635,6 +785,9 @@ func (tx *FrameTx) Validate() error {
 			if !value.IsZero() {
 				return fmt.Errorf("expiry verifier frame %d has nonzero value", i)
 			}
+			if frame.StateGasLimit != 0 {
+				return fmt.Errorf("expiry verifier frame %d has nonzero state gas limit", i)
+			}
 			if len(frame.Data) != params.FrameExpiryDataLength {
 				return fmt.Errorf("expiry verifier frame %d has data length %d, want %d", i, len(frame.Data), params.FrameExpiryDataLength)
 			}
@@ -642,6 +795,18 @@ func (tx *FrameTx) Validate() error {
 				return errors.New("frame tx has multiple expiry verifier frames")
 			}
 		}
+	}
+	intrinsic, err := tx.IntrinsicGas()
+	if err != nil {
+		return err
+	}
+	floor, err := tx.FloorDataGas()
+	if err != nil {
+		return err
+	}
+	executionLimit, overflow := commonmath.SafeAdd(intrinsic, totalExecutionGas)
+	if overflow || max(executionLimit, floor) > params.MaxTxGas {
+		return fmt.Errorf("frame tx execution gas exceeds cap %d", params.MaxTxGas)
 	}
 	return nil
 }

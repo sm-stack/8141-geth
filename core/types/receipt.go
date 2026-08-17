@@ -108,7 +108,7 @@ type receiptMarshaling struct {
 
 type frameReceiptMarshaling struct {
 	Status  hexutil.Uint64
-	GasUsed hexutil.Uint64
+	GasUsed FrameGasUsed
 	Logs    []*Log
 }
 
@@ -123,15 +123,21 @@ type receiptRLP struct {
 // FrameReceipt represents the results of a single frame execution.
 // For frame transactions, receipts are a list of these entries.
 type FrameReceipt struct {
-	Status  uint8  `json:"status"`
-	GasUsed uint64 `json:"gasUsed"`
-	Logs    []*Log `json:"logs"`
+	Status  uint8        `json:"status"`
+	GasUsed FrameGasUsed `json:"gasUsed"`
+	Logs    []*Log       `json:"logs"`
+}
+
+// FrameGasUsed is the two-dimensional gas usage of a frame.
+type FrameGasUsed struct {
+	Execution uint64 `json:"execution"`
+	State     uint64 `json:"state"`
 }
 
 // frameReceiptRLP is the consensus encoding of a frame receipt entry.
 type frameReceiptRLP struct {
 	Status  uint8
-	GasUsed uint64
+	GasUsed FrameGasUsed
 	Logs    []*Log
 }
 
@@ -422,7 +428,7 @@ func (r *Receipt) DeriveFields(signer Signer, context DeriveReceiptContext) {
 	r.EffectiveGasPrice = context.Tx.inner.effectiveGasPrice(new(big.Int), context.BaseFee)
 
 	// EIP-4844 blob transaction fields
-	if context.Tx.Type() == BlobTxType {
+	if context.Tx.BlobGas() > 0 {
 		r.BlobGasUsed = context.Tx.BlobGas()
 		r.BlobGasPrice = context.BlobGasPrice
 	}
@@ -462,22 +468,25 @@ type ReceiptForStorage Receipt
 // EncodeRLP implements rlp.Encoder, and flattens all content fields of a receipt
 // into an RLP stream.
 func (r *ReceiptForStorage) EncodeRLP(_w io.Writer) error {
+	statusEncoding := (*Receipt)(r).statusEncoding()
+	logs := r.Logs
 	if r.Type == FrameTxType {
-		buf := encodeBufferPool.Get().(*bytes.Buffer)
-		defer encodeBufferPool.Put(buf)
-		buf.Reset()
+		var buf bytes.Buffer
 		buf.WriteByte(FrameTxType)
-		if err := rlp.Encode(buf, (*Receipt)(r).framePayload()); err != nil {
+		if err := rlp.Encode(&buf, (*Receipt)(r).framePayload()); err != nil {
 			return err
 		}
-		return rlp.Encode(_w, buf.Bytes())
+		statusEncoding = buf.Bytes()
+		if logs == nil {
+			logs = flattenFrameLogs(r.FrameReceipts)
+		}
 	}
 	w := rlp.NewEncoderBuffer(_w)
 	outerList := w.List()
-	w.WriteBytes((*Receipt)(r).statusEncoding())
+	w.WriteBytes(statusEncoding)
 	w.WriteUint64(r.CumulativeGasUsed)
 	logList := w.List()
-	for _, log := range r.Logs {
+	for _, log := range logs {
 		if err := log.EncodeRLP(w); err != nil {
 			return err
 		}
@@ -498,6 +507,15 @@ func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
 		var stored storedReceiptRLP
 		if err := s.Decode(&stored); err != nil {
 			return err
+		}
+		if len(stored.PostStateOrStatus) > 1 && stored.PostStateOrStatus[0] == FrameTxType {
+			var frame frameReceiptPayload
+			if err := rlp.DecodeBytes(stored.PostStateOrStatus[1:], &frame); err != nil {
+				return err
+			}
+			r.Type = FrameTxType
+			(*Receipt)(r).setFromFrameRLP(frame)
+			return nil
 		}
 		r.Type = LegacyTxType
 		if err := (*Receipt)(r).setStatus(stored.PostStateOrStatus); err != nil {

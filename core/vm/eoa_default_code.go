@@ -37,39 +37,35 @@ const (
 //
 // Returns the return data, leftover gas, and any error.
 func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, input []byte, gas uint64, frameMode uint8) ([]byte, uint64, error) {
+	ret, budget, err := ExecuteDefaultCodeWithGasBudget(evm, caller, target, input, NewGasBudget(gas, 0), frameMode)
+	return ret, budget.ExecutionGas, err
+}
+
+// ExecuteDefaultCodeWithGasBudget is the two-dimensional variant used by frame
+// transaction execution.
+func ExecuteDefaultCodeWithGasBudget(evm *EVM, caller common.Address, target common.Address, input []byte, gas GasBudget, frameMode uint8) ([]byte, GasBudget, error) {
 	switch frameMode {
 	case types.FrameModeVerify:
-		return executeDefaultVerify(evm, target, gas)
+		if !gas.ChargeExecutionOnly(defaultCodeBaseGas) {
+			return nil, gas.ExitHalt(), ErrOutOfGas
+		}
+		approveScope, ok := defaultCodeTxSignatureApproveScope(evm.TxContext.FrameCtx, target)
+		if !ok {
+			return nil, gas.ExitRevert(), ErrExecutionReverted
+		}
+		if _, _, err := applyDefaultApprove(evm, target, approveScope, gas.ExecutionGas); err != nil {
+			return nil, gas.ExitRevert(), err
+		}
+		return nil, gas, nil
 	case types.FrameModeSender, types.FrameModeDefault:
 		return nil, gas, nil
 	default:
-		return nil, gas, ErrExecutionReverted
+		return nil, gas.ExitRevert(), ErrExecutionReverted
 	}
-}
-
-// executeDefaultVerify implements the VERIFY mode of the EOA default code.
-// Transaction-level signatures are validated before execution; this path only
-// checks that a matching empty-msg protocol-supported signature is present.
-func executeDefaultVerify(evm *EVM, target common.Address, gas uint64) ([]byte, uint64, error) {
-	fc := evm.FrameCtx
-	if fc == nil {
-		return nil, gas, ErrExecutionReverted
-	}
-
-	approveScope, ok := defaultCodeTxSignatureApproveScope(fc, target)
-	if !ok {
-		return nil, gas, ErrExecutionReverted
-	}
-
-	if gas < defaultCodeBaseGas {
-		return nil, 0, ErrOutOfGas
-	}
-	gas -= defaultCodeBaseGas
-	return applyDefaultApprove(evm, target, approveScope, gas)
 }
 
 func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address) (uint8, bool) {
-	if fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
+	if fc == nil || fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
 		return 0, false
 	}
 	allowedScope := fc.Frames[fc.FrameIndex].Flags & types.FrameFlagApproveScopeMask
@@ -98,7 +94,7 @@ func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint6
 		return nil, gas, ErrExecutionReverted
 	}
 
-	fc := evm.FrameCtx
+	fc := evm.TxContext.FrameCtx
 	if fc == nil {
 		return nil, gas, ErrExecutionReverted
 	}
@@ -107,6 +103,6 @@ func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint6
 		return nil, gas, ErrExecutionReverted
 	}
 
-	evm.ApproveScope = scope
+	evm.TxContext.ApproveScope = scope
 	return nil, gas, nil
 }

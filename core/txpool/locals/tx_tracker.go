@@ -86,7 +86,7 @@ func (tracker *TxTracker) TrackAll(txs []*types.Transaction) {
 	defer tracker.mu.Unlock()
 
 	for _, tx := range txs {
-		if tx.Type() == types.BlobTxType {
+		if tx.BlobGas() > 0 {
 			continue
 		}
 		// If we're already tracking it, it's a no-op

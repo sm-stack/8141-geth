@@ -486,7 +486,10 @@ func (tx *Transaction) BlobHashes() []common.Hash {
 
 // BlobTxSidecar returns the sidecar of a blob transaction, nil otherwise.
 func (tx *Transaction) BlobTxSidecar() *BlobTxSidecar {
-	if blobtx, ok := tx.inner.(*BlobTx); ok {
+	switch blobtx := tx.inner.(type) {
+	case *BlobTx:
+		return blobtx.Sidecar
+	case *FrameTx:
 		return blobtx.Sidecar
 	}
 	return nil
@@ -504,17 +507,26 @@ func (tx *Transaction) BlobGasFeeCapIntCmp(other *big.Int) int {
 
 // WithoutBlobTxSidecar returns a copy of tx with the blob sidecar removed.
 func (tx *Transaction) WithoutBlobTxSidecar() *Transaction {
-	blobtx, ok := tx.inner.(*BlobTx)
-	if !ok || blobtx.Sidecar == nil {
+	sidecar := tx.BlobTxSidecar()
+	if sidecar == nil {
+		return tx
+	}
+	var inner TxData
+	switch blobtx := tx.inner.(type) {
+	case *BlobTx:
+		inner = blobtx.withoutSidecar()
+	case *FrameTx:
+		inner = blobtx.withoutSidecar()
+	default:
 		return tx
 	}
 	cpy := &Transaction{
-		inner: blobtx.withoutSidecar(),
+		inner: inner,
 		time:  tx.time,
 	}
 	if size := tx.size.Load(); size != 0 {
 		// The tx had a sidecar before, so we need to subtract it from the size.
-		scSize := rlp.ListSize(blobtx.Sidecar.encodedSize())
+		scSize := rlp.ListSize(sidecar.encodedSize())
 		cpy.size.Store(size - scSize)
 	}
 	if h := tx.hash.Load(); h != nil {
@@ -528,12 +540,17 @@ func (tx *Transaction) WithoutBlobTxSidecar() *Transaction {
 
 // WithBlobTxSidecar returns a copy of tx with the blob sidecar added.
 func (tx *Transaction) WithBlobTxSidecar(sideCar *BlobTxSidecar) *Transaction {
-	blobtx, ok := tx.inner.(*BlobTx)
-	if !ok {
+	var inner TxData
+	switch blobtx := tx.inner.(type) {
+	case *BlobTx:
+		inner = blobtx.withSidecar(sideCar)
+	case *FrameTx:
+		inner = blobtx.withSidecar(sideCar)
+	default:
 		return tx
 	}
 	cpy := &Transaction{
-		inner: blobtx.withSidecar(sideCar),
+		inner: inner,
 		time:  tx.time,
 	}
 	// Note: tx.size cache not carried over because the sidecar is included in size!
@@ -590,15 +607,16 @@ func (tx *Transaction) FrameSender() common.Address {
 // Frames returns the frame list of a frame transaction, nil otherwise.
 func (tx *Transaction) Frames() []Frame {
 	if ftx, ok := tx.inner.(*FrameTx); ok {
-		return ftx.Frames
+		return ftx.copyData(false).Frames
 	}
 	return nil
 }
 
-// GetFrameTx returns the inner FrameTx data if this is a frame transaction, nil otherwise.
+// GetFrameTx returns a deep copy of the frame transaction data, or nil for
+// other transaction types. Mutating the result does not mutate tx.
 func (tx *Transaction) GetFrameTx() *FrameTx {
 	if ftx, ok := tx.inner.(*FrameTx); ok {
-		return ftx
+		return ftx.copyData(false)
 	}
 	return nil
 }

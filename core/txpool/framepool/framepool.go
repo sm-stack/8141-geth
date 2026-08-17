@@ -29,6 +29,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	commonmath "github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/txpool"
@@ -85,22 +86,16 @@ var (
 	// canonicalPaymasterCodeHash is keccak256(CanonicalPaymaster runtime bytecode),
 	// compiled by contracts with the pinned EIP-8141 Solidity compiler.
 	canonicalPaymasterCodeHash = common.HexToHash("0x6c30f5865065de960a498c71c875f58fc0817d3b5c93819def154c652ba80435")
-	// benchmarkPaymasterAuthShimCodeHash recognizes the research-only runtime
-	// that preserves the official withdrawal and signature metadata semantics.
-	// It must never ship in a production client.
-	benchmarkPaymasterAuthShimCodeHash = common.HexToHash("0x0eaf76edbfffd6e5f136f53d137faabe417fc9cff28655308d6ed70d5ce9ea0b")
-
 	// The original PoC CanonicalPaymaster fixes pending withdrawal amount at
-	// storage slot 1. The benchmark shim mirrors the latest EIP asset layout,
-	// where pendingWithdrawalTo occupies slot 1 and the amount occupies slot 2.
+	// storage slot 1.
 	canonicalPaymasterPendingWithdrawalSlot = common.Hash{31: 1}
-	benchmarkPaymasterPendingWithdrawalSlot = common.Hash{31: 2}
 )
 
 // BlockChain defines the blockchain interface needed by the frame pool.
 type BlockChain interface {
 	Config() *params.ChainConfig
 	CurrentBlock() *types.Header
+	GetBlock(hash common.Hash, number uint64) *types.Block
 	StateAt(header *types.Header) (*state.StateDB, error)
 }
 
@@ -120,9 +115,11 @@ type FramePool struct {
 	payerSolvencyPreflight     bool
 	payerCodeIdentityPreflight bool
 	selectiveRevalidation      bool
+	canonicalPaymasters        map[common.Hash]common.Hash
 
 	reserver txpool.Reserver
 
+	validationMu   sync.Mutex
 	mu             sync.RWMutex
 	pending        map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
 	all            map[common.Hash]*types.Transaction      // hash → tx
@@ -181,6 +178,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		payerSolvencyPreflight:     config.PayerSolvencyPreflight,
 		payerCodeIdentityPreflight: config.PayerCodeIdentityPreflight,
 		selectiveRevalidation:      config.SelectiveRevalidation,
+		canonicalPaymasters:        make(map[common.Hash]common.Hash),
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
 		meta:                       make(map[common.Hash]frameTxMeta),
@@ -226,6 +224,8 @@ func (p *FramePool) Close() error { return nil }
 
 // Reset updates the pool state when the chain head changes.
 func (p *FramePool) Reset(oldHead, newHead *types.Header) {
+	p.validationMu.Lock()
+	defer p.validationMu.Unlock()
 	resetRunMeter.Mark(1)
 	resetStart := time.Now()
 	defer func() {
@@ -234,6 +234,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		resetLastTimeGauge.Update(elapsed.Nanoseconds())
 	}()
 
+	reinject := p.reorgTransactions(oldHead, newHead)
 	statedb, err := p.chain.StateAt(newHead)
 	if err != nil {
 		log.Error("Failed to reset frame pool state", "err", err)
@@ -246,8 +247,17 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	p.currentState = statedb
 
 	var txs []*types.Transaction
+	seen := make(map[common.Hash]struct{})
 	for _, senderTxs := range p.pending {
-		txs = append(txs, senderTxs...)
+		for _, tx := range senderTxs {
+			txs = append(txs, tx)
+			seen[tx.Hash()] = struct{}{}
+		}
+	}
+	for _, tx := range reinject {
+		if _, ok := seen[tx.Hash()]; !ok {
+			txs = append(txs, tx)
+		}
 	}
 	resetCandidateMeter.Mark(int64(len(txs)))
 	oldMeta := p.meta
@@ -349,6 +359,61 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		p.reserveTxAccounting(tx.Hash(), meta)
 		retained++
 	}
+}
+
+func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) types.Transactions {
+	if oldHead == nil || newHead == nil || oldHead.Hash() == newHead.ParentHash {
+		return nil
+	}
+	oldNum, newNum := oldHead.Number.Uint64(), newHead.Number.Uint64()
+	var depth uint64
+	if newNum > oldNum {
+		depth = newNum - oldNum
+	} else {
+		depth = oldNum - newNum
+	}
+	if depth > 64 {
+		return nil
+	}
+	rem := p.chain.GetBlock(oldHead.Hash(), oldNum)
+	add := p.chain.GetBlock(newHead.Hash(), newNum)
+	if rem == nil || add == nil {
+		return nil
+	}
+	var discarded, included types.Transactions
+	for rem.NumberU64() > add.NumberU64() {
+		discarded = append(discarded, rem.Transactions()...)
+		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
+		if rem == nil {
+			return nil
+		}
+	}
+	for add.NumberU64() > rem.NumberU64() {
+		included = append(included, add.Transactions()...)
+		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
+		if add == nil {
+			return nil
+		}
+	}
+	for rem.Hash() != add.Hash() {
+		discarded = append(discarded, rem.Transactions()...)
+		included = append(included, add.Transactions()...)
+		if rem.NumberU64() == 0 || add.NumberU64() == 0 {
+			return nil
+		}
+		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
+		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
+		if rem == nil || add == nil {
+			return nil
+		}
+	}
+	var lost types.Transactions
+	for _, tx := range types.TxDifference(discarded, included) {
+		if p.Filter(tx) && (tx.BlobGas() == 0 || tx.BlobTxSidecar() != nil) {
+			lost = append(lost, tx)
+		}
+	}
+	return lost
 }
 
 // SetGasTip updates the minimum gas tip and evicts underpriced transactions.
@@ -568,6 +633,9 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	if frameTx == nil {
 		return fmt.Errorf("not a frame transaction")
 	}
+	p.validationMu.Lock()
+	defer p.validationMu.Unlock()
+
 	p.mu.Lock()
 	_, err := p.checkAdmissionCheap(tx, true)
 	p.mu.Unlock()
@@ -584,7 +652,6 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	check, err := p.checkAdmissionCheap(tx, false)
 	if err != nil {
@@ -592,6 +659,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 			accountingRejectMeter.Mark(1)
 			accountingInsufficientMeter.Mark(1)
 		}
+		p.mu.Unlock()
 		return err
 	}
 	replacement := check.replacement
@@ -603,11 +671,13 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	if len(p.pending[sender]) == 0 {
 		if p.reserver != nil {
 			if err := p.reserver.Hold(sender); err != nil {
+				p.mu.Unlock()
 				return err
 			}
 		}
 		held = true
 	}
+	p.mu.Unlock()
 
 	// Simulate the validation prefix.
 	meta, err := p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
@@ -617,6 +687,8 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		}
 		return err
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if err := p.validatePaymasterAccounting(tx, meta, replacement); err != nil {
 		accountingRejectMeter.Mark(1)
 		if errors.Is(err, core.ErrInsufficientFunds) {
@@ -792,12 +864,12 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			Origin:   params.FrameEntryPointAddress,
 			GasPrice: new(uint256.Int),
 		})
-		evm.FrameCtx = frameCtx
+		evm.TxContext.FrameCtx = frameCtx
 		frameCtx.FrameIndex = i
 		baseState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
 		warmRecentRootReferences(baseState, frameTx.RecentRootRefs)
-		_, _, vmerr := evm.Call(params.FrameEntryPointAddress, target, frame.Data, vm.NewGasBudget(frame.GasLimit, 0), new(uint256.Int))
-		evm.FrameCtx = nil
+		_, _, vmerr := evm.Call(params.FrameEntryPointAddress, target, frame.Data, vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit), new(uint256.Int))
+		evm.TxContext.FrameCtx = nil
 		for _, slot := range tracer.StorageReads() {
 			storageReads[slot] = struct{}{}
 		}
@@ -828,7 +900,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		}
 		meta := frameTxMeta{
 			payer:                 frameTx.Sender,
-			maxCost:               tx.Cost(),
+			maxCost:               p.maxCost(tx),
 			payerAvailableBalance: p.currentState.GetBalance(frameTx.Sender).ToBig(),
 			payerCodeHash:         p.currentState.GetCodeHash(frameTx.Sender),
 		}
@@ -858,7 +930,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if err := p.validateNonceSurcharge(frameTx, payResult.gasRemaining); err != nil {
 		return frameTxMeta{}, payResult, err
 	}
-	meta.maxCost = tx.Cost()
+	meta.maxCost = p.maxCost(tx)
 	meta.payerAvailableBalance = p.payerAvailableBalance(meta)
 	meta.payerCodeHash = p.currentState.GetCodeHash(meta.payer)
 	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads)
@@ -958,6 +1030,7 @@ func validateExpiryVerifierFrame(statedb *state.StateDB, index int, frame types.
 
 func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, signatureGas uint64, includePay bool, gasCap uint64) error {
 	total := signatureGas
+	var stateTotal uint64
 	indices := []int{plan.expiryIndex, plan.deployIndex, plan.senderVerifyIndex}
 	if includePay {
 		indices = append(indices, plan.payVerifyIndex)
@@ -974,6 +1047,10 @@ func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, 
 		total, overflow = commonmath.SafeAdd(total, frame.GasLimit)
 		if overflow || total > gasCap {
 			return fmt.Errorf("validation prefix gas %d exceeds cap %d", total, gasCap)
+		}
+		stateTotal, overflow = commonmath.SafeAdd(stateTotal, frame.StateGasLimit)
+		if overflow || stateTotal > params.FrameTxMaxVerifyStateGas {
+			return fmt.Errorf("validation prefix state gas %d exceeds cap %d", stateTotal, params.FrameTxMaxVerifyStateGas)
 		}
 	}
 	return nil
@@ -995,7 +1072,7 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 		Origin:   params.FrameEntryPointAddress,
 		GasPrice: new(uint256.Int),
 	})
-	evm.FrameCtx = frameCtx
+	evm.TxContext.FrameCtx = frameCtx
 	frameCtx.FrameIndex = index
 
 	simState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
@@ -1007,13 +1084,15 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 		vmerr        error
 	)
 	if hasNoCode(simState, target) {
-		_, gasRemaining, vmerr = vm.ExecuteDefaultCode(evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
+		var result vm.GasBudget
+		_, result, vmerr = vm.ExecuteDefaultCodeWithGasBudget(evm, caller, target, frame.Data, vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit), frame.Mode)
+		gasRemaining = result.ExecutionGas
 	} else {
 		var result vm.GasBudget
-		_, result, vmerr = evm.StaticCall(caller, target, frame.Data, vm.NewGasBudget(frame.GasLimit, 0))
-		gasRemaining = result.ExecutionGas + result.StateGas
+		_, result, vmerr = evm.StaticCall(caller, target, frame.Data, vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit))
+		gasRemaining = result.ExecutionGas
 	}
-	evm.FrameCtx = nil
+	evm.TxContext.FrameCtx = nil
 	result := verifyResult{
 		frameIndex:   index,
 		target:       target,
@@ -1032,7 +1111,7 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 			return result, fmt.Errorf("VERIFY frame %d: %w", index, violation)
 		}
 	}
-	scope := evm.ApproveScope
+	scope := evm.TxContext.ApproveScope
 	if scope == vm.ApproveNone {
 		if vmerr != nil {
 			switch {
@@ -1081,14 +1160,12 @@ func resolveFrameTarget(sender common.Address, frame types.Frame) common.Address
 // returns the storage slot containing its pending withdrawal amount. The slot
 // is part of the runtime-specific public-mempool accounting contract.
 func (p *FramePool) canonicalPaymasterWithdrawalSlot(addr common.Address) (common.Hash, bool) {
-	switch p.currentState.GetCodeHash(addr) {
-	case canonicalPaymasterCodeHash:
+	codeHash := p.currentState.GetCodeHash(addr)
+	if codeHash == canonicalPaymasterCodeHash {
 		return canonicalPaymasterPendingWithdrawalSlot, true
-	case benchmarkPaymasterAuthShimCodeHash:
-		return benchmarkPaymasterPendingWithdrawalSlot, true
-	default:
-		return common.Hash{}, false
 	}
+	slot, ok := p.canonicalPaymasters[codeHash]
+	return slot, ok
 }
 
 func (p *FramePool) isCanonicalPaymaster(addr common.Address) bool {
@@ -1262,7 +1339,7 @@ func (p *FramePool) preflightPayerSolvencyWithPlan(tx *types.Transaction, replac
 		payer:              payer,
 		usesPaymaster:      usesPaymaster,
 		canonicalPaymaster: usesPaymaster && p.isCanonicalPaymaster(payer),
-		maxCost:            tx.Cost(),
+		maxCost:            p.maxCost(tx),
 	}
 	err := p.validatePayerSolvency(tx, meta, replacement)
 	if meter {
@@ -1397,7 +1474,7 @@ func validateFrameOrdering(frames []types.Frame, sender common.Address) error {
 // exact canonical runtime additionally reserves its announced withdrawal amount.
 func (p *FramePool) validatePayerSolvency(tx *types.Transaction, meta frameTxMeta, replacement *types.Transaction) error {
 	if meta.maxCost == nil {
-		meta.maxCost = tx.Cost()
+		meta.maxCost = p.maxCost(tx)
 	}
 	reserved := p.reservedExcluding(meta.payer, replacement)
 	required := new(big.Int).Add(reserved, meta.maxCost)
@@ -1407,6 +1484,15 @@ func (p *FramePool) validatePayerSolvency(tx *types.Transaction, meta frameTxMet
 		return fmt.Errorf("%w: payer %s available balance %v, reserved %v, pending withdrawal %v, tx cost %v", core.ErrInsufficientFunds, meta.payer.Hex(), balance, reserved, pendingWithdrawal, meta.maxCost)
 	}
 	return nil
+}
+
+func (p *FramePool) maxCost(tx *types.Transaction) *big.Int {
+	cost := new(big.Int).Mul(new(big.Int).SetUint64(tx.Gas()), tx.GasFeeCap())
+	if tx.BlobGas() == 0 {
+		return cost
+	}
+	blobFee := eip4844.CalcBlobFee(p.chain.Config(), p.currentHead)
+	return cost.Add(cost, new(big.Int).Mul(new(big.Int).SetUint64(tx.BlobGas()), blobFee))
 }
 
 func (p *FramePool) pendingCanonicalWithdrawalForMeta(meta frameTxMeta) *big.Int {
@@ -1524,18 +1610,34 @@ func bumpedPrice(price *big.Int, bump uint64) *big.Int {
 
 // Pending returns all processable frame transactions.
 func (p *FramePool) Pending(filter txpool.PendingFilter) (map[common.Address][]*txpool.LazyTransaction, int) {
-	if filter.BlobTxs {
-		return nil, 0
-	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	pending := make(map[common.Address][]*txpool.LazyTransaction, len(p.pending))
 	count := 0
 	for addr, txs := range p.pending {
-		lazies := make([]*txpool.LazyTransaction, len(txs))
-		for i, tx := range txs {
-			lazies[i] = &txpool.LazyTransaction{
+		lazies := make([]*txpool.LazyTransaction, 0, len(txs))
+		for _, tx := range txs {
+			isBlob := tx.BlobGas() > 0
+			if isBlob != filter.BlobTxs {
+				continue
+			}
+			if filter.MinTip != nil && filter.BaseFee != nil && tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
+				continue
+			}
+			if isBlob && filter.BlobFee != nil && tx.BlobGasFeeCapIntCmp(filter.BlobFee.ToBig()) < 0 {
+				continue
+			}
+			if filter.GasLimitCap != 0 && tx.Gas() > filter.GasLimitCap {
+				continue
+			}
+			if isBlob {
+				sidecar := tx.BlobTxSidecar()
+				if sidecar == nil || sidecar.Version != filter.BlobVersion {
+					continue
+				}
+			}
+			lazies = append(lazies, &txpool.LazyTransaction{
 				Pool:      p,
 				Hash:      tx.Hash(),
 				Tx:        tx,
@@ -1544,10 +1646,12 @@ func (p *FramePool) Pending(filter txpool.PendingFilter) (map[common.Address][]*
 				GasTipCap: uint256.MustFromBig(tx.GasTipCap()),
 				Gas:       tx.Gas(),
 				BlobGas:   tx.BlobGas(),
-			}
+			})
 		}
-		pending[addr] = lazies
-		count += len(lazies)
+		if len(lazies) != 0 {
+			pending[addr] = lazies
+			count += len(lazies)
+		}
 	}
 	return pending, count
 }

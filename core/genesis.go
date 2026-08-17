@@ -730,7 +730,6 @@ func DeveloperGenesisBlock(gasLimit uint64, faucet *common.Address) *Genesis {
 			// EIP-7997 - Deterministic deployment factory
 			params.DeterministicFactoryAddress: {Nonce: 1, Code: params.DeterministicFactoryCode, Balance: common.Big0},
 			params.FrameExpiryVerifierAddress:  {Nonce: 1, Code: params.FrameExpiryVerifierCode, Balance: common.Big0},
-			params.NonceManagerAddress:         {Nonce: 1, Code: params.NonceManagerCode, Balance: common.Big0},
 			params.RecentRootAddress:           {Nonce: 1, Code: params.RecentRootCode, Balance: common.Big0},
 		},
 	}

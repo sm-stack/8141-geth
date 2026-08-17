@@ -275,8 +275,7 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 	input := fmt.Sprintf(`{
 		"from":"0x0000000000000000000000000000000000001111",
 		"sender":"0x000000000000000000000000000000000000abcd",
-		"nonceKeys":["0x7","0xb"],
-		"nonceSeq":"0x3",
+		"nonce":"0x3",
 		"chainId":"0x2a",
 		"maxFeePerGas":"0x64",
 		"maxPriorityFeePerGas":"0x2",
@@ -286,7 +285,6 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 			{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
 		],
 		"signatures":[{"scheme":"0x1","signer":"0x000000000000000000000000000000000000abcd","msg":"0x","signature":"%s"}]
-		,"recentRootReferences":[{"sourceId":"0x0101010101010101010101010101010101010101010101010101010101010101","slot":"0x9","root":"0x0202020202020202020202020202020202020202020202020202020202020202"}]
 	}`, signature)
 
 	var args TransactionArgs
@@ -316,10 +314,10 @@ func TestTransactionArgsFrameTxJSONToTransaction(t *testing.T) {
 	if len(ftx.Signatures) != 1 || len(ftx.Signatures[0].Signature) != 65 {
 		t.Fatalf("unexpected signatures: %#v", ftx.Signatures)
 	}
-	if ftx.NonceSeq != 3 || len(ftx.NonceKeys) != 2 || ftx.NonceKeys[0].Uint64() != 7 || ftx.NonceKeys[1].Uint64() != 11 {
-		t.Fatalf("unexpected keyed nonce: keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
+	if ftx.NonceSeq != 3 || len(ftx.NonceKeys) != 1 || !ftx.NonceKeys[0].IsZero() {
+		t.Fatalf("unexpected nonce: keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
 	}
-	if len(ftx.RecentRootRefs) != 1 || ftx.RecentRootRefs[0].Slot != 9 {
+	if len(ftx.RecentRootRefs) != 0 {
 		t.Fatalf("unexpected recent root references: %#v", ftx.RecentRootRefs)
 	}
 }
@@ -344,8 +342,8 @@ func TestCallDefaultsRejectsFrameNonceKeysWithoutSequence(t *testing.T) {
 		Frames:    &frames,
 		NonceKeys: []*hexutil.Big{(*hexutil.Big)(big.NewInt(1))},
 	}
-	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err == nil || !strings.Contains(err.Error(), "requires \"nonceSeq\"") {
-		t.Fatalf("CallDefaults error = %v, want missing nonceSeq", err)
+	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("CallDefaults error = %v, want obsolete nonce field rejection", err)
 	}
 }
 

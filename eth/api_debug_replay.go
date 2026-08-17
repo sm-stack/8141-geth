@@ -171,7 +171,7 @@ func (api *DebugAPI) replayBuild(ctx context.Context, block *types.Block, stated
 			return nil, nil, 0, common.Hash{}, fmt.Errorf("could not apply committed tx %d [%v]: %w", k, tx.Hash().Hex(), err)
 		}
 		receipts = append(receipts, receipt)
-		if tx.Type() == types.BlobTxType && header.BlobGasUsed != nil {
+		if tx.BlobGas() > 0 && header.BlobGasUsed != nil {
 			*header.BlobGasUsed += receipt.BlobGasUsed
 		}
 		tcount++

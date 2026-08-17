@@ -17,6 +17,8 @@
 package vm
 
 import (
+	"slices"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -52,7 +54,62 @@ type FrameContext struct {
 	SigHash        common.Hash   // Cached compute_sig_hash(tx).
 	FrameIndex     int           // Currently executing frame index.
 	FrameResults   []uint8       // Status of each completed frame (0=fail, 1=success, 2=skipped).
+	FrameGasUsed   []types.FrameGasUsed
 	RecentRootRefs []types.RecentRootRef
+	stateGasOwners map[frameStateSlot]int
+}
+
+type frameStateSlot struct {
+	address common.Address
+	slot    common.Hash
+}
+
+// FrameContextSnapshot captures frame-local state-gas ownership across EVM snapshots.
+type FrameContextSnapshot struct {
+	owners       map[frameStateSlot]int
+	frameGasUsed []types.FrameGasUsed
+}
+
+// Snapshot captures state-gas ownership and per-frame accounting.
+func (fc *FrameContext) Snapshot() *FrameContextSnapshot {
+	if fc == nil {
+		return nil
+	}
+	snapshot := &FrameContextSnapshot{
+		owners:       make(map[frameStateSlot]int, len(fc.stateGasOwners)),
+		frameGasUsed: slices.Clone(fc.FrameGasUsed),
+	}
+	for slot, owner := range fc.stateGasOwners {
+		snapshot.owners[slot] = owner
+	}
+	return snapshot
+}
+
+// Restore rolls frame-local accounting back to a prior snapshot.
+func (fc *FrameContext) Restore(snapshot *FrameContextSnapshot) {
+	if fc == nil || snapshot == nil {
+		return
+	}
+	fc.stateGasOwners = snapshot.owners
+	fc.FrameGasUsed = snapshot.frameGasUsed
+}
+
+func (fc *FrameContext) recordStateGas(address common.Address, slot common.Hash) {
+	if fc.stateGasOwners == nil {
+		fc.stateGasOwners = make(map[frameStateSlot]int)
+	}
+	fc.stateGasOwners[frameStateSlot{address: address, slot: slot}] = fc.FrameIndex
+}
+
+func (fc *FrameContext) refundStateGas(address common.Address, slot common.Hash, amount uint64, current *GasBudget) {
+	key := frameStateSlot{address: address, slot: slot}
+	owner, ok := fc.stateGasOwners[key]
+	if !ok || owner == fc.FrameIndex {
+		current.RefundState(amount)
+	} else if owner >= 0 && owner < len(fc.FrameGasUsed) {
+		fc.FrameGasUsed[owner].State -= min(fc.FrameGasUsed[owner].State, amount)
+	}
+	delete(fc.stateGasOwners, key)
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -76,35 +133,35 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	// Validate scope: must be a non-zero PAYMENT/EXECUTION bitmask.
 	s := scopeVal.Uint64()
 	if s == 0 || s > uint64(ApproveBoth) {
-		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+		return nil, ErrExecutionReverted
 	}
 
 	// Must be in a frame tx context.
-	if evm.FrameCtx == nil {
+	if evm.TxContext.FrameCtx == nil {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
 	// ADDRESS == frame.target: only the frame target can call APPROVE.
-	currentFrame := evm.FrameCtx.Frames[evm.FrameCtx.FrameIndex]
-	frameTarget := evm.FrameCtx.Sender
+	currentFrame := evm.TxContext.FrameCtx.Frames[evm.TxContext.FrameCtx.FrameIndex]
+	frameTarget := evm.TxContext.FrameCtx.Sender
 	if currentFrame.Target != nil {
 		frameTarget = *currentFrame.Target
 	}
 	if scope.Contract.Address() != frameTarget {
-		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+		return nil, ErrExecutionReverted
 	}
 
 	allowedScope := currentFrame.Flags & types.FrameFlagApproveScopeMask
 	if uint8(s)&^allowedScope != 0 {
-		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+		return nil, ErrExecutionReverted
 	}
 
 	// Execution approval can only come from tx.sender.
-	if uint8(s)&ApproveExecution != 0 && frameTarget != evm.FrameCtx.Sender {
-		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+	if uint8(s)&ApproveExecution != 0 && frameTarget != evm.TxContext.FrameCtx.Sender {
+		return nil, ErrExecutionReverted
 	}
 
-	evm.ApproveScope = uint8(s)
+	evm.TxContext.ApproveScope = uint8(s)
 
 	ret := scope.Memory.GetCopy(offset.Uint64(), size.Uint64())
 	return ret, errStopToken
@@ -124,24 +181,24 @@ const (
 	txParamFrameCount         = 0x09
 	txParamFrameIndex         = 0x0a
 	txParamSignatureCount     = 0x0b
-	txParamNonceKey0          = 0x0c
-	txParamLegacyNonce        = 0x0d
-	txParamNonceKeyCount      = 0x0e
-	txParamNonceKeysHash      = 0x0f
-	txParamRecentRootRefCount = 0x10
+	txParamStateGasLeft       = 0x0c
+	txParamRecentRootRefCount = 0x0d
 )
 
 // FRAMEPARAM parameter selectors.
 const (
-	frameParamTarget       = 0x00
-	frameParamGasLimit     = 0x01
-	frameParamMode         = 0x02
-	frameParamFlags        = 0x03
-	frameParamDataLen      = 0x04
-	frameParamStatus       = 0x05
-	frameParamAllowedScope = 0x06
-	frameParamAtomicBatch  = 0x07
-	frameParamValue        = 0x08
+	frameParamTarget           = 0x00
+	frameParamGasLimit         = 0x01
+	frameParamMode             = 0x02
+	frameParamFlags            = 0x03
+	frameParamDataLen          = 0x04
+	frameParamStatus           = 0x05
+	frameParamAllowedScope     = 0x06
+	frameParamAtomicBatch      = 0x07
+	frameParamValue            = 0x08
+	frameParamStateGasLimit    = 0x09
+	frameParamExecutionGasUsed = 0x0a
+	frameParamStateGasUsed     = 0x0b
 )
 
 // SIGPARAM parameter selectors.
@@ -166,10 +223,10 @@ func frameSelector(v *uint256.Int, op OpCode) (uint64, error) {
 }
 
 func requireFrameContext(evm *EVM, op OpCode) (*FrameContext, error) {
-	if evm.FrameCtx == nil {
+	if evm.TxContext.FrameCtx == nil {
 		return nil, invalidFrameOpcode(op)
 	}
-	return evm.FrameCtx, nil
+	return evm.TxContext.FrameCtx, nil
 }
 
 func requireFrame(fc *FrameContext, frameIndex *uint256.Int, op OpCode) (*types.Frame, error) {
@@ -197,18 +254,18 @@ func setUint256(dst, src *uint256.Int) {
 	dst.Set(src)
 }
 
-func setMaxCost(dst *uint256.Int, fc *FrameContext) {
+func setMaxCost(dst *uint256.Int, evm *EVM, fc *FrameContext) {
 	dst.Clear()
 	if fc.GasFeeCap == nil {
 		return
 	}
 	gasLimit := new(uint256.Int).SetUint64(fc.GasLimit)
 	dst.Mul(gasLimit, fc.GasFeeCap)
-	if len(fc.BlobHashes) == 0 || fc.BlobFeeCap == nil {
+	if len(fc.BlobHashes) == 0 || evm.Context.BlobBaseFee == nil {
 		return
 	}
 	blobGas := new(uint256.Int).SetUint64(params.BlobTxBlobGasPerBlob * uint64(len(fc.BlobHashes)))
-	blobCost := new(uint256.Int).Mul(blobGas, fc.BlobFeeCap)
+	blobCost := new(uint256.Int).Mul(blobGas, uint256.MustFromBig(evm.Context.BlobBaseFee))
 	dst.Add(dst, blobCost)
 }
 
@@ -246,7 +303,7 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	case txParamBlobFeeCap:
 		setUint256(param, fc.BlobFeeCap)
 	case txParamMaxCost:
-		setMaxCost(param, fc)
+		setMaxCost(param, evm, fc)
 	case txParamBlobHashLen:
 		param.SetUint64(uint64(len(fc.BlobHashes)))
 	case txParamSigHash:
@@ -257,19 +314,10 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		param.SetUint64(uint64(fc.FrameIndex))
 	case txParamSignatureCount:
 		param.SetUint64(uint64(len(fc.Signatures)))
+	case txParamStateGasLeft:
+		param.SetUint64(scope.Contract.Gas.StateGas)
 	case txParamRecentRootRefCount:
 		param.SetUint64(uint64(len(fc.RecentRootRefs)))
-	case txParamNonceKey0:
-		if len(fc.NonceKeys) == 0 || fc.NonceKeys[0] == nil {
-			return nil, invalidFrameOpcode(TXPARAM)
-		}
-		param.Set(fc.NonceKeys[0])
-	case txParamLegacyNonce:
-		param.SetUint64(fc.LegacyNonce)
-	case txParamNonceKeyCount:
-		param.SetUint64(uint64(len(fc.NonceKeys)))
-	case txParamNonceKeysHash:
-		param.SetBytes32(fc.NonceKeysHash[:])
 	default:
 		return nil, invalidFrameOpcode(TXPARAM)
 	}
@@ -394,6 +442,18 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		param.SetUint64(uint64((frame.Flags & types.FrameFlagAtomicBatch) >> 2))
 	case frameParamValue:
 		setUint256(param, frame.Value)
+	case frameParamStateGasLimit:
+		param.SetUint64(frame.StateGasLimit)
+	case frameParamExecutionGasUsed, frameParamStateGasUsed:
+		idx := int(frameIndex.Uint64())
+		if idx >= fc.FrameIndex || idx >= len(fc.FrameGasUsed) {
+			return nil, invalidFrameOpcode(FRAMEPARAM)
+		}
+		if selector == frameParamExecutionGasUsed {
+			param.SetUint64(fc.FrameGasUsed[idx].Execution)
+		} else {
+			param.SetUint64(fc.FrameGasUsed[idx].State)
+		}
 	default:
 		return nil, invalidFrameOpcode(FRAMEPARAM)
 	}

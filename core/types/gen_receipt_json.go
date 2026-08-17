@@ -25,8 +25,11 @@ func (r Receipt) MarshalJSON() ([]byte, error) {
 		Payer             *common.Address `json:"payer,omitempty"`
 		FrameReceipts     []struct {
 			Status  hexutil.Uint64 `json:"status"`
-			GasUsed hexutil.Uint64 `json:"gasUsed"`
-			Logs    []*Log         `json:"logs"`
+			GasUsed struct {
+				Execution hexutil.Uint64 `json:"execution"`
+				State     hexutil.Uint64 `json:"state"`
+			} `json:"gasUsed"`
+			Logs []*Log `json:"logs"`
 		} `json:"frameReceipts,omitempty"`
 		TxHash            common.Hash    `json:"transactionHash" gencodec:"required"`
 		ContractAddress   common.Address `json:"contractAddress"`
@@ -52,18 +55,27 @@ func (r Receipt) MarshalJSON() ([]byte, error) {
 	if len(r.FrameReceipts) > 0 {
 		enc.FrameReceipts = make([]struct {
 			Status  hexutil.Uint64 `json:"status"`
-			GasUsed hexutil.Uint64 `json:"gasUsed"`
-			Logs    []*Log         `json:"logs"`
+			GasUsed struct {
+				Execution hexutil.Uint64 `json:"execution"`
+				State     hexutil.Uint64 `json:"state"`
+			} `json:"gasUsed"`
+			Logs []*Log `json:"logs"`
 		}, len(r.FrameReceipts))
 		for i, fr := range r.FrameReceipts {
 			enc.FrameReceipts[i] = struct {
 				Status  hexutil.Uint64 `json:"status"`
-				GasUsed hexutil.Uint64 `json:"gasUsed"`
-				Logs    []*Log         `json:"logs"`
+				GasUsed struct {
+					Execution hexutil.Uint64 `json:"execution"`
+					State     hexutil.Uint64 `json:"state"`
+				} `json:"gasUsed"`
+				Logs []*Log `json:"logs"`
 			}{
-				Status:  hexutil.Uint64(fr.Status),
-				GasUsed: hexutil.Uint64(fr.GasUsed),
-				Logs:    fr.Logs,
+				Status: hexutil.Uint64(fr.Status),
+				GasUsed: struct {
+					Execution hexutil.Uint64 `json:"execution"`
+					State     hexutil.Uint64 `json:"state"`
+				}{Execution: hexutil.Uint64(fr.GasUsed.Execution), State: hexutil.Uint64(fr.GasUsed.State)},
+				Logs: fr.Logs,
 			}
 		}
 	}
@@ -91,8 +103,11 @@ func (r *Receipt) UnmarshalJSON(input []byte) error {
 		Payer             *common.Address `json:"payer,omitempty"`
 		FrameReceipts     []struct {
 			Status  *hexutil.Uint64 `json:"status"`
-			GasUsed *hexutil.Uint64 `json:"gasUsed"`
-			Logs    []*Log          `json:"logs"`
+			GasUsed *struct {
+				Execution *hexutil.Uint64 `json:"execution"`
+				State     *hexutil.Uint64 `json:"state"`
+			} `json:"gasUsed"`
+			Logs []*Log `json:"logs"`
 		} `json:"frameReceipts,omitempty"`
 		TxHash            *common.Hash    `json:"transactionHash" gencodec:"required"`
 		ContractAddress   *common.Address `json:"contractAddress"`
@@ -146,7 +161,12 @@ func (r *Receipt) UnmarshalJSON(input []byte) error {
 				r.FrameReceipts[i].Status = uint8(status)
 			}
 			if fr.GasUsed != nil {
-				r.FrameReceipts[i].GasUsed = uint64(*fr.GasUsed)
+				if fr.GasUsed.Execution != nil {
+					r.FrameReceipts[i].GasUsed.Execution = uint64(*fr.GasUsed.Execution)
+				}
+				if fr.GasUsed.State != nil {
+					r.FrameReceipts[i].GasUsed.State = uint64(*fr.GasUsed.State)
+				}
 			}
 			r.FrameReceipts[i].Logs = fr.Logs
 		}

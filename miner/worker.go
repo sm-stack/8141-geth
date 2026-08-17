@@ -392,7 +392,7 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx *types.Transaction) (err error) {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransaction")
 	defer spanEnd(&err)
-	if tx.Type() == types.BlobTxType {
+	if tx.BlobGas() > 0 {
 		return miner.commitBlobTransaction(env, tx)
 	}
 	receipt, bal, err := miner.applyTransaction(env, tx)

@@ -121,7 +121,7 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 func handleTransactions(peer *eth.Peer, list []*types.Transaction, directBroadcast bool) error {
 	seen := make(map[common.Hash]struct{}, len(list))
 	for _, tx := range list {
-		if tx.Type() == types.BlobTxType {
+		if tx.BlobGas() > 0 {
 			if directBroadcast {
 				return errors.New("disallowed broadcast blob transaction")
 			} else {
@@ -136,7 +136,7 @@ func handleTransactions(peer *eth.Peer, list []*types.Transaction, directBroadca
 				}
 				// eth72 delivers blob transactions without the blob payload,
 				// earlier versions with all blobs.
-				if blobs := len(tx.BlobTxSidecar().Blobs); peer.Version() >= eth.ETH72 {
+				if blobs := len(tx.BlobTxSidecar().Blobs); tx.Type() == types.BlobTxType && peer.Version() >= eth.ETH72 {
 					if blobs != 0 {
 						return errors.New("received blob transaction with blob payload on eth72")
 					}

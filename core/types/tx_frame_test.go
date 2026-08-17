@@ -33,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
@@ -60,11 +61,58 @@ func testFrameTx() *FrameTx {
 			{Scheme: SignatureSchemeSecp256k1, Signer: signer, Msg: nil, Signature: bytes.Repeat([]byte{0x11}, 65)},
 			{Scheme: SignatureSchemeP256, Signer: signer, Msg: explicitMsg, Signature: bytes.Repeat([]byte{0x22}, 128)},
 		},
-		RecentRootRefs: []RecentRootRef{{
-			SourceID: common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-			Slot:     9,
-			Root:     common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-		}},
+	}
+}
+
+func TestFrameTxBlobSidecarRoundTrip(t *testing.T) {
+	sidecar := NewBlobTxSidecar(BlobSidecarVersion0,
+		[]kzg4844.Blob{*emptyBlob},
+		[]kzg4844.Commitment{emptyBlobCommit},
+		[]kzg4844.Proof{emptyBlobProof},
+	)
+	inner := testFrameTx()
+	inner.BlobFeeCap = uint256.NewInt(1)
+	inner.BlobHashes = sidecar.BlobHashes()
+	inner.Sidecar = sidecar
+	tx := NewTx(inner)
+
+	encoded, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Transaction
+	if err := decoded.UnmarshalBinary(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.BlobTxSidecar() == nil {
+		t.Fatal("decoded frame transaction has no blob sidecar")
+	}
+	if err := decoded.BlobTxSidecar().ValidateBlobCommitmentHashes(decoded.BlobHashes()); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Hash() != tx.Hash() || tx.WithoutBlobTxSidecar().Hash() != tx.Hash() {
+		t.Fatal("blob sidecar changed frame transaction hash")
+	}
+	if decoded.WithoutBlobTxSidecar().BlobTxSidecar() != nil {
+		t.Fatal("WithoutBlobTxSidecar retained frame sidecar")
+	}
+}
+
+func TestFrameTxAccessorsDoNotExposeMutablePayload(t *testing.T) {
+	tx := NewTx(testFrameTx())
+	hash := tx.Hash()
+	payload := tx.GetFrameTx()
+	payload.NonceSeq++
+	payload.Frames[0].Data[0] ^= 0xff
+	frames := tx.Frames()
+	frames[0].GasLimit++
+
+	if tx.Hash() != hash {
+		t.Fatal("mutating accessor result changed cached transaction hash")
+	}
+	fresh := tx.GetFrameTx()
+	if fresh.NonceSeq != 42 || fresh.Frames[0].GasLimit != 100_000 || bytes.Equal(fresh.Frames[0].Data, payload.Frames[0].Data) {
+		t.Fatalf("frame transaction payload was mutated through an accessor: %#v", fresh)
 	}
 }
 
@@ -191,15 +239,12 @@ func loadFrameTxVector(t *testing.T) (*FrameTx, storedFrameTxVector) {
 	for _, signature := range stored.Transaction.Signatures {
 		tx.Signatures = append(tx.Signatures, TxSignature{Scheme: signature.Scheme, Signer: common.HexToAddress(signature.Signer), Msg: decode(signature.Msg), Signature: decode(signature.Signature)})
 	}
-	for _, ref := range stored.Transaction.RecentRootRefs {
-		tx.RecentRootRefs = append(tx.RecentRootRefs, RecentRootRef{SourceID: common.HexToHash(ref.SourceID), Slot: parseU64(ref.Slot), Root: common.HexToHash(ref.Root)})
-	}
 	return tx, stored
 }
 
 func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
 	var tokens uint64
-	for _, chunk := range [][]byte{ftx.rlpFramesData(), ftx.rlpRecentRootRefsData(), ftx.rlpSignaturesData()} {
+	for _, chunk := range ftx.frameTxCalldataBytes() {
 		for _, b := range chunk {
 			if b == 0 {
 				tokens++
@@ -208,7 +253,7 @@ func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
 			}
 		}
 	}
-	return tokens * params.TxCostFloorPerToken
+	return tokens * params.TxDataZeroGas
 }
 
 func expectedFrameTxSignatureGas(t *testing.T, ftx *FrameTx) uint64 {
@@ -233,10 +278,31 @@ func expectedFrameTxIntrinsicGas(t *testing.T, ftx *FrameTx) uint64 {
 		uint64(len(ftx.Frames))*params.FrameTxPerFrameGas +
 		expectedFrameTxCalldataGas(ftx) +
 		expectedFrameTxSignatureGas(t, ftx)
-	if len(ftx.RecentRootRefs) > 0 {
-		gas += params.RecentRootBaseGas + uint64(len(ftx.RecentRootRefs))*params.RecentRootPerRefGas
+	for _, frame := range ftx.Frames {
+		if frame.Value != nil && !frame.Value.IsZero() && frame.Target != nil && *frame.Target != ftx.Sender {
+			gas += params.TxValueCost2780
+		}
 	}
 	return gas
+}
+
+func expectedFrameTxFloorGas(t *testing.T, ftx *FrameTx) uint64 {
+	t.Helper()
+	fixed, err := ftx.fixedGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokens uint64
+	for _, chunk := range ftx.frameTxCalldataBytes() {
+		for _, b := range chunk {
+			if b == 0 {
+				tokens++
+			} else {
+				tokens += params.TxTokenPerNonZeroByte
+			}
+		}
+	}
+	return fixed + tokens*params.TxCostFloorPerToken7976
 }
 
 func TestFrameTxType(t *testing.T) {
@@ -398,16 +464,18 @@ func TestFrameTxSignatureGas(t *testing.T) {
 }
 
 func TestFrameTxSigHashVector(t *testing.T) {
-	tx, vector := loadFrameTxVector(t)
-	if got, want := tx.SigHash(tx.chainID()).Hex(), vector.SigHash; got != want {
-		t.Fatalf("SigHash = %s, want %s", got, want)
-	}
+	tx := testFrameTx()
+	wantHash := tx.SigHash(tx.chainID())
 	typed, err := NewTx(tx).MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary failed: %v", err)
 	}
-	if got, want := hexutil.Encode(typed), vector.RawTransaction; got != want {
-		t.Fatalf("raw typed tx = %s, want %s", got, want)
+	var decoded Transaction
+	if err := decoded.UnmarshalBinary(typed); err != nil {
+		t.Fatalf("UnmarshalBinary failed: %v", err)
+	}
+	if got := decoded.GetFrameTx().SigHash(tx.chainID()); got != wantHash {
+		t.Fatalf("round-trip SigHash = %s, want %s", got, wantHash)
 	}
 }
 
@@ -606,7 +674,7 @@ func TestFrameDecodeRLPRejectsInvalidTargetLength(t *testing.T) {
 			FrameModeDefault,
 			uint8(0),
 			bytes.Repeat([]byte{0x11}, n),
-			uint64(1),
+			frameGasLimits{Execution: 1},
 			uint256.NewInt(0),
 			[]byte{0x01},
 		})
@@ -632,7 +700,7 @@ func TestFrameDecodeRLPResetsNilTarget(t *testing.T) {
 		FrameModeVerify,
 		uint8(0),
 		[]byte{},
-		uint64(100),
+		frameGasLimits{Execution: 100},
 		uint256.NewInt(0),
 		[]byte("sig"),
 	})
@@ -679,30 +747,20 @@ func TestFrameTxIntrinsicGas(t *testing.T) {
 	}
 }
 
-func TestFrameTxRecentRootIntrinsicGas(t *testing.T) {
-	withRef := testFrameTx()
-	withoutRef := withRef.copy().(*FrameTx)
-	withoutRef.RecentRootRefs = nil
-	withFixed, err := withRef.fixedGas()
+func TestFrameTxValueTransferIntrinsicGas(t *testing.T) {
+	withValue := testFrameTx()
+	withoutValue := withValue.copy().(*FrameTx)
+	withoutValue.Frames[1].Value.Clear()
+	withGas, err := withValue.IntrinsicGas()
 	if err != nil {
 		t.Fatal(err)
 	}
-	withoutFixed, err := withoutRef.fixedGas()
+	withoutGas, err := withoutValue.IntrinsicGas()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := withFixed-withoutFixed, params.RecentRootBaseGas+params.RecentRootPerRefGas; got != want {
-		t.Fatalf("one-reference fixed gas delta = %d, want %d", got, want)
-	}
-	second := withRef.RecentRootRefs[0]
-	second.Slot++
-	withRef.RecentRootRefs = append(withRef.RecentRootRefs, second)
-	twoFixed, err := withRef.fixedGas()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := twoFixed-withFixed, params.RecentRootPerRefGas; got != want {
-		t.Fatalf("second-reference fixed gas delta = %d, want %d", got, want)
+	if got := withGas - withoutGas; got != params.TxValueCost2780 {
+		t.Fatalf("value transfer intrinsic delta = %d, want %d", got, params.TxValueCost2780)
 	}
 }
 
@@ -760,7 +818,7 @@ func TestFrameTxFloorDataGas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FloorDataGas() unexpected error: %v", err)
 	}
-	if want := expectedFrameTxIntrinsicGas(t, ftx); floor != want {
+	if want := expectedFrameTxFloorGas(t, ftx); floor != want {
 		t.Errorf("FloorDataGas() = %d, want %d", floor, want)
 	}
 	ftxNoSignatures := ftx.copy().(*FrameTx)
@@ -785,19 +843,19 @@ func TestFrameTxFloorDataGas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FloorDataGas() for empty frames unexpected error: %v", err)
 	}
-	if want := expectedFrameTxIntrinsicGas(t, ftxEmpty); floorEmpty != want {
+	if want := expectedFrameTxFloorGas(t, ftxEmpty); floorEmpty != want {
 		t.Errorf("FloorDataGas() empty = %d, want %d", floorEmpty, want)
 	}
 }
 
 func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	type rawFrame struct {
-		Mode     uint8
-		Flags    uint8
-		Target   []byte
-		GasLimit uint64
-		Value    *uint256.Int
-		Data     []byte
+		Mode   uint8
+		Flags  uint8
+		Target []byte
+		Limits frameGasLimits
+		Value  *uint256.Int
+		Data   []byte
 	}
 	type rawSignature struct {
 		Scheme    uint8
@@ -806,40 +864,36 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 		Signature []byte
 	}
 	type rawFrameTx struct {
-		ChainID        *uint256.Int
-		NonceKeys      []*uint256.Int
-		NonceSeq       uint64
-		Sender         common.Address
-		Frames         []rawFrame
-		Signatures     []rawSignature
-		GasTipCap      *uint256.Int
-		GasFeeCap      *uint256.Int
-		BlobFeeCap     *uint256.Int
-		BlobHashes     []common.Hash
-		RecentRootRefs []RecentRootRef
+		ChainID    *uint256.Int
+		Nonce      uint64
+		Sender     common.Address
+		Frames     []rawFrame
+		Signatures []rawSignature
+		Fees       frameTxFees
+		BlobHashes []common.Hash
 	}
 
 	raw := rawFrameTx{
-		ChainID:   uint256.NewInt(1),
-		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
-		NonceSeq:  1,
-		Sender:    common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		ChainID: uint256.NewInt(1),
+		Nonce:   1,
+		Sender:  common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Frames: []rawFrame{
 			{
-				Mode:     FrameModeVerify,
-				Flags:    0,
-				Target:   bytes.Repeat([]byte{0x01}, common.AddressLength-1),
-				GasLimit: 100000,
-				Value:    uint256.NewInt(0),
-				Data:     []byte("signature"),
+				Mode:   FrameModeVerify,
+				Flags:  0,
+				Target: bytes.Repeat([]byte{0x01}, common.AddressLength-1),
+				Limits: frameGasLimits{Execution: 100000},
+				Value:  uint256.NewInt(0),
+				Data:   []byte("signature"),
 			},
 		},
-		Signatures:     nil,
-		GasTipCap:      uint256.NewInt(1),
-		GasFeeCap:      uint256.NewInt(1),
-		BlobFeeCap:     uint256.NewInt(0),
-		BlobHashes:     nil,
-		RecentRootRefs: nil,
+		Signatures: nil,
+		Fees: frameTxFees{
+			GasTipCap:  uint256.NewInt(1),
+			GasFeeCap:  uint256.NewInt(1),
+			BlobFeeCap: uint256.NewInt(0),
+		},
+		BlobHashes: nil,
 	}
 	payload, err := rlp.EncodeToBytes(raw)
 	if err != nil {
@@ -918,11 +972,6 @@ func TestFrameTxUnmarshalBinaryRejectsLegacyNineFieldPayload(t *testing.T) {
 
 func TestFrameTxUnmarshalBinaryRejectsLegacyTenFieldPayload(t *testing.T) {
 	tx, _ := loadFrameTxVector(t)
-	legacy := frameTxRLP{
-		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq, Sender: tx.Sender,
-		Frames: tx.Frames, Signatures: tx.Signatures, GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap,
-		BlobFeeCap: tx.BlobFeeCap, BlobHashes: tx.BlobHashes,
-	}
 	payload, err := rlp.EncodeToBytes(struct {
 		ChainID                          *uint256.Int
 		NonceKeys                        []*uint256.Int
@@ -932,7 +981,7 @@ func TestFrameTxUnmarshalBinaryRejectsLegacyTenFieldPayload(t *testing.T) {
 		Signatures                       []TxSignature
 		GasTipCap, GasFeeCap, BlobFeeCap *uint256.Int
 		BlobHashes                       []common.Hash
-	}{legacy.ChainID, legacy.NonceKeys, legacy.NonceSeq, legacy.Sender, legacy.Frames, legacy.Signatures, legacy.GasTipCap, legacy.GasFeeCap, legacy.BlobFeeCap, legacy.BlobHashes})
+	}{tx.ChainID, tx.NonceKeys, tx.NonceSeq, tx.Sender, tx.Frames, tx.Signatures, tx.GasTipCap, tx.GasFeeCap, tx.BlobFeeCap, tx.BlobHashes})
 	if err != nil {
 		t.Fatal(err)
 	}

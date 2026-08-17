@@ -263,7 +263,7 @@ func TestExtractReceiptFields(t *testing.T) {
 		CumulativeGasUsed: 1337,
 		Payer:             common.HexToAddress("0xbeef"),
 		FrameReceipts: []types.FrameReceipt{
-			{Status: 1, GasUsed: 42, Logs: []*types.Log{{Address: common.HexToAddress("0xcafe")}}},
+			{Status: 1, GasUsed: types.FrameGasUsed{Execution: 42}, Logs: []*types.Log{{Address: common.HexToAddress("0xcafe")}}},
 			{Status: types.FrameReceiptStatusSkipped},
 		},
 	})

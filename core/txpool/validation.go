@@ -78,14 +78,14 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if !rules.IsLondon && tx.Type() == types.DynamicFeeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in London", core.ErrTxTypeNotSupported, tx.Type())
 	}
-	if !rules.IsCancun && tx.Type() == types.BlobTxType {
+	if !rules.IsCancun && tx.BlobGas() > 0 {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Cancun", core.ErrTxTypeNotSupported, tx.Type())
 	}
 	if !rules.IsPrague && tx.Type() == types.SetCodeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
 	}
-	if !rules.IsPrague && tx.Type() == types.FrameTxType {
-		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
+	if !rules.IsBogota && tx.Type() == types.FrameTxType {
+		return fmt.Errorf("%w: type %d rejected, pool not yet in Bogota", core.ErrTxTypeNotSupported, tx.Type())
 	}
 	// Check whether the init code size has been exceeded
 	if tx.To() == nil {
@@ -215,7 +215,7 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if tx.GasTipCapIntCmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: gas tip cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.GasTipCap(), opts.MinTip)
 	}
-	if tx.Type() == types.BlobTxType {
+	if tx.BlobGas() > 0 {
 		return validateBlobSidecar(tx, head, opts)
 	}
 	if tx.Type() == types.SetCodeTxType {

@@ -43,11 +43,13 @@ type testChain struct {
 	config  *params.ChainConfig
 	statedb *state.StateDB
 	head    *types.Header
+	blocks  map[common.Hash]*types.Block
 }
 
-func (c *testChain) Config() *params.ChainConfig                   { return c.config }
-func (c *testChain) CurrentBlock() *types.Header                   { return c.head }
-func (c *testChain) StateAt(*types.Header) (*state.StateDB, error) { return c.statedb, nil }
+func (c *testChain) Config() *params.ChainConfig                      { return c.config }
+func (c *testChain) CurrentBlock() *types.Header                      { return c.head }
+func (c *testChain) GetBlock(hash common.Hash, _ uint64) *types.Block { return c.blocks[hash] }
+func (c *testChain) StateAt(*types.Header) (*state.StateDB, error)    { return c.statedb, nil }
 
 // reserver implements txpool.Reserver for tests.
 type reserver struct {
@@ -119,7 +121,10 @@ var (
 )
 
 func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
-	config := params.MergedTestChainConfig
+	configCopy := *params.MergedTestChainConfig
+	zero := uint64(0)
+	configCopy.BogotaTime = &zero
+	config := &configCopy
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 
 	head := &types.Header{
@@ -134,9 +139,11 @@ func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
 		config:  config,
 		statedb: statedb,
 		head:    head,
+		blocks:  make(map[common.Hash]*types.Block),
 	}
 
 	pool := New(chain)
+	pool.canonicalPaymasters[benchmarkPaymasterAuthShimCodeHash] = benchmarkPaymasterPendingWithdrawalSlot
 	pool.Init(0, head, newReserver())
 	return pool, statedb, config
 }
@@ -517,6 +524,36 @@ func TestFramePoolResetDropsExpiredExpiryVerifierTx(t *testing.T) {
 	}
 }
 
+func TestFramePoolResetReinjectsTransactionFromDiscardedBranch(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx)
+	parent := types.NewBlockWithHeader(&types.Header{Number: big.NewInt(0), Extra: []byte("parent")})
+	oldBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("old"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+	}).WithBody(types.Body{Transactions: types.Transactions{tx}})
+	newBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("new"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+	})
+	chain := pool.chain.(*testChain)
+	for _, block := range []*types.Block{parent, oldBlock, newBlock} {
+		chain.blocks[block.Hash()] = block
+	}
+
+	pool.Reset(oldBlock.Header(), newBlock.Header())
+	if !pool.Has(tx.Hash()) {
+		t.Fatal("transaction from discarded branch was not reinjected")
+	}
+}
+
 func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -524,23 +561,11 @@ func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	for i, key := range []uint64{101, 102} {
-		ftx := baseFTX(sender, 0, config)
-		ftx.NonceKeys = []*uint256.Int{uint256.NewInt(key)}
-		ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000}}
-		err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
-		if i == 0 && err != nil {
-			t.Fatalf("first key %d rejected: %v", key, err)
-		}
-		if i == 1 && err == nil {
-			t.Fatalf("second key %d accepted despite sender limit", key)
-		}
-	}
-	newHead := *pool.currentHead
-	newHead.Time++
-	pool.Reset(pool.currentHead, &newHead)
-	if pending, _ := pool.Stats(); pending != 1 {
-		t.Fatalf("expected one sender transaction after reset, got %d", pending)
+	ftx := baseFTX(sender, 0, config)
+	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(101)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err == nil || !strings.Contains(err.Error(), "obsolete keyed nonce") {
+		t.Fatalf("obsolete keyed nonce error = %v", err)
 	}
 }
 
@@ -562,6 +587,7 @@ func setupRecentRootFrameTx(t *testing.T, currentSlot, refSlot uint64) (*FramePo
 }
 
 func TestFramePoolRecentRootAdmission(t *testing.T) {
+	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	tests := []struct {
 		name   string
@@ -599,6 +625,7 @@ func TestFramePoolRecentRootAdmission(t *testing.T) {
 }
 
 func TestFramePoolRecentRootAdmissionUsesSlotProvider(t *testing.T) {
+	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	pool, _, ftx, _ := setupRecentRootFrameTx(t, 1, 8999)
 	pool.slotProvider = func(*types.Header) vm.SlotProvider { return fixedFramePoolSlotProvider(9000) }
 	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
@@ -607,6 +634,7 @@ func TestFramePoolRecentRootAdmissionUsesSlotProvider(t *testing.T) {
 }
 
 func TestWarmRecentRootReferences(t *testing.T) {
+	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	_, statedb, _, ref := setupRecentRootFrameTx(t, 9000, 8999)
 	copyState := statedb.Copy()
 	warmRecentRootReferences(copyState, []types.RecentRootRef{ref})
@@ -620,6 +648,7 @@ func TestWarmRecentRootReferences(t *testing.T) {
 }
 
 func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
+	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	t.Run("expiry", func(t *testing.T) {
 		pool, _, ftx, ref := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
@@ -648,6 +677,7 @@ func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
 }
 
 func TestFramePoolInvalidRecentRootReplacementKeepsOriginal(t *testing.T) {
+	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	pool, _, ftx, _ := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
 	original := makeFrameTx(ftx)
@@ -947,26 +977,20 @@ func TestFramePoolSenderLimit(t *testing.T) {
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	// Add maxFrameTxsPerAccount txs — all should succeed.
-	for i := uint64(0); i < maxFrameTxsPerAccount; i++ {
-		ftx := baseFTX(sender, 0, config)
-		ftx.NonceKeys = []*uint256.Int{uint256.NewInt(i + 1)}
-		ftx.Frames = []types.Frame{
-			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{byte(i)}},
-		}
-		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
-		if errs[0] != nil {
-			t.Fatalf("tx %d: unexpected error: %v", i, errs[0])
-		}
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000},
+	}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("first tx: unexpected error: %v", err)
 	}
 
 	// The next one should be rejected.
-	ftx := baseFTX(sender, 0, config)
-	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(maxFrameTxsPerAccount + 1)}
-	ftx.Frames = []types.Frame{
+	second := baseFTX(sender, 1, config)
+	second.Frames = []types.Frame{
 		{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 50000, Data: []byte{0xff}},
 	}
-	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	errs := pool.Add([]*types.Transaction{makeFrameTx(second)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected rejection when exceeding per-sender limit")
 	}
@@ -1093,8 +1117,8 @@ func TestFramePoolRejectsInsufficientKeyedNonceSurchargeGas(t *testing.T) {
 	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
 	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 10_000}}
 	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
-	if err == nil || !strings.Contains(err.Error(), "keyed nonce first use") {
-		t.Fatalf("insufficient surcharge gas error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "obsolete keyed nonce") {
+		t.Fatalf("obsolete keyed nonce error = %v", err)
 	}
 }
 

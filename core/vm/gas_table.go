@@ -732,7 +732,11 @@ func gasSStore8037And8038(evm *EVM, contract *Contract, stack *Stack, mem *Memor
 	}
 	if original == value { // reset to original value (2.2.2)
 		if original == (common.Hash{}) { // reset to original inexistent slot (2.2.2.1)
-			contract.Gas.RefundState(stateSet)
+			if evm.TxContext.FrameCtx != nil {
+				evm.TxContext.FrameCtx.refundStateGas(contract.Address(), slot, stateSet, &contract.Gas)
+			} else {
+				contract.Gas.RefundState(stateSet)
+			}
 		}
 		evm.StateDB.AddRefund(params.StorageWriteAmsterdam)
 	}

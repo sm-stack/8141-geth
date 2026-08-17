@@ -58,12 +58,22 @@ type GasBudget struct {
 	// has been borrowed to cover state-gas charges that exceeded the
 	// reservoir.
 	Spilled uint64
+
+	// isolatedState disables EIP-8037 reservoir spillover. Frame transactions
+	// declare independent execution and state budgets which must never mix.
+	isolatedState bool
 }
 
 // NewGasBudget initializes a fresh GasBudget for execution / forwarding,
 // with both usage accumulators set to zero.
 func NewGasBudget(execution, state uint64) GasBudget {
 	return GasBudget{ExecutionGas: execution, StateGas: state}
+}
+
+// NewFrameGasBudget initializes the independent two-dimensional budget used by
+// an EIP-8141 frame.
+func NewFrameGasBudget(execution, state uint64) GasBudget {
+	return GasBudget{ExecutionGas: execution, StateGas: state, isolatedState: true}
 }
 
 // Used returns the total scalar gas consumed relative to an initial budget.
@@ -103,6 +113,9 @@ func (g GasBudget) CanAfford(cost GasCosts) bool {
 	}
 	execution := g.ExecutionGas - cost.ExecutionGas
 	if cost.StateGas > g.StateGas {
+		if g.isolatedState {
+			return false
+		}
 		return cost.StateGas-g.StateGas <= execution
 	}
 	return true
@@ -118,6 +131,9 @@ func (g *GasBudget) charge(cost GasCosts) bool {
 	spilled := g.Spilled
 
 	if cost.StateGas > state {
+		if g.isolatedState {
+			return false
+		}
 		spillover := cost.StateGas - state
 		if spillover > execution {
 			return false
@@ -180,8 +196,9 @@ func (g *GasBudget) Forward(execution uint64) GasBudget {
 	g.UsedExecutionGas += execution
 
 	child := GasBudget{
-		ExecutionGas: execution,
-		StateGas:     g.StateGas,
+		ExecutionGas:  execution,
+		StateGas:      g.StateGas,
+		isolatedState: g.isolatedState,
 	}
 	g.StateGas = 0
 	return child
@@ -223,6 +240,7 @@ func (g GasBudget) ExitRevert() GasBudget {
 		UsedExecutionGas: g.UsedExecutionGas,
 		UsedStateGas:     0,
 		Spilled:          0,
+		isolatedState:    g.isolatedState,
 	}
 }
 
@@ -246,6 +264,7 @@ func (g GasBudget) ExitHalt() GasBudget {
 		UsedExecutionGas: g.UsedExecutionGas + g.ExecutionGas + g.Spilled,
 		UsedStateGas:     0,
 		Spilled:          0,
+		isolatedState:    g.isolatedState,
 	}
 }
 
