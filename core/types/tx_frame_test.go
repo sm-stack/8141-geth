@@ -140,12 +140,13 @@ type storedFrameTxVector struct {
 		BlobFeeCap string   `json:"maxFeePerBlobGas"`
 		BlobHashes []string `json:"blobVersionedHashes"`
 		Frames     []struct {
-			Mode     string  `json:"mode"`
-			Flags    uint8   `json:"flags"`
-			Target   *string `json:"target"`
-			GasLimit string  `json:"gasLimit"`
-			Value    string  `json:"value"`
-			Data     string  `json:"data"`
+			Mode          string  `json:"mode"`
+			Flags         uint8   `json:"flags"`
+			Target        *string `json:"target"`
+			GasLimit      string  `json:"gasLimit"`
+			StateGasLimit string  `json:"stateGasLimit"`
+			Value         string  `json:"value"`
+			Data          string  `json:"data"`
 		} `json:"frames"`
 		Signatures []struct {
 			Scheme    uint8  `json:"scheme"`
@@ -161,6 +162,7 @@ type storedFrameTxVector struct {
 	} `json:"transaction"`
 	SigHash        string `json:"sigHash"`
 	RawTransaction string `json:"rawTransaction"`
+	IntrinsicGas   string `json:"intrinsicGas"`
 }
 
 func loadFrameTxVector(t *testing.T) (*FrameTx, storedFrameTxVector) {
@@ -230,7 +232,7 @@ func loadFrameTxVector(t *testing.T) (*FrameTx, storedFrameTxVector) {
 	}
 	modes := map[string]uint8{"default": FrameModeDefault, "verify": FrameModeVerify, "sender": FrameModeSender}
 	for _, frame := range stored.Transaction.Frames {
-		converted := Frame{Mode: modes[frame.Mode], Flags: frame.Flags, GasLimit: parseU64(frame.GasLimit), Value: parseU256(frame.Value), Data: decode(frame.Data)}
+		converted := Frame{Mode: modes[frame.Mode], Flags: frame.Flags, GasLimit: parseU64(frame.GasLimit), StateGasLimit: parseU64(frame.StateGasLimit), Value: parseU256(frame.Value), Data: decode(frame.Data)}
 		if frame.Target != nil {
 			target := common.HexToAddress(*frame.Target)
 			converted.Target = &target
@@ -240,7 +242,36 @@ func loadFrameTxVector(t *testing.T) (*FrameTx, storedFrameTxVector) {
 	for _, signature := range stored.Transaction.Signatures {
 		tx.Signatures = append(tx.Signatures, TxSignature{Scheme: signature.Scheme, Signer: common.HexToAddress(signature.Signer), Msg: decode(signature.Msg), Signature: decode(signature.Signature)})
 	}
+	for _, ref := range stored.Transaction.RecentRootRefs {
+		tx.RecentRootRefs = append(tx.RecentRootRefs, RecentRootRef{
+			SourceID: common.HexToHash(ref.SourceID),
+			Slot:     parseU64(ref.Slot),
+			Root:     common.HexToHash(ref.Root),
+		})
+	}
 	return tx, stored
+}
+
+func TestFrameTxGoldenVector(t *testing.T) {
+	frame, stored := loadFrameTxVector(t)
+	tx := NewTx(frame)
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hexutil.Encode(raw); got != stored.RawTransaction {
+		t.Errorf("raw transaction = %s", got)
+	}
+	if got := frame.SigHash(frame.chainID()).Hex(); got != stored.SigHash {
+		t.Errorf("signature hash = %s", got)
+	}
+	intrinsic, err := frame.IntrinsicGas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strconv.FormatUint(intrinsic, 10); got != stored.IntrinsicGas {
+		t.Errorf("intrinsic gas = %s", got)
+	}
 }
 
 func expectedFrameTxCalldataGas(ftx *FrameTx) uint64 {
