@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -653,6 +654,10 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 			errs[i] = err
 			continue
 		}
+		if err := validateFrameBlobProofs(tx); err != nil {
+			errs[i] = err
+			continue
+		}
 		if err := p.validateAndAdd(tx); err != nil {
 			errs[i] = err
 			continue
@@ -663,6 +668,27 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 		p.txFeed.Send(core.NewTxsEvent{Txs: added})
 	}
 	return errs
+}
+
+func validateFrameBlobProofs(tx *types.Transaction) error {
+	if tx.BlobGas() == 0 {
+		return nil
+	}
+	sidecar := tx.BlobTxSidecar()
+	if sidecar == nil {
+		return errors.New("missing sidecar in blob frame transaction")
+	}
+	cells, err := kzg4844.ComputeCells(sidecar.Blobs)
+	if err != nil {
+		return err
+	}
+	return txpool.ValidateCells(&types.BlobTxCellSidecar{
+		Version:     sidecar.Version,
+		Commitments: sidecar.Commitments,
+		Proofs:      sidecar.Proofs,
+		Cells:       cells,
+		Custody:     types.CustodyBitmapAll,
+	})
 }
 
 func validateFrameNonce(tx *types.FrameTx, statedb *state.StateDB) error {

@@ -217,6 +217,32 @@ func TestBlobFrameNetworkEncoding(t *testing.T) {
 	}
 }
 
+func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	var (
+		blob       kzg4844.Blob
+		commitment kzg4844.Commitment
+		proofs     = make([]kzg4844.Proof, kzg4844.CellProofsPerBlob)
+	)
+	ftx := baseFTX(sender, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		proofs,
+	))
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err == nil {
+		t.Fatal("frame pool accepted invalid blob commitment/proofs")
+	}
+}
+
 // baseFTX returns a valid FrameTx skeleton for the given sender.
 func baseFTX(sender common.Address, nonce uint64, config *params.ChainConfig) *types.FrameTx {
 	return &types.FrameTx{
@@ -675,10 +701,17 @@ func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	var (
-		blob       kzg4844.Blob
-		commitment kzg4844.Commitment
-		zero       uint64
+		blob kzg4844.Blob
+		zero uint64
 	)
+	commitment, err := kzg4844.BlobToCommitment(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := kzg4844.ComputeCellProofs(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pool.currentHead.ExcessBlobGas = &zero
 	pool.currentHead.BlobGasUsed = &zero
 	ftx := baseFTX(sender, 0, config)
@@ -689,7 +722,7 @@ func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T)
 		types.BlobSidecarVersion1,
 		[]kzg4844.Blob{blob},
 		[]kzg4844.Commitment{commitment},
-		make([]kzg4844.Proof, kzg4844.CellProofsPerBlob),
+		proofs,
 	))
 	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
 		t.Fatalf("add blob frame transaction: %v", err)
