@@ -342,8 +342,25 @@ func TestCallDefaultsRejectsFrameNonceKeysWithoutSequence(t *testing.T) {
 		Frames:    &frames,
 		NonceKeys: []*hexutil.Big{(*hexutil.Big)(big.NewInt(1))},
 	}
-	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("CallDefaults error = %v, want obsolete nonce field rejection", err)
+	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err == nil || !strings.Contains(err.Error(), "requires") {
+		t.Fatalf("CallDefaults error = %v, want missing nonce sequence rejection", err)
+	}
+}
+
+func TestCallDefaultsAcceptsFrameNonceKeys(t *testing.T) {
+	frames := []types.Frame{}
+	seq := hexutil.Uint64(4)
+	args := &TransactionArgs{
+		Frames:    &frames,
+		NonceKeys: []*hexutil.Big{(*hexutil.Big)(big.NewInt(7)), (*hexutil.Big)(big.NewInt(11))},
+		NonceSeq:  &seq,
+	}
+	if err := args.CallDefaults(1_000_000, big.NewInt(1), big.NewInt(42)); err != nil {
+		t.Fatal(err)
+	}
+	ftx := args.ToTransaction(types.FrameTxType).GetFrameTx()
+	if ftx.NonceSeq != 4 || len(ftx.NonceKeys) != 2 || ftx.NonceKeys[0].Uint64() != 7 || ftx.NonceKeys[1].Uint64() != 11 {
+		t.Fatalf("unexpected keyed nonce: keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
 	}
 }
 

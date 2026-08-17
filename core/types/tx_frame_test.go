@@ -865,7 +865,8 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 	type rawFrameTx struct {
 		ChainID    *uint256.Int
-		Nonce      uint64
+		NonceKeys  []*uint256.Int
+		NonceSeq   uint64
 		Sender     common.Address
 		Frames     []rawFrame
 		Signatures []rawSignature
@@ -874,9 +875,10 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	}
 
 	raw := rawFrameTx{
-		ChainID: uint256.NewInt(1),
-		Nonce:   1,
-		Sender:  common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		ChainID:   uint256.NewInt(1),
+		NonceKeys: []*uint256.Int{new(uint256.Int)},
+		NonceSeq:  1,
+		Sender:    common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Frames: []rawFrame{
 			{
 				Mode:   FrameModeVerify,

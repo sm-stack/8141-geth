@@ -182,7 +182,14 @@ const (
 	txParamFrameIndex         = 0x0a
 	txParamSignatureCount     = 0x0b
 	txParamStateGasLeft       = 0x0c
-	txParamRecentRootRefCount = 0x0d
+	txParamNonceKeyCount      = 0x0d
+	txParamNonceKeysHash      = 0x0e
+	txParamRecentRootRefCount = 0x0f
+	txParamNonceKey0          = 0x10
+	// EIP-8250 assigns 0x0c to the legacy nonce, but the current EIP-8141
+	// assigns that selector to state_gas_left. Use the next free selector
+	// until the draft specifications resolve the collision.
+	txParamLegacyNonce = 0x11
 )
 
 // FRAMEPARAM parameter selectors.
@@ -316,8 +323,19 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		param.SetUint64(uint64(len(fc.Signatures)))
 	case txParamStateGasLeft:
 		param.SetUint64(scope.Contract.Gas.StateGas)
+	case txParamNonceKeyCount:
+		param.SetUint64(uint64(len(fc.NonceKeys)))
+	case txParamNonceKeysHash:
+		param.SetBytes32(fc.NonceKeysHash[:])
 	case txParamRecentRootRefCount:
 		param.SetUint64(uint64(len(fc.RecentRootRefs)))
+	case txParamNonceKey0:
+		if len(fc.NonceKeys) == 0 || fc.NonceKeys[0] == nil {
+			return nil, invalidFrameOpcode(TXPARAM)
+		}
+		param.Set(fc.NonceKeys[0])
+	case txParamLegacyNonce:
+		param.SetUint64(fc.LegacyNonce)
 	default:
 		return nil, invalidFrameOpcode(TXPARAM)
 	}

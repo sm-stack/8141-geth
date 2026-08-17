@@ -143,6 +143,10 @@ func TestTxParamKeyedNonceSelectors(t *testing.T) {
 		want     *uint256.Int
 	}{
 		{txParamNonce, uint256.NewInt(3)},
+		{txParamNonceKeyCount, uint256.NewInt(2)},
+		{txParamNonceKeysHash, new(uint256.Int).SetBytes(fc.NonceKeysHash[:])},
+		{txParamNonceKey0, uint256.NewInt(7)},
+		{txParamLegacyNonce, uint256.NewInt(19)},
 	}
 	for _, tt := range tests {
 		evm := NewEVM(BlockContext{}, nil, params.TestChainConfig, Config{})
@@ -164,6 +168,9 @@ func TestTxParamKeyedNonceSelectors(t *testing.T) {
 }
 
 func TestRecentRootIntrospection(t *testing.T) {
+	if txParamRecentRootRefCount != 0x0f {
+		t.Fatalf("unexpected recent-root TXPARAM assignment: %#x", txParamRecentRootRefCount)
+	}
 	if RECENTROOTREFLOAD != 0xb5 || RECENTROOTREFLOAD.String() != "RECENTROOTREFLOAD" {
 		t.Fatalf("unexpected recent-root opcode assignment: %#x %s", RECENTROOTREFLOAD, RECENTROOTREFLOAD)
 	}

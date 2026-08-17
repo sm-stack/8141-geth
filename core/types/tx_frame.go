@@ -200,7 +200,7 @@ type RecentRootRef struct {
 
 // FrameTx implements the EIP-8141 frame transaction.
 //
-// RLP encoding: [chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes, recent_root_references]
+// RLP encoding: [chain_id, nonce_keys, nonce_seq, sender, frames, signatures, fees, blob_versioned_hashes, recent_root_references]
 // where fees = [max_priority_fee_per_gas, max_fee_per_gas, max_fee_per_blob_gas].
 type FrameTx struct {
 	ChainID        *uint256.Int
@@ -357,7 +357,7 @@ func (tx *FrameTx) encode(b *bytes.Buffer) error {
 
 func (tx *FrameTx) rlpPayload() *frameTxRLP {
 	return &frameTxRLP{
-		ChainID: tx.ChainID, Nonce: tx.NonceSeq, Sender: tx.Sender,
+		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq, Sender: tx.Sender,
 		Frames: tx.Frames, Signatures: tx.Signatures,
 		Fees:           frameTxFees{GasTipCap: tx.GasTipCap, GasFeeCap: tx.GasFeeCap, BlobFeeCap: tx.BlobFeeCap},
 		BlobHashes:     tx.BlobHashes,
@@ -408,8 +408,7 @@ func (tx *FrameTx) decode(input []byte) error {
 		}
 		tx.Sidecar = sidecar
 	}
-	tx.ChainID, tx.NonceSeq = dec.ChainID, dec.Nonce
-	tx.NonceKeys = []*uint256.Int{new(uint256.Int)}
+	tx.ChainID, tx.NonceKeys, tx.NonceSeq = dec.ChainID, dec.NonceKeys, dec.NonceSeq
 	tx.Sender, tx.Frames, tx.Signatures = dec.Sender, dec.Frames, dec.Signatures
 	tx.GasTipCap, tx.GasFeeCap, tx.BlobFeeCap = dec.Fees.GasTipCap, dec.Fees.GasFeeCap, dec.Fees.BlobFeeCap
 	tx.BlobHashes = dec.BlobHashes
@@ -419,7 +418,8 @@ func (tx *FrameTx) decode(input []byte) error {
 
 type frameTxRLP struct {
 	ChainID        *uint256.Int
-	Nonce          uint64
+	NonceKeys      []*uint256.Int
+	NonceSeq       uint64
 	Sender         common.Address
 	Frames         []Frame
 	Signatures     []TxSignature
@@ -456,9 +456,19 @@ func (tx *FrameTx) rlpRecentRootRefsData() []byte {
 	return buf.Bytes()
 }
 
+// rlpNonceData returns the consecutive EIP-8250 nonce fields as encoded in the
+// transaction payload.
+func (tx *FrameTx) rlpNonceData() []byte {
+	var buf bytes.Buffer
+	rlp.Encode(&buf, tx.NonceKeys)
+	rlp.Encode(&buf, tx.NonceSeq)
+	return buf.Bytes()
+}
+
 // frameTxCalldataBytes returns the raw byte strings charged as frame tx data.
 func (tx *FrameTx) frameTxCalldataBytes() [][]byte {
-	chunks := make([][]byte, 0, len(tx.Frames)+3*len(tx.Signatures)+1)
+	chunks := make([][]byte, 0, len(tx.Frames)+3*len(tx.Signatures)+2)
+	chunks = append(chunks, tx.rlpNonceData())
 	for i := range tx.Frames {
 		chunks = append(chunks, tx.Frames[i].Data)
 	}
@@ -707,8 +717,8 @@ func (tx *FrameTx) Validate() error {
 	if tx.BlobFeeCap == nil {
 		return errors.New("frame tx missing max_fee_per_blob_gas")
 	}
-	if len(tx.NonceKeys) != 1 || tx.NonceKeys[0] == nil || !tx.NonceKeys[0].IsZero() {
-		return errors.New("frame tx uses obsolete keyed nonce encoding")
+	if err := ValidateNonceKeys(tx.NonceKeys); err != nil {
+		return err
 	}
 	if len(tx.RecentRootRefs) > params.MaxRecentRootReferences {
 		return fmt.Errorf("frame tx has %d recent root references, max %d", len(tx.RecentRootRefs), params.MaxRecentRootReferences)

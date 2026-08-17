@@ -1077,6 +1077,8 @@ type RPCTransaction struct {
 	Hash                 common.Hash                  `json:"hash"`
 	Input                hexutil.Bytes                `json:"input"`
 	Nonce                *hexutil.Uint64              `json:"nonce,omitempty"`
+	NonceKeys            []*hexutil.Big               `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64              `json:"nonceSeq,omitempty"`
 	To                   *common.Address              `json:"to"`
 	TransactionIndex     *hexutil.Uint64              `json:"transactionIndex"`
 	Value                *hexutil.Big                 `json:"value"`
@@ -1187,7 +1189,12 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 
 	case types.FrameTxType:
 		frameTx := tx.GetFrameTx()
-		result.Nonce = (*hexutil.Uint64)(&frameTx.NonceSeq)
+		result.Nonce = nil
+		result.NonceKeys = make([]*hexutil.Big, len(frameTx.NonceKeys))
+		for i, key := range frameTx.NonceKeys {
+			result.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
+		}
+		result.NonceSeq = (*hexutil.Uint64)(&frameTx.NonceSeq)
 		result.ChainID = (*hexutil.Big)(tx.ChainId())
 		result.Sender = &frameTx.Sender
 		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())

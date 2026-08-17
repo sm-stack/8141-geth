@@ -249,6 +249,20 @@ func TestDeveloperGenesisIncludesRecentRootContract(t *testing.T) {
 	}
 }
 
+func TestDeveloperGenesisIncludesNonceManager(t *testing.T) {
+	genesis := DeveloperGenesisBlock(30_000_000, nil)
+	account, ok := genesis.Alloc[params.NonceManagerAddress]
+	if !ok {
+		t.Fatal("nonce manager missing from developer genesis")
+	}
+	if account.Nonce != 1 {
+		t.Fatalf("nonce manager nonce = %d, want 1", account.Nonce)
+	}
+	if !bytes.Equal(account.Code, params.NonceManagerCode) {
+		t.Fatalf("nonce manager code = %x, want %x", account.Code, params.NonceManagerCode)
+	}
+}
+
 func TestReadWriteGenesisAlloc(t *testing.T) {
 	var (
 		db    = rawdb.NewMemoryDatabase()

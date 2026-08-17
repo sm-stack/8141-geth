@@ -131,15 +131,15 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend, config 
 		args.Value = new(hexutil.Big)
 	}
 	if args.isFrameTx() {
-		if args.NonceKeys != nil || args.NonceSeq != nil {
-			return errors.New("nonceKeys and nonceSeq are not supported by frame transactions")
-		}
-		if args.Nonce == nil {
+		if args.NonceKeys == nil && args.Nonce == nil {
 			nonce, err := b.GetPoolNonce(ctx, args.frameSender())
 			if err != nil {
 				return err
 			}
 			args.Nonce = (*hexutil.Uint64)(&nonce)
+		}
+		if err := args.setFrameNonceDefaults(); err != nil {
+			return err
 		}
 	} else if args.Nonce == nil {
 		nonce, err := b.GetPoolNonce(ctx, args.from())
@@ -456,11 +456,8 @@ func (args *TransactionArgs) CallDefaults(globalGasCap uint64, baseFee *big.Int,
 		}
 	}
 	if args.isFrameTx() {
-		if args.NonceKeys != nil || args.NonceSeq != nil {
-			return errors.New("nonceKeys and nonceSeq are not supported by frame transactions")
-		}
-		if args.Nonce == nil {
-			args.Nonce = new(hexutil.Uint64)
+		if err := args.setFrameNonceDefaults(); err != nil {
+			return err
 		}
 	} else if args.Nonce == nil {
 		args.Nonce = new(hexutil.Uint64)
@@ -570,9 +567,19 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 	var data types.TxData
 	switch usedType {
 	case types.FrameTxType:
-		nonce := uint64(0)
-		if args.Nonce != nil {
-			nonce = uint64(*args.Nonce)
+		nonceKeyArgs := args.NonceKeys
+		nonceSeq := args.NonceSeq
+		if nonceKeyArgs == nil {
+			nonceKeyArgs = []*hexutil.Big{(*hexutil.Big)(new(big.Int))}
+			seq := hexutil.Uint64(0)
+			if args.Nonce != nil {
+				seq = *args.Nonce
+			}
+			nonceSeq = &seq
+		}
+		nonceKeys := make([]*uint256.Int, len(nonceKeyArgs))
+		for i, key := range nonceKeyArgs {
+			nonceKeys[i] = uint256.MustFromBig(key.ToInt())
 		}
 		frames := []types.Frame{}
 		if args.Frames != nil {
@@ -592,8 +599,8 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		}
 		data = &types.FrameTx{
 			ChainID:        uint256.MustFromBig(args.ChainID.ToInt()),
-			NonceKeys:      []*uint256.Int{new(uint256.Int)},
-			NonceSeq:       nonce,
+			NonceKeys:      nonceKeys,
+			NonceSeq:       uint64(*nonceSeq),
 			Sender:         args.frameSender(),
 			Frames:         frames,
 			Signatures:     signatures,
@@ -692,6 +699,41 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		}
 	}
 	return types.NewTx(data)
+}
+
+func (args *TransactionArgs) setFrameNonceDefaults() error {
+	if args.NonceKeys == nil {
+		if args.NonceSeq != nil {
+			return errors.New(`frame transaction cannot specify "nonceSeq" without "nonceKeys"`)
+		}
+		if args.Nonce == nil {
+			args.Nonce = new(hexutil.Uint64)
+		}
+		args.NonceKeys = []*hexutil.Big{(*hexutil.Big)(new(big.Int))}
+		seq := *args.Nonce
+		args.NonceSeq = &seq
+	} else {
+		if args.NonceSeq == nil {
+			return errors.New(`frame transaction with "nonceKeys" requires "nonceSeq"`)
+		}
+		if args.Nonce != nil {
+			return errors.New(`frame transaction cannot specify both "nonce" and "nonceKeys"`)
+		}
+		seq := *args.NonceSeq
+		args.Nonce = &seq
+	}
+	keys := make([]*uint256.Int, len(args.NonceKeys))
+	for i, key := range args.NonceKeys {
+		if key == nil {
+			return fmt.Errorf("nonceKeys[%d] is null", i)
+		}
+		var overflow bool
+		keys[i], overflow = uint256.FromBig(key.ToInt())
+		if overflow {
+			return fmt.Errorf("nonceKeys[%d] exceeds uint256", i)
+		}
+	}
+	return types.ValidateNonceKeys(keys)
 }
 
 // IsEIP4844 returns an indicator if the args contains EIP4844 fields.

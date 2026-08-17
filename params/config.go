@@ -1235,6 +1235,7 @@ func (c *ChainConfig) ActiveSystemContracts(time uint64) map[string]common.Addre
 	}
 	if fork >= forks.Bogota {
 		active["EXPIRY_VERIFIER_ADDRESS"] = FrameExpiryVerifierAddress
+		active["NONCE_MANAGER_ADDRESS"] = NonceManagerAddress
 		active["RECENT_ROOT_ADDRESS"] = RecentRootAddress
 	}
 	if fork >= forks.Prague {

@@ -164,8 +164,8 @@ func TestNewRPCTransactionFrameTx(t *testing.T) {
 	if pending.Sender == nil || *pending.Sender != sender {
 		t.Fatalf("sender mismatch: got %v want %v", pending.Sender, sender)
 	}
-	if pending.Nonce == nil || *pending.Nonce != 7 {
-		t.Fatalf("unexpected frame nonce: %v", pending.Nonce)
+	if pending.Nonce != nil || pending.NonceSeq == nil || *pending.NonceSeq != 7 || len(pending.NonceKeys) != 1 || (*big.Int)(pending.NonceKeys[0]).Sign() != 0 {
+		t.Fatalf("unexpected frame nonce: nonce=%v keys=%v seq=%v", pending.Nonce, pending.NonceKeys, pending.NonceSeq)
 	}
 	if pending.Frames == nil || len(*pending.Frames) != 2 {
 		t.Fatalf("frames length mismatch: got %v want 2", pending.Frames)
@@ -216,7 +216,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshalling failed: %v", err)
 	}
 	have := string(data)
-	for _, want := range []string{`"sender"`, `"nonce"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
+	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
 		if !strings.Contains(have, want) {
 			t.Fatalf("rpc frame tx json missing %s: %s", want, have)
 		}

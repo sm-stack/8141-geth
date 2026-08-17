@@ -19,6 +19,7 @@ package types
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -33,6 +34,8 @@ type txJSON struct {
 
 	ChainID              *hexutil.Big           `json:"chainId,omitempty"`
 	Nonce                *hexutil.Uint64        `json:"nonce,omitempty"`
+	NonceKeys            []*hexutil.Big         `json:"nonceKeys,omitempty"`
+	NonceSeq             *hexutil.Uint64        `json:"nonceSeq,omitempty"`
 	From                 *common.Address        `json:"from,omitempty"`
 	Sender               *common.Address        `json:"sender,omitempty"`
 	To                   *common.Address        `json:"to"`
@@ -179,7 +182,11 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 
 	case *FrameTx:
 		enc.ChainID = (*hexutil.Big)(itx.ChainID.ToBig())
-		enc.Nonce = (*hexutil.Uint64)(&itx.NonceSeq)
+		enc.NonceKeys = make([]*hexutil.Big, len(itx.NonceKeys))
+		for i, key := range itx.NonceKeys {
+			enc.NonceKeys[i] = (*hexutil.Big)(key.ToBig())
+		}
+		enc.NonceSeq = (*hexutil.Uint64)(&itx.NonceSeq)
 		enc.Sender = &itx.Sender
 		gas := itx.TotalGas()
 		enc.Gas = (*hexutil.Uint64)(&gas)
@@ -545,11 +552,23 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 		if overflow {
 			return errors.New("'chainId' value overflows uint256")
 		}
-		if dec.Nonce == nil {
-			return errors.New("missing required field 'nonce' in frame transaction")
+		if len(dec.NonceKeys) == 0 {
+			return errors.New("missing required field 'nonceKeys' in frame transaction")
 		}
-		itx.NonceKeys = []*uint256.Int{new(uint256.Int)}
-		itx.NonceSeq = uint64(*dec.Nonce)
+		itx.NonceKeys = make([]*uint256.Int, len(dec.NonceKeys))
+		for i, key := range dec.NonceKeys {
+			if key == nil {
+				return fmt.Errorf("nonceKeys[%d] is null", i)
+			}
+			itx.NonceKeys[i], overflow = uint256.FromBig(key.ToInt())
+			if overflow {
+				return fmt.Errorf("nonceKeys[%d] overflows uint256", i)
+			}
+		}
+		if dec.NonceSeq == nil {
+			return errors.New("missing required field 'nonceSeq' in frame transaction")
+		}
+		itx.NonceSeq = uint64(*dec.NonceSeq)
 		switch {
 		case dec.Sender != nil:
 			itx.Sender = *dec.Sender

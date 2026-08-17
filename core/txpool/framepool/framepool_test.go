@@ -714,7 +714,7 @@ func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T)
 	}
 }
 
-func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
+func TestFramePoolAcceptsKeyedNonceDomain(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
@@ -724,8 +724,8 @@ func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
 	ftx := baseFTX(sender, 0, config)
 	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(101)}
 	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50000}}
-	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err == nil || !strings.Contains(err.Error(), "obsolete keyed nonce") {
-		t.Fatalf("obsolete keyed nonce error = %v", err)
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("keyed nonce rejected: %v", err)
 	}
 }
 
@@ -1277,8 +1277,8 @@ func TestFramePoolRejectsInsufficientKeyedNonceSurchargeGas(t *testing.T) {
 	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
 	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 10_000}}
 	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
-	if err == nil || !strings.Contains(err.Error(), "obsolete keyed nonce") {
-		t.Fatalf("obsolete keyed nonce error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "need 20000") {
+		t.Fatalf("keyed nonce surcharge error = %v", err)
 	}
 }
 
