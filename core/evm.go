@@ -66,6 +66,10 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 	if header.SlotNumber != nil {
 		slotNum = *header.SlotNumber
 	}
+	slotProvider := vm.SlotProvider(vm.TimestampSlotProvider{Timestamp: header.Time})
+	if header.SlotNumber != nil {
+		slotProvider = vm.SlotNumberProvider(*header.SlotNumber)
+	}
 
 	return vm.BlockContext{
 		CanTransfer:      CanTransfer,
@@ -80,6 +84,7 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 		GasLimit:         header.GasLimit,
 		Random:           random,
 		SlotNum:          slotNum,
+		SlotProvider:     slotProvider,
 		CostPerStateByte: params.CostPerStateByte,
 	}
 }

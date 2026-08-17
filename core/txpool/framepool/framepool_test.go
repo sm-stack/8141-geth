@@ -65,6 +65,15 @@ func newReserver() *reserver {
 	return &reserver{accounts: make(map[common.Address]struct{})}
 }
 
+func TestSlotProviderUsesHeaderSlotNumber(t *testing.T) {
+	pool, _, _ := newTestEnv()
+	slot := uint64(8272)
+	head := &types.Header{Time: 120, SlotNumber: &slot}
+	if got := pool.slotProvider(head).CurrentSlot(); got != slot {
+		t.Fatalf("current slot = %d, want %d", got, slot)
+	}
+}
+
 func (r *reserver) Hold(addr common.Address) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()

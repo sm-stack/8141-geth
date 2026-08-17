@@ -80,6 +80,11 @@ type TimestampSlotProvider struct{ Timestamp uint64 }
 
 func (p TimestampSlotProvider) CurrentSlot() uint64 { return p.Timestamp / params.SecondsPerSlot }
 
+// SlotNumberProvider exposes an explicit consensus-layer slot number.
+type SlotNumberProvider uint64
+
+func (p SlotNumberProvider) CurrentSlot() uint64 { return uint64(p) }
+
 // TxContext provides the EVM with information about a transaction.
 // All fields can change between transactions.
 type TxContext struct {

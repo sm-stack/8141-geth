@@ -72,6 +72,23 @@ func TestRecentRootNativeWriteLastWriteWins(t *testing.T) {
 	}
 }
 
+func TestRecentRootNativeWriteUsesConsensusSlot(t *testing.T) {
+	evm, db := newRecentRootEVM(t, 120)
+	evm.Context.SlotProvider = vm.SlotNumberProvider(77)
+	source := common.HexToAddress("0x1234")
+	salt := common.HexToHash("0x55")
+	root := common.HexToHash("0x01")
+	input := append(bytes.Clone(salt[:]), root[:]...)
+	if _, _, err := evm.Call(source, params.RecentRootAddress, input, vm.NewGasBudget(100_000, 0), new(uint256.Int)); err != nil {
+		t.Fatal(err)
+	}
+	sourceID := types.RecentRootSourceID(source, salt)
+	key := types.RecentRootStorageKey(sourceID, 77)
+	if got, want := db.GetState(params.RecentRootAddress, key), types.RecentRootEntryHash(sourceID, 77, root); got != want {
+		t.Fatalf("entry = %s, want %s", got, want)
+	}
+}
+
 func TestRecentRootNativeWriteRejectsInvalidCalls(t *testing.T) {
 	evm, db := newRecentRootEVM(t, 120)
 	source := common.HexToAddress("0x1234")

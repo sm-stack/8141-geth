@@ -191,6 +191,9 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
 		blobSidecars:               make(map[common.Hash]cachedBlobSidecar),
 		slotProvider: func(head *types.Header) vm.SlotProvider {
+			if head.SlotNumber != nil {
+				return vm.SlotNumberProvider(*head.SlotNumber)
+			}
 			return vm.TimestampSlotProvider{Timestamp: head.Time}
 		},
 
