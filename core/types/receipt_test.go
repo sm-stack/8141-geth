@@ -733,6 +733,50 @@ func TestReceiptForStorageFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFrameReceiptDecodeRejectsInvalidStatus(t *testing.T) {
+	payload := frameReceiptPayload{
+		FrameReceipts: []frameReceiptRLP{{Status: 3}},
+	}
+	encoded, err := rlp.EncodeToBytes(&payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded = append([]byte{FrameTxType}, encoded...)
+	var receipt Receipt
+	if err := receipt.UnmarshalBinary(encoded); err == nil {
+		t.Fatal("decoded frame receipt with invalid status")
+	}
+}
+
+func TestReceiptForStorageRejectsMismatchedFrameFields(t *testing.T) {
+	frame := &Receipt{
+		Type:              FrameTxType,
+		CumulativeGasUsed: 12,
+		FrameReceipts: []FrameReceipt{{
+			Status: FrameReceiptStatusSuccessful,
+			Logs:   []*Log{{Address: common.HexToAddress("0x1234")}},
+		}},
+	}
+	status, err := encodeFrameStorageStatus(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []storedReceiptRLP{
+		{PostStateOrStatus: status, CumulativeGasUsed: 13, Logs: flattenFrameLogs(frame.FrameReceipts)},
+		{PostStateOrStatus: status, CumulativeGasUsed: 12, Logs: []*Log{}},
+	}
+	for i, test := range tests {
+		encoded, err := rlp.EncodeToBytes(&test)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receipt ReceiptForStorage
+		if err := rlp.DecodeBytes(encoded, &receipt); err == nil {
+			t.Fatalf("test %d: decoded mismatched frame storage fields", i)
+		}
+	}
+}
+
 func TestReceiptForStorageFramePayloadDoesNotCollideWithPostState(t *testing.T) {
 	postState := make([]byte, common.HashLength)
 	postState[0] = FrameTxType
@@ -956,7 +1000,7 @@ func TestFrameReceiptJSONRejectsInvalidStatus(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected frameReceipts[0] payload: %#v", frameReceipts[0])
 	}
-	first["status"] = "0x02"
+	first["status"] = "0x3"
 	mutated, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload error: %v", err)

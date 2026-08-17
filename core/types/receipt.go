@@ -316,8 +316,7 @@ func (r *Receipt) decodeTyped(b []byte) error {
 			return err
 		}
 		r.Type = b[0]
-		r.setFromFrameRLP(data)
-		return nil
+		return r.setFromFrameRLP(data)
 	default:
 		return ErrTxTypeNotSupported
 	}
@@ -330,7 +329,12 @@ func (r *Receipt) setFromRLP(data receiptRLP) error {
 	return r.setStatus(data.PostStateOrStatus)
 }
 
-func (r *Receipt) setFromFrameRLP(data frameReceiptPayload) {
+func (r *Receipt) setFromFrameRLP(data frameReceiptPayload) error {
+	for i, frame := range data.FrameReceipts {
+		if !validFrameReceiptStatus(uint64(frame.Status)) {
+			return fmt.Errorf("invalid frame receipt status %d at index %d", frame.Status, i)
+		}
+	}
 	r.CumulativeGasUsed = data.CumulativeGasUsed
 	r.Payer = data.Payer
 	r.FrameReceipts = frameReceiptsFromRLP(data.FrameReceipts)
@@ -338,6 +342,25 @@ func (r *Receipt) setFromFrameRLP(data frameReceiptPayload) {
 	r.Status = ReceiptStatusSuccessful
 	r.PostState = nil
 	r.Bloom = CreateBloom(r)
+	return nil
+}
+
+func validateStoredFrameReceipt(data frameReceiptPayload, cumulativeGasUsed uint64, logs []*Log) error {
+	if data.CumulativeGasUsed != cumulativeGasUsed {
+		return errors.New("frame receipt cumulative gas mismatch")
+	}
+	frameLogs, err := rlp.EncodeToBytes(flattenFrameLogs(frameReceiptsFromRLP(data.FrameReceipts)))
+	if err != nil {
+		return err
+	}
+	storedLogs, err := rlp.EncodeToBytes(logs)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(frameLogs, storedLogs) {
+		return errors.New("frame receipt logs mismatch")
+	}
+	return nil
 }
 
 func frameReceiptsToRLP(frames []FrameReceipt) []frameReceiptRLP {
@@ -539,9 +562,11 @@ func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
 			if err != nil {
 				return err
 			}
+			if err := validateStoredFrameReceipt(frame, stored.CumulativeGasUsed, stored.Logs); err != nil {
+				return err
+			}
 			r.Type = FrameTxType
-			(*Receipt)(r).setFromFrameRLP(frame)
-			return nil
+			return (*Receipt)(r).setFromFrameRLP(frame)
 		}
 		r.Type = LegacyTxType
 		if err := (*Receipt)(r).setStatus(stored.PostStateOrStatus); err != nil {
@@ -575,8 +600,7 @@ func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
 			return err
 		}
 		(*Receipt)(r).Type = b[0]
-		(*Receipt)(r).setFromFrameRLP(payload)
-		return nil
+		return (*Receipt)(r).setFromFrameRLP(payload)
 	}
 }
 
@@ -695,23 +719,11 @@ func (r *SlimReceipt) DecodeRLP(s *rlp.Stream) error {
 		if err != nil {
 			return err
 		}
-		if frame.CumulativeGasUsed != data.CumulativeGasUsed {
-			return errors.New("frame receipt cumulative gas mismatch")
-		}
-		frameLogs, err := rlp.EncodeToBytes(flattenFrameLogs(frameReceiptsFromRLP(frame.FrameReceipts)))
-		if err != nil {
+		if err := validateStoredFrameReceipt(frame, data.CumulativeGasUsed, data.Logs); err != nil {
 			return err
-		}
-		logs, err := rlp.EncodeToBytes(data.Logs)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(frameLogs, logs) {
-			return errors.New("frame receipt logs mismatch")
 		}
 		(*Receipt)(r).Type = FrameTxType
-		(*Receipt)(r).setFromFrameRLP(frame)
-		return nil
+		return (*Receipt)(r).setFromFrameRLP(frame)
 	}
 	r.Type = data.Type
 	r.CumulativeGasUsed = data.CumulativeGasUsed
