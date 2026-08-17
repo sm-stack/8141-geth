@@ -1007,6 +1007,52 @@ func TestFrameTxPayerInsufficientBalance(t *testing.T) {
 	t.Logf("got expected error: %v", err)
 }
 
+func TestFrameTxPayerInsufficientBalanceRevertsFrame(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	sender := common.HexToAddress("0x1111")
+	poorPayer := common.HexToAddress("0x2222")
+	fundedPayer := common.HexToAddress("0x3333")
+
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetCode(poorPayer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetCode(fundedPayer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(poorPayer, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	statedb.SetBalance(fundedPayer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		Sender:    sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 50_000},
+			{Mode: types.FrameModeDefault, Flags: types.FrameFlagApprovePayment, Target: &poorPayer, GasLimit: 50_000},
+			{Mode: types.FrameModeDefault, Flags: types.FrameFlagApprovePayment, Target: &fundedPayer, GasLimit: 50_000},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	result, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.payer != fundedPayer {
+		t.Fatalf("payer = %s, want %s", result.payer, fundedPayer)
+	}
+	wantStatus := []uint8{types.FrameReceiptStatusSuccessful, types.FrameReceiptStatusFailed, types.FrameReceiptStatusSuccessful}
+	for i, want := range wantStatus {
+		if result.frameResults[i] != want {
+			t.Fatalf("frame %d status = %d, want %d", i, result.frameResults[i], want)
+		}
+	}
+	if got := statedb.GetNonce(sender); got != 1 {
+		t.Fatalf("sender nonce = %d, want 1", got)
+	}
+	if got := statedb.GetBalance(poorPayer); !got.Eq(uint256.NewInt(1)) {
+		t.Fatalf("poor payer balance changed: %s", got)
+	}
+}
+
 func TestFrameTxApproveScopeMustBeAllowedByFrameFlags(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
@@ -1063,6 +1109,32 @@ func TestFrameTxApproveScopeZeroRejected(t *testing.T) {
 	_, err := applyFrameTx(evm, config, msg)
 	if err == nil {
 		t.Fatal("expected error: APPROVE(0x0) must be rejected")
+	}
+}
+
+func TestFrameTxApproveScopeRejectsHighBits(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	sender := common.HexToAddress("0x1111")
+	approveWideScopeCode := []byte{
+		0x68, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // PUSH9 2^64+1
+		0x5f, 0x5f, 0xaa, // PUSH0, PUSH0, APPROVE
+	}
+	statedb.SetCode(sender, approveWideScopeCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		Sender:    sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, GasLimit: 50_000},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	if _, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))); err == nil {
+		t.Fatal("APPROVE accepted scope with high bits set")
 	}
 }
 

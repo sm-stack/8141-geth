@@ -1680,33 +1680,38 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []types.Fra
 				} else if approvals.payerApproved {
 					needRevert = true
 				} else {
-					stateBeforeNonce := remaining.StateGas
-					nonceGas, legacyNonceAfter, keyedWrites, err := st.consumeFrameNonce(&remaining)
+					gasCharge, err := st.framePayerMaxCost()
 					if err != nil {
+						return common.Address{}, nil, nil, nil, err
+					}
+					if st.state.GetBalance(target).Cmp(gasCharge) < 0 {
 						needRevert = true
-						additionalGas := frame.GasLimit - frameGasUsed[i].Execution
-						frameGasUsed[i].Execution += additionalGas
-						frameCtx.FrameGasUsed[i] = frameGasUsed[i]
-						totalExecutionGasUsed += additionalGas
 					} else {
-						remaining.ExecutionGas -= nonceGas
-						frameGasUsed[i].Execution += nonceGas
-						frameGasUsed[i].State += stateBeforeNonce - remaining.StateGas
-						frameCtx.FrameGasUsed[i] = frameGasUsed[i]
-						totalExecutionGasUsed += nonceGas
-						gasCharge, err := st.collectGasFromPayer(target)
+						stateBeforeNonce := remaining.StateGas
+						nonceGas, legacyNonceAfter, keyedWrites, err := st.consumeFrameNonce(&remaining)
 						if err != nil {
-							return common.Address{}, nil, nil, nil, err
-						}
-						approvals.payer = target
-						st.frameMaxCost = new(uint256.Int).Set(gasCharge)
-						approvals.payerApproved = true
-						approvals.paymentEffect = &framePaymentEffect{
-							frameIndex:       i,
-							payer:            target,
-							gasCharge:        gasCharge,
-							legacyNonceAfter: legacyNonceAfter,
-							keyedNonceWrites: keyedWrites,
+							needRevert = true
+							additionalGas := frame.GasLimit - frameGasUsed[i].Execution
+							frameGasUsed[i].Execution += additionalGas
+							frameCtx.FrameGasUsed[i] = frameGasUsed[i]
+							totalExecutionGasUsed += additionalGas
+						} else {
+							remaining.ExecutionGas -= nonceGas
+							frameGasUsed[i].Execution += nonceGas
+							frameGasUsed[i].State += stateBeforeNonce - remaining.StateGas
+							frameCtx.FrameGasUsed[i] = frameGasUsed[i]
+							totalExecutionGasUsed += nonceGas
+							st.state.SubBalance(target, gasCharge, tracing.BalanceDecreaseGasBuy)
+							approvals.payer = target
+							st.frameMaxCost = new(uint256.Int).Set(gasCharge)
+							approvals.payerApproved = true
+							approvals.paymentEffect = &framePaymentEffect{
+								frameIndex:       i,
+								payer:            target,
+								gasCharge:        gasCharge,
+								legacyNonceAfter: legacyNonceAfter,
+								keyedNonceWrites: keyedWrites,
+							}
 						}
 					}
 				}
@@ -1815,22 +1820,16 @@ func (st *stateTransition) hasNoCode(addr common.Address) bool {
 	return false
 }
 
-// collectGasFromPayer charges the total transaction gas cost from the payer account.
-// This is called when a frame APPROVEs payment.
-func (st *stateTransition) collectGasFromPayer(payer common.Address) (*uint256.Int, error) {
+// framePayerMaxCost calculates the amount collected when a frame approves
+// payment. The caller checks solvency before applying nonce or payment effects.
+func (st *stateTransition) framePayerMaxCost() (*uint256.Int, error) {
 	msg := st.msg
-
-	// Calculate actual charge: gasLimit * effectiveGasPrice.
-	mgval := new(uint256.Int).SetUint64(msg.GasLimit)
-	if _, overflow := mgval.MulOverflow(mgval, msg.GasPrice); overflow {
-		return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
-	}
 
 	// Calculate balance check: gasLimit * gasFeeCap (worst case).
 	balanceCheck := new(uint256.Int).SetUint64(msg.GasLimit)
 	if msg.GasFeeCap != nil {
 		if _, overflow := balanceCheck.MulOverflow(balanceCheck, msg.GasFeeCap); overflow {
-			return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
+			return nil, fmt.Errorf("%w: frame payer required balance exceeds 256 bits", ErrInsufficientFunds)
 		}
 	}
 
@@ -1842,19 +1841,11 @@ func (st *stateTransition) collectGasFromPayer(payer common.Address) (*uint256.I
 		}
 		blobFee := new(uint256.Int).SetUint64(blobGas)
 		if _, overflow := blobFee.MulOverflow(blobFee, blobBaseFee); overflow {
-			return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
-		}
-		if _, overflow := mgval.AddOverflow(mgval, blobFee); overflow {
-			return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
+			return nil, fmt.Errorf("%w: frame payer required balance exceeds 256 bits", ErrInsufficientFunds)
 		}
 		if _, overflow := balanceCheck.AddOverflow(balanceCheck, blobFee); overflow {
-			return nil, fmt.Errorf("%w: payer %v required balance exceeds 256 bits", ErrInsufficientFunds, payer.Hex())
+			return nil, fmt.Errorf("%w: frame payer required balance exceeds 256 bits", ErrInsufficientFunds)
 		}
 	}
-	if have, want := st.state.GetBalance(payer), balanceCheck; have.Cmp(want) < 0 {
-		return nil, fmt.Errorf("%w: payer %v have %v want %v", ErrInsufficientFunds, payer.Hex(), have, want)
-	}
-
-	st.state.SubBalance(payer, balanceCheck, tracing.BalanceDecreaseGasBuy)
 	return balanceCheck, nil
 }

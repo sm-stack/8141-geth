@@ -131,6 +131,9 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	scopeVal := scope.Stack.pop()
 
 	// Validate scope: must be a non-zero PAYMENT/EXECUTION bitmask.
+	if !scopeVal.IsUint64() {
+		return nil, ErrExecutionReverted
+	}
 	s := scopeVal.Uint64()
 	if s == 0 || s > uint64(ApproveBoth) {
 		return nil, ErrExecutionReverted
