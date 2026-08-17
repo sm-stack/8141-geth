@@ -773,7 +773,15 @@ func (st *stateTransition) preCheck(rules params.Rules) error {
 	// Reserve the gas budget in the block gas pool
 	var err error
 	if rules.IsAmsterdam {
-		err = st.gp.CheckGasAmsterdam(min(st.msg.GasLimit, params.MaxTxGas), st.msg.GasLimit)
+		executionReservation := min(st.msg.GasLimit, params.MaxTxGas)
+		stateReservation := st.msg.GasLimit
+		if st.msg.Frames != nil {
+			executionReservation, stateReservation, err = frameGasReservations(st.msg)
+			if err != nil {
+				return err
+			}
+		}
+		err = st.gp.CheckGasAmsterdam(executionReservation, stateReservation)
 	} else {
 		err = st.gp.CheckGasLegacy(st.msg.GasLimit)
 	}
@@ -781,6 +789,22 @@ func (st *stateTransition) preCheck(rules params.Rules) error {
 		return err
 	}
 	return st.buyGas()
+}
+
+func frameGasReservations(msg *Message) (execution, state uint64, err error) {
+	execution = msg.FrameIntrinsicGas
+	for _, frame := range msg.Frames {
+		var overflow bool
+		execution, overflow = commonmath.SafeAdd(execution, frame.GasLimit)
+		if overflow {
+			return 0, 0, fmt.Errorf("%w: frame execution gas overflow", ErrFrameTxInvalid)
+		}
+		state, overflow = commonmath.SafeAdd(state, frame.StateGasLimit)
+		if overflow {
+			return 0, 0, fmt.Errorf("%w: frame state gas overflow", ErrFrameTxInvalid)
+		}
+	}
+	return max(execution, msg.FrameFloorDataGas), state, nil
 }
 
 func (st *stateTransition) checkRecentRootReferences() error {
@@ -875,23 +899,10 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, msg.GasLimit, intrinsicGas)
 	}
 	if isFrameTx {
-		var executionGas, stateGas uint64
-		for _, frame := range msg.Frames {
-			var overflow bool
-			executionGas, overflow = commonmath.SafeAdd(executionGas, frame.GasLimit)
-			if overflow {
-				return nil, fmt.Errorf("%w: frame execution gas overflow", ErrFrameTxInvalid)
-			}
-			stateGas, overflow = commonmath.SafeAdd(stateGas, frame.StateGasLimit)
-			if overflow {
-				return nil, fmt.Errorf("%w: frame state gas overflow", ErrFrameTxInvalid)
-			}
+		requiredExecution, stateGas, err := frameGasReservations(msg)
+		if err != nil {
+			return nil, err
 		}
-		requiredExecution, overflow := commonmath.SafeAdd(intrinsicGas, executionGas)
-		if overflow {
-			return nil, fmt.Errorf("%w: frame execution gas overflow", ErrFrameTxInvalid)
-		}
-		requiredExecution = max(requiredExecution, floorDataGas)
 		required, overflow := commonmath.SafeAdd(requiredExecution, stateGas)
 		if overflow || msg.GasLimit < required {
 			return nil, fmt.Errorf("%w: frame gas limit %d below required %d", ErrFrameTxInvalid, msg.GasLimit, required)
@@ -1231,8 +1242,6 @@ func (st *stateTransition) settleGas(rules params.Rules, floorDataGas uint64, re
 	if gasUsedBeforeRefund < txStateGas {
 		return 0, 0, fmt.Errorf("negative topmost frame execution gas usage, total: %d, state: %d", gasUsedBeforeRefund, txStateGas)
 	}
-	txExecutionGas := max(gasUsedBeforeRefund-txStateGas, floorDataGas)
-
 	// EIP-3529: tx_gas_refund = min(tx_gas_used_before_refund/5, refund_counter).
 	refund := st.calcRefund(gasUsedBeforeRefund)
 	if st.evm.Config.Tracer.HasGasHook() {
@@ -1241,9 +1250,32 @@ func (st *stateTransition) settleGas(rules params.Rules, floorDataGas uint64, re
 	gasLeft += refund
 	gasUsed = gasUsedBeforeRefund - refund
 
-	// EIP-7623: tx_gas_used = max(tx_gas_used_after_refund, calldata_floor).
+	// EIP-7623: frame transactions compare the calldata floor against their
+	// execution component, then add state gas back to the receipt scalar.
 	peakUsed = gasUsedBeforeRefund
-	if rules.IsPrague && gasUsed < floorDataGas {
+	var txExecutionGas uint64
+	if st.msg.Frames != nil {
+		if gasUsed < txStateGas {
+			return 0, 0, fmt.Errorf("negative post-refund frame execution gas usage, total: %d, state: %d", gasUsed, txStateGas)
+		}
+		txExecutionGas = max(gasUsed-txStateGas, floorDataGas)
+		settled, overflow := commonmath.SafeAdd(txExecutionGas, txStateGas)
+		if overflow {
+			return 0, 0, ErrGasLimitOverflow
+		}
+		if settled > gasUsed {
+			diff := settled - gasUsed
+			if st.evm.Config.Tracer.HasGasHook() {
+				st.evm.Config.Tracer.EmitGasChange(tracing.Gas{Execution: gasLeft}, tracing.Gas{Execution: gasLeft - diff}, tracing.GasChangeTxDataFloor)
+			}
+			gasLeft -= diff
+		}
+		gasUsed = settled
+		peakUsed = max(peakUsed, gasUsed)
+	} else {
+		txExecutionGas = max(gasUsedBeforeRefund-txStateGas, floorDataGas)
+	}
+	if st.msg.Frames == nil && rules.IsPrague && gasUsed < floorDataGas {
 		diff := floorDataGas - gasUsed
 		if st.evm.Config.Tracer.HasGasHook() {
 			st.evm.Config.Tracer.EmitGasChange(tracing.Gas{Execution: gasLeft}, tracing.Gas{Execution: gasLeft - diff}, tracing.GasChangeTxDataFloor)

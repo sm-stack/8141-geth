@@ -871,6 +871,71 @@ func TestFrameTxGasAccounting(t *testing.T) {
 	t.Logf("total gas used: %d, gas limit: %d", result.UsedGas, msg.GasLimit)
 }
 
+func TestFrameTxGasReservations(t *testing.T) {
+	msg := &Message{
+		FrameIntrinsicGas: 1_000,
+		FrameFloorDataGas: 2_000,
+		Frames: []types.Frame{
+			{GasLimit: 111, StateGasLimit: 333},
+			{GasLimit: 222, StateGasLimit: 444},
+		},
+	}
+	execution, state, err := frameGasReservations(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution != 2_000 || state != 777 {
+		t.Fatalf("reservations = (%d, %d), want (2000, 777)", execution, state)
+	}
+}
+
+func TestFrameTxSettlementDimensions(t *testing.T) {
+	tests := []struct {
+		name          string
+		refund        uint64
+		floor         uint64
+		wantGas       uint64
+		wantExecution uint64
+	}{
+		{name: "floor excludes state gas", floor: 450, wantGas: 550, wantExecution: 450},
+		{name: "refund reduces execution gas", refund: 100, wantGas: 400, wantExecution: 300},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evm, statedb, config := newFrameTestEnv()
+			zero := uint64(0)
+			config.AmsterdamTime = &zero
+			if tt.refund != 0 {
+				statedb.AddRefund(tt.refund)
+			}
+			remaining := vm.NewFrameGasBudget(400, 100)
+			remaining.UsedStateGas = 100
+			gp := NewGasPool(1_000)
+			transition := &stateTransition{
+				gp:           gp,
+				msg:          &Message{GasLimit: 1_000, Frames: []types.Frame{{}}, GasPrice: new(uint256.Int)},
+				gasRemaining: remaining,
+				state:        statedb,
+				evm:          evm,
+			}
+			rules := config.Rules(evm.Context.BlockNumber, true, evm.Context.Time)
+			if !rules.IsAmsterdam {
+				t.Fatal("test config must activate Amsterdam")
+			}
+			gasUsed, _, err := transition.settleGas(rules, tt.floor, common.Address{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gasUsed != tt.wantGas {
+				t.Fatalf("gas used = %d, want %d", gasUsed, tt.wantGas)
+			}
+			if gp.CumulativeExecution() != tt.wantExecution || gp.CumulativeState() != 100 {
+				t.Fatalf("dimensions = (%d, %d), want (%d, 100)", gp.CumulativeExecution(), gp.CumulativeState(), tt.wantExecution)
+			}
+		})
+	}
+}
+
 // TestFrameTxDefaultMode tests DEFAULT mode frames (caller = ENTRY_POINT).
 func TestFrameTxDefaultMode(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
