@@ -597,7 +597,7 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 		if args.BlobFeeCap != nil {
 			blobFeeCap = (*big.Int)(args.BlobFeeCap)
 		}
-		data = &types.FrameTx{
+		frameTx := &types.FrameTx{
 			ChainID:        uint256.MustFromBig(args.ChainID.ToInt()),
 			NonceKeys:      nonceKeys,
 			NonceSeq:       uint64(*nonceSeq),
@@ -610,6 +610,14 @@ func (args *TransactionArgs) ToTransaction(defaultType int) *types.Transaction {
 			BlobHashes:     args.BlobHashes,
 			RecentRootRefs: recentRootRefs,
 		}
+		if args.Blobs != nil {
+			version := types.BlobSidecarVersion0
+			if len(args.Proofs) == len(args.Blobs)*kzg4844.CellProofsPerBlob {
+				version = types.BlobSidecarVersion1
+			}
+			frameTx.Sidecar = types.NewBlobTxSidecar(version, args.Blobs, args.Commitments, args.Proofs)
+		}
+		data = frameTx
 
 	case types.SetCodeTxType:
 		al := types.AccessList{}

@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
@@ -333,6 +334,28 @@ func TestTransactionArgsFrameTxLegacyNonceAlias(t *testing.T) {
 	ftx := args.ToTransaction(types.FrameTxType).GetFrameTx()
 	if !ftx.UsesLegacyNonce() || ftx.NonceSeq != 7 {
 		t.Fatalf("legacy nonce alias produced keys=%v seq=%d", ftx.NonceKeys, ftx.NonceSeq)
+	}
+}
+
+func TestTransactionArgsFrameTxPreservesBlobSidecar(t *testing.T) {
+	nonce := hexutil.Uint64(0)
+	chainID := (*hexutil.Big)(big.NewInt(42))
+	frames := []types.Frame{{Mode: types.FrameModeDefault, GasLimit: 1, Value: new(uint256.Int)}}
+	args := &TransactionArgs{
+		Nonce: &nonce, ChainID: chainID, Frames: &frames,
+		MaxFeePerGas: (*hexutil.Big)(big.NewInt(1)), MaxPriorityFeePerGas: new(hexutil.Big), BlobFeeCap: new(hexutil.Big),
+		BlobHashes:  []common.Hash{{1}},
+		Blobs:       []kzg4844.Blob{{1}},
+		Commitments: []kzg4844.Commitment{{2}},
+		Proofs:      []kzg4844.Proof{{3}},
+	}
+	tx := args.ToTransaction(types.FrameTxType)
+	sidecar := tx.BlobTxSidecar()
+	if sidecar == nil {
+		t.Fatal("frame transaction dropped blob sidecar")
+	}
+	if sidecar.Version != types.BlobSidecarVersion0 || len(sidecar.Blobs) != 1 || sidecar.Blobs[0][0] != 1 {
+		t.Fatalf("unexpected frame sidecar: %#v", sidecar)
 	}
 }
 
