@@ -961,6 +961,33 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidRecentRootReference(t *testing.T) {
 	}
 }
 
+func TestFrameJSONPreservesStateGasLimit(t *testing.T) {
+	frame := Frame{
+		Mode:          FrameModeDefault,
+		Flags:         FrameFlagApprovePayment,
+		GasLimit:      50_000,
+		StateGasLimit: 12_345,
+		Value:         uint256.NewInt(7),
+		Data:          []byte{1, 2, 3},
+	}
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Frame
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.StateGasLimit != frame.StateGasLimit {
+		t.Fatalf("state gas limit = %d, want %d", decoded.StateGasLimit, frame.StateGasLimit)
+	}
+
+	var missing Frame
+	if err := json.Unmarshal([]byte(`{"mode":"0x0","flags":"0x0","target":null,"gasLimit":"0x1","value":"0x0","data":"0x"}`), &missing); err == nil {
+		t.Fatal("frame JSON without stateGasLimit was accepted")
+	}
+}
+
 func TestFrameTxUnmarshalBinaryRejectsLegacyNineFieldPayload(t *testing.T) {
 	legacy := struct {
 		ChainID    *uint256.Int

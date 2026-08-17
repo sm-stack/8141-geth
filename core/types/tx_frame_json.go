@@ -29,36 +29,39 @@ import (
 // MarshalJSON marshals a frame using RPC quantity/bytes encoding.
 func (f Frame) MarshalJSON() ([]byte, error) {
 	type frameJSON struct {
-		Mode     hexutil.Uint64  `json:"mode"`
-		Flags    hexutil.Uint64  `json:"flags"`
-		Target   *common.Address `json:"target"`
-		GasLimit hexutil.Uint64  `json:"gasLimit"`
-		Value    *hexutil.Big    `json:"value"`
-		Data     hexutil.Bytes   `json:"data"`
+		Mode          hexutil.Uint64  `json:"mode"`
+		Flags         hexutil.Uint64  `json:"flags"`
+		Target        *common.Address `json:"target"`
+		GasLimit      hexutil.Uint64  `json:"gasLimit"`
+		StateGasLimit hexutil.Uint64  `json:"stateGasLimit"`
+		Value         *hexutil.Big    `json:"value"`
+		Data          hexutil.Bytes   `json:"data"`
 	}
 	value := new(big.Int)
 	if f.Value != nil {
 		value = f.Value.ToBig()
 	}
 	return json.Marshal(&frameJSON{
-		Mode:     hexutil.Uint64(f.Mode),
-		Flags:    hexutil.Uint64(f.Flags),
-		Target:   f.Target,
-		GasLimit: hexutil.Uint64(f.GasLimit),
-		Value:    (*hexutil.Big)(value),
-		Data:     hexutil.Bytes(f.Data),
+		Mode:          hexutil.Uint64(f.Mode),
+		Flags:         hexutil.Uint64(f.Flags),
+		Target:        f.Target,
+		GasLimit:      hexutil.Uint64(f.GasLimit),
+		StateGasLimit: hexutil.Uint64(f.StateGasLimit),
+		Value:         (*hexutil.Big)(value),
+		Data:          hexutil.Bytes(f.Data),
 	})
 }
 
 // UnmarshalJSON unmarshals a frame from RPC quantity/bytes encoding.
 func (f *Frame) UnmarshalJSON(input []byte) error {
 	type frameJSON struct {
-		Mode     *hexutil.Uint64 `json:"mode"`
-		Flags    *hexutil.Uint64 `json:"flags"`
-		Target   *common.Address `json:"target"`
-		GasLimit *hexutil.Uint64 `json:"gasLimit"`
-		Value    *hexutil.Big    `json:"value"`
-		Data     *hexutil.Bytes  `json:"data"`
+		Mode          *hexutil.Uint64 `json:"mode"`
+		Flags         *hexutil.Uint64 `json:"flags"`
+		Target        *common.Address `json:"target"`
+		GasLimit      *hexutil.Uint64 `json:"gasLimit"`
+		StateGasLimit *hexutil.Uint64 `json:"stateGasLimit"`
+		Value         *hexutil.Big    `json:"value"`
+		Data          *hexutil.Bytes  `json:"data"`
 	}
 	var dec frameJSON
 	if err := json.Unmarshal(input, &dec); err != nil {
@@ -83,6 +86,10 @@ func (f *Frame) UnmarshalJSON(input []byte) error {
 		return errors.New("missing required field 'gasLimit' in frame")
 	}
 	f.GasLimit = uint64(*dec.GasLimit)
+	if dec.StateGasLimit == nil {
+		return errors.New("missing required field 'stateGasLimit' in frame")
+	}
+	f.StateGasLimit = uint64(*dec.StateGasLimit)
 	if dec.Value == nil {
 		return errors.New("missing required field 'value' in frame")
 	}

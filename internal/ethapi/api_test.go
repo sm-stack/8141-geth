@@ -203,7 +203,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
 		NonceSeq:   7,
 		Sender:     sender,
-		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Value: uint256.NewInt(123), Data: []byte("call")}},
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000, StateGasLimit: 1_234, Value: new(uint256.Int), Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, StateGasLimit: 5_678, Value: uint256.NewInt(123), Data: []byte("call")}},
 		Signatures: []types.TxSignature{{Scheme: types.SignatureSchemeSecp256k1, Signer: sender, Signature: signature}},
 		GasTipCap:  uint256.NewInt(2),
 		GasFeeCap:  uint256.NewInt(100),
@@ -216,7 +216,7 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshalling failed: %v", err)
 	}
 	have := string(data)
-	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"signatures"`} {
+	for _, want := range []string{`"sender"`, `"nonceKeys"`, `"nonceSeq"`, `"frames"`, `"flags"`, `"value"`, `"gasLimit"`, `"stateGasLimit"`, `"signatures"`} {
 		if !strings.Contains(have, want) {
 			t.Fatalf("rpc frame tx json missing %s: %s", want, have)
 		}
@@ -227,8 +227,8 @@ func TestTransactionFrameTxRpcJSONRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal rpc json body: %v", err)
 	}
 	require.JSONEq(t, `[
-		{"mode":"0x1","flags":"0x3","target":null,"gasLimit":"0xc350","value":"0x0","data":"0x736967"},
-		{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","value":"0x7b","data":"0x63616c6c"}
+		{"mode":"0x1","flags":"0x3","target":null,"gasLimit":"0xc350","stateGasLimit":"0x4d2","value":"0x0","data":"0x736967"},
+		{"mode":"0x2","flags":"0x0","target":"0x0000000000000000000000000000000000001234","gasLimit":"0x13880","stateGasLimit":"0x162e","value":"0x7b","data":"0x63616c6c"}
 	]`, string(body["frames"]))
 	require.JSONEq(t, `[{
 		"scheme":"0x1",
