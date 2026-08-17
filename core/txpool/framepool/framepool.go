@@ -131,7 +131,8 @@ type FramePool struct {
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
 
-	txFeed event.Feed
+	discoverFeed event.Feed // Transactions newly added from the network or local RPC
+	insertFeed   event.Feed // All inserted transactions, including reorg reinjections
 }
 
 type frameTxMeta struct {
@@ -312,7 +313,6 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	candidate.revalidate(txs, oldMeta)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for sender := range existingSenders {
 		if len(candidate.pending[sender]) == 0 && p.reserver != nil {
 			p.reserver.Release(sender)
@@ -326,6 +326,17 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	p.stalePayerCode = candidate.stalePayerCode
 	p.paymasterReserved = candidate.paymasterReserved
 	p.paymasterPending = candidate.paymasterPending
+
+	var reorgs []*types.Transaction
+	for _, tx := range reinject {
+		if retained := p.all[tx.Hash()]; retained != nil {
+			reorgs = append(reorgs, retained)
+		}
+	}
+	p.mu.Unlock()
+	if len(reorgs) > 0 {
+		p.insertFeed.Send(core.NewTxsEvent{Txs: reorgs})
+	}
 }
 
 type resetReserver struct {
@@ -665,7 +676,9 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 		added = append(added, tx)
 	}
 	if len(added) > 0 {
-		p.txFeed.Send(core.NewTxsEvent{Txs: added})
+		event := core.NewTxsEvent{Txs: added}
+		p.discoverFeed.Send(event)
+		p.insertFeed.Send(event)
 	}
 	return errs
 }
@@ -1934,9 +1947,13 @@ func (p *FramePool) Pending(filter txpool.PendingFilter) (map[common.Address][]*
 	return pending, count
 }
 
-// SubscribeTransactions subscribes to new transaction events.
+// SubscribeTransactions subscribes to new transaction events, optionally
+// including transactions resurrected by a reorg.
 func (p *FramePool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs bool) event.Subscription {
-	return p.txFeed.Subscribe(ch)
+	if reorgs {
+		return p.insertFeed.Subscribe(ch)
+	}
+	return p.discoverFeed.Subscribe(ch)
 }
 
 // Nonce returns the next nonce for the given address.

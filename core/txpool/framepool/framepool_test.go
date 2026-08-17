@@ -746,6 +746,53 @@ func TestFramePoolResetReinjectsTransactionFromDiscardedBranch(t *testing.T) {
 	}
 }
 
+func TestFramePoolReorgSubscription(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx)
+	parent := types.NewBlockWithHeader(&types.Header{Number: big.NewInt(0), Extra: []byte("parent")})
+	oldBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("old"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+	}).WithBody(types.Body{Transactions: types.Transactions{tx}})
+	newBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("new"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+	})
+	chain := pool.chain.(*testChain)
+	for _, block := range []*types.Block{parent, oldBlock, newBlock} {
+		chain.blocks[block.Hash()] = block
+	}
+
+	newTxs := make(chan core.NewTxsEvent, 1)
+	allTxs := make(chan core.NewTxsEvent, 1)
+	newSub := pool.SubscribeTransactions(newTxs, false)
+	defer newSub.Unsubscribe()
+	allSub := pool.SubscribeTransactions(allTxs, true)
+	defer allSub.Unsubscribe()
+
+	pool.Reset(oldBlock.Header(), newBlock.Header())
+	select {
+	case event := <-allTxs:
+		if len(event.Txs) != 1 || event.Txs[0].Hash() != tx.Hash() {
+			t.Fatalf("unexpected reorg event: %v", event.Txs)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reorg subscriber did not receive reinjected transaction")
+	}
+	select {
+	case event := <-newTxs:
+		t.Fatalf("new-only subscriber received reorg event: %v", event.Txs)
+	default:
+	}
+}
+
 func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
