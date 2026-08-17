@@ -543,6 +543,15 @@ func TestFrameValidationTracerRecordsDependencies(t *testing.T) {
 			t.Fatalf("precompile code reads: have %v want none", reads)
 		}
 	})
+
+	t.Run("legacy nonce introspection", func(t *testing.T) {
+		tracer := newTestTracer()
+		selector := *uint256.NewInt(txParamLegacyNonce)
+		tracer.OnOpcode(0, byte(TXPARAM), 100000, 2, &mockScope{stackData: []uint256.Int{selector}}, nil, 1, nil)
+		if !tracer.ReadsLegacyNonce() {
+			t.Fatal("legacy nonce TXPARAM read was not recorded")
+		}
+	})
 }
 
 func TestFrameValidationRejectsStorageOutsideSender(t *testing.T) {

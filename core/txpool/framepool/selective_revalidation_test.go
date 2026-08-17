@@ -189,6 +189,26 @@ func TestSelectiveRevalidationDetectsHelperCodeChange(t *testing.T) {
 	}
 }
 
+func TestValidationDependenciesTrackIntrospectedLegacyNonce(t *testing.T) {
+	fixture := newPayerCodeToggleFixture(t, 1, false)
+	tx := fixture.txs[0]
+	frameTx := tx.GetFrameTx()
+	meta := frameTxMeta{
+		payer:         frameTx.Sender,
+		payerCodeHash: fixture.state.GetCodeHash(frameTx.Sender),
+	}
+	meta.validationDeps = fixture.pool.snapshotValidationDependencies(
+		frameTx, validationPrefixPlan{}, meta, nil, nil, true,
+	)
+	if !fixture.pool.validationDependenciesUnchanged(frameTx, meta) {
+		t.Fatal("fresh legacy nonce dependency reported as changed")
+	}
+	fixture.state.SetNonce(frameTx.Sender, fixture.state.GetNonce(frameTx.Sender)+1, tracing.NonceChangeUnspecified)
+	if fixture.pool.validationDependenciesUnchanged(frameTx, meta) {
+		t.Fatal("legacy nonce dependency change was reused")
+	}
+}
+
 func TestSelectiveRevalidationRejectsCanonicalWithdrawalWithoutEVM(t *testing.T) {
 	const count = 16
 	fixture := newMassInvalidationFixture(t, "bls", count)

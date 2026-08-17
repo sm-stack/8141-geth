@@ -152,6 +152,7 @@ type storageDependency struct {
 type validationDependencySnapshot struct {
 	senderCodeHash common.Hash
 	rules          params.Rules
+	legacyNonce    *uint64
 	storageValues  map[storageDependency]common.Hash
 	codeHashes     map[common.Address]common.Hash
 }
@@ -980,6 +981,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	baseState := p.currentState.Copy()
 	storageReads := make(map[common.Hash]struct{})
 	codeReads := make(map[common.Address]struct{})
+	legacyNonceRead := false
 	mergeDependencies := func(result verifyResult) {
 		for _, slot := range result.storageReads {
 			storageReads[slot] = struct{}{}
@@ -987,6 +989,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		for _, addr := range result.codeReads {
 			codeReads[addr] = struct{}{}
 		}
+		legacyNonceRead = legacyNonceRead || result.legacyNonceRead
 	}
 
 	if plan.deployIndex >= 0 {
@@ -1020,6 +1023,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		for _, addr := range tracer.CodeReads() {
 			codeReads[addr] = struct{}{}
 		}
+		legacyNonceRead = legacyNonceRead || tracer.ReadsLegacyNonce()
 		if violation := tracer.Violation(); violation != nil {
 			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame %d: %w", i, violation)
 		}
@@ -1048,7 +1052,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			payerAvailableBalance: p.currentState.GetBalance(frameTx.Sender).ToBig(),
 			payerCodeHash:         p.currentState.GetCodeHash(frameTx.Sender),
 		}
-		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads)
+		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead)
 		return meta, senderResult, nil
 	}
 	if senderResult.approveScope != vm.ApproveExecution {
@@ -1077,7 +1081,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	meta.maxCost = p.maxCost(tx)
 	meta.payerAvailableBalance = p.payerAvailableBalance(meta)
 	meta.payerCodeHash = p.currentState.GetCodeHash(meta.payer)
-	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads)
+	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead)
 	return meta, payResult, nil
 }
 
@@ -1246,6 +1250,7 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	if tracer != nil {
 		result.storageReads = tracer.StorageReads()
 		result.codeReads = tracer.CodeReads()
+		result.legacyNonceRead = tracer.ReadsLegacyNonce()
 		if violation := tracer.Violation(); violation != nil {
 			if violation.Rule == "OP-020" {
 				result.failureClass = verifyFailureOutOfGas
@@ -1346,12 +1351,16 @@ func (p *FramePool) classifyPayer(sender, payer common.Address) frameTxMeta {
 // signatures are immutable for a given hash; nonce and recent-root references
 // are checked directly on every reset. The remaining reusable dependencies are
 // sender storage, validation-reached code, sender code, and payer code.
-func (p *FramePool) snapshotValidationDependencies(frameTx *types.FrameTx, plan validationPrefixPlan, meta frameTxMeta, storageReads map[common.Hash]struct{}, codeReads map[common.Address]struct{}) *validationDependencySnapshot {
+func (p *FramePool) snapshotValidationDependencies(frameTx *types.FrameTx, plan validationPrefixPlan, meta frameTxMeta, storageReads map[common.Hash]struct{}, codeReads map[common.Address]struct{}, legacyNonceRead bool) *validationDependencySnapshot {
 	snapshot := &validationDependencySnapshot{
 		senderCodeHash: p.currentState.GetCodeHash(frameTx.Sender),
 		rules:          p.chainconfig.Rules(p.currentHead.Number, p.currentHead.Difficulty.Sign() == 0, p.currentHead.Time),
 		storageValues:  make(map[storageDependency]common.Hash),
 		codeHashes:     make(map[common.Address]common.Hash),
+	}
+	if legacyNonceRead {
+		nonce := p.currentState.GetNonce(frameTx.Sender)
+		snapshot.legacyNonce = &nonce
 	}
 	for slot := range storageReads {
 		location := storageDependency{address: frameTx.Sender, slot: slot}
@@ -1402,6 +1411,9 @@ func (p *FramePool) validationDependenciesUnchanged(frameTx *types.FrameTx, meta
 		return false
 	}
 	if p.currentState.GetCodeHash(meta.payer) != meta.payerCodeHash {
+		return false
+	}
+	if snapshot.legacyNonce != nil && p.currentState.GetNonce(frameTx.Sender) != *snapshot.legacyNonce {
 		return false
 	}
 	for location, value := range snapshot.storageValues {
@@ -1557,15 +1569,16 @@ const (
 
 // verifyResult records the structured outcome of a simulated VERIFY frame.
 type verifyResult struct {
-	approveScope  uint8
-	frameIndex    int
-	target        common.Address
-	gasLimit      uint64
-	gasRemaining  uint64
-	prefixGasUsed uint64
-	failureClass  verifyFailureClass
-	storageReads  []common.Hash
-	codeReads     []common.Address
+	approveScope    uint8
+	frameIndex      int
+	target          common.Address
+	gasLimit        uint64
+	gasRemaining    uint64
+	prefixGasUsed   uint64
+	failureClass    verifyFailureClass
+	storageReads    []common.Hash
+	codeReads       []common.Address
+	legacyNonceRead bool
 }
 
 func (r verifyResult) frameGasUsed() uint64 {

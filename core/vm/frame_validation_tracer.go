@@ -73,6 +73,7 @@ type FrameValidationTracer struct {
 	precompiles  map[common.Address]bool
 	storageReads map[common.Hash]struct{}
 	codeReads    map[common.Address]struct{}
+	legacyNonce  bool
 
 	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
 	lastOpValid    bool   // Whether lastOp is meaningful
@@ -137,6 +138,12 @@ func (t *FrameValidationTracer) CodeReads() []common.Address {
 	return reads
 }
 
+// ReadsLegacyNonce reports whether validation introspected the sender's
+// pre-state legacy account nonce through TXPARAM.
+func (t *FrameValidationTracer) ReadsLegacyNonce() bool {
+	return t.legacyNonce
+}
+
 // Violation returns the first detected rule violation, or nil.
 func (t *FrameValidationTracer) Violation() *FrameValidationError {
 	return t.violation
@@ -157,6 +164,15 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		return
 	}
 	opcode := OpCode(op)
+	if opcode == TXPARAM && scope != nil {
+		stackData := scope.StackData()
+		if len(stackData) > 0 {
+			selector, overflow := stackData[len(stackData)-1].Uint64WithOverflow()
+			if !overflow && selector == txParamLegacyNonce {
+				t.legacyNonce = true
+			}
+		}
+	}
 
 	// [OP-012] Check if previous opcode was GAS not followed by CALL.
 	if t.lastOpValid && t.lastOp == GAS && !isCallOp(opcode) {
