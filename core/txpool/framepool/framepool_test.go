@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -240,6 +241,58 @@ func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
 	))
 	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err == nil {
 		t.Fatal("frame pool accepted invalid blob commitment/proofs")
+	}
+}
+
+func TestFramePoolFullSelectsLowestPricedEviction(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	for i := 0; i < maxFramePoolSize; i++ {
+		sender := common.BigToAddress(big.NewInt(int64(i + 1)))
+		ftx := baseFTX(sender, 0, config)
+		ftx.GasTipCap = uint256.NewInt(uint64(i + 1))
+		ftx.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) + uint64(i+1))
+		pool.all[makeFrameTx(ftx).Hash()] = makeFrameTx(ftx)
+	}
+
+	sender := common.HexToAddress("0xffff")
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	candidate := baseFTX(sender, 0, config)
+	candidate.GasTipCap = uint256.NewInt(2)
+	candidate.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
+	candidate.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+
+	pool.mu.Lock()
+	check, err := pool.checkAdmissionCheap(makeFrameTx(candidate), false)
+	pool.mu.Unlock()
+	if err != nil {
+		t.Fatalf("higher-priced transaction rejected from full pool: %v", err)
+	}
+	if check.eviction == nil || check.eviction.GasTipCap().Cmp(big.NewInt(1)) != 0 {
+		t.Fatalf("eviction = %v, want lowest tip transaction", check.eviction)
+	}
+	evictedHash := check.eviction.Hash()
+
+	candidate.GasTipCap = uint256.NewInt(1)
+	candidate.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) + 1)
+	pool.mu.Lock()
+	_, err = pool.checkAdmissionCheap(makeFrameTx(candidate), false)
+	pool.mu.Unlock()
+	if !errors.Is(err, txpool.ErrUnderpriced) {
+		t.Fatalf("underpriced full-pool admission error = %v", err)
+	}
+
+	candidate.GasTipCap = uint256.NewInt(2)
+	candidate.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 2)
+	candidateTx := makeFrameTx(candidate)
+	if err := pool.Add([]*types.Transaction{candidateTx}, false)[0]; err != nil {
+		t.Fatalf("add replacement for lowest-priced pool entry: %v", err)
+	}
+	if pool.Has(evictedHash) || !pool.Has(candidateTx.Hash()) {
+		t.Fatal("full-pool admission did not atomically replace the lowest-priced entry")
+	}
+	if pending, _ := pool.Stats(); pending != 1 || len(pool.all) != maxFramePoolSize {
+		t.Fatalf("pool sizes after eviction: pending=%d all=%d", pending, len(pool.all))
 	}
 }
 

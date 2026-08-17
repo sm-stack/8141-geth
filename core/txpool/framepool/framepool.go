@@ -738,6 +738,7 @@ func warmRecentRootReferences(statedb *state.StateDB, refs []types.RecentRootRef
 type admissionCheck struct {
 	replacement      *types.Transaction
 	replacementIndex int
+	eviction         *types.Transaction
 }
 
 // checkAdmissionCheap performs all rejection-only admission checks that don't
@@ -784,7 +785,10 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 		}
 	}
 	if check.replacement == nil && len(p.all) >= maxFramePoolSize {
-		return check, fmt.Errorf("frame pool full")
+		check.eviction = p.lowestPricedTransaction()
+		if check.eviction == nil || !isFrameTxPriceBumped(tx, check.eviction) {
+			return check, fmt.Errorf("%w: frame pool full", txpool.ErrUnderpriced)
+		}
 	}
 	if err := validateFrameOrdering(frameTx.Frames, sender); err != nil {
 		return check, err
@@ -842,6 +846,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 	replacement := check.replacement
 	replacementIndex := check.replacementIndex
+	eviction := check.eviction
 	sender := frameTx.Sender
 
 	// Reserve address (if first tx for this sender).
@@ -868,7 +873,11 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err := p.validatePaymasterAccounting(tx, meta, replacement); err != nil {
+	accountingReplacement := replacement
+	if accountingReplacement == nil {
+		accountingReplacement = eviction
+	}
+	if err := p.validatePaymasterAccounting(tx, meta, accountingReplacement); err != nil {
 		accountingRejectMeter.Mark(1)
 		if errors.Is(err, core.ErrInsufficientFunds) {
 			accountingInsufficientMeter.Mark(1)
@@ -885,12 +894,67 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		delete(p.all, replacement.Hash())
 		p.pending[sender][replacementIndex] = tx
 	} else {
+		if eviction != nil {
+			p.removeTransaction(eviction)
+		}
 		p.pending[sender] = append(p.pending[sender], tx)
 	}
 	p.all[tx.Hash()] = tx
 	p.reserveTxAccounting(tx.Hash(), meta)
 	delete(p.stalePayerCode, tx.Hash())
 	return nil
+}
+
+func (p *FramePool) lowestPricedTransaction() *types.Transaction {
+	var worst *types.Transaction
+	for _, tx := range p.all {
+		if worst == nil || compareFrameTxPrice(tx, worst) < 0 {
+			worst = tx
+		}
+	}
+	return worst
+}
+
+func compareFrameTxPrice(a, b *types.Transaction) int {
+	if cmp := a.GasTipCap().Cmp(b.GasTipCap()); cmp != 0 {
+		return cmp
+	}
+	if cmp := a.GasFeeCap().Cmp(b.GasFeeCap()); cmp != 0 {
+		return cmp
+	}
+	if cmp := a.BlobGasFeeCap().Cmp(b.BlobGasFeeCap()); cmp != 0 {
+		return cmp
+	}
+	aHash, bHash := a.Hash(), b.Hash()
+	return bytes.Compare(aHash[:], bHash[:])
+}
+
+// removeTransaction removes a non-replacement transaction and releases its
+// sender reservation if the sender has no other frame transaction.
+func (p *FramePool) removeTransaction(tx *types.Transaction) {
+	hash := tx.Hash()
+	frameTx := tx.GetFrameTx()
+	if frameTx == nil {
+		return
+	}
+	p.releaseTxAccounting(hash)
+	delete(p.all, hash)
+	sender := frameTx.Sender
+	txs := p.pending[sender]
+	for i, pendingTx := range txs {
+		if pendingTx.Hash() == hash {
+			txs = slices.Delete(txs, i, i+1)
+			break
+		}
+	}
+	if len(txs) == 0 {
+		delete(p.pending, sender)
+		if p.reserver != nil {
+			p.reserver.Release(sender)
+		}
+	} else {
+		p.pending[sender] = txs
+	}
 }
 
 // validationViewLocked snapshots all state used by validation-prefix execution.
