@@ -38,8 +38,8 @@ const (
 	TxGasEIP8141             uint64 = 12000   // Per frame transaction (EIP-8141). NOTE: Not payable on data of calls between transactions.
 	FrameTxPerFrameGas       uint64 = 475     // Per EIP-8141 frame transaction frame.
 	FrameTxMaxVerifyStateGas uint64 = 500_000 // Public-mempool validation state-gas cap.
-	RecentRootBaseGas        uint64 = 2400    // Base intrinsic gas when recent-root references are present.
-	RecentRootPerRefGas      uint64 = 2002    // Per-reference intrinsic gas for EIP-8272.
+	RecentRootBaseGas        uint64 = 2900    // ACCESS_LIST_ADDRESS_COST under Amsterdam for EIP-8272.
+	RecentRootPerRefGas      uint64 = 2102    // Storage key plus two fixed-input Keccak computations for EIP-8272.
 	SigGasArbitrary          uint64 = 100     // Per EIP-8141 arbitrary transaction-level signature structural validation.
 	SigGasSecp256k1          uint64 = 2800    // Per EIP-8141 secp256k1 transaction-level signature verification.
 	SigGasP256               uint64 = 6700    // Per EIP-8141 P256 transaction-level signature verification.

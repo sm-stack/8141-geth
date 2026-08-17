@@ -66,13 +66,18 @@ func (recentRootSystemContract) Run(evm *EVM, caller common.Address, input []byt
 	stack.push(new(uint256.Int).SetBytes(entry[:]))
 	stack.push(new(uint256.Int).SetBytes(key[:]))
 	contract := NewContract(caller, params.RecentRootAddress, value, gas, evm.jumpDests)
-	cost, err := gasSStoreEIP3529(evm, contract, stack, nil, 0)
+	cost, err := gasSStore8037And8038(evm, contract, stack, nil, 0)
 	if err != nil {
 		return nil, gas.ExitHalt(), ErrOutOfGas
 	}
+	gas = contract.Gas
 	if _, ok := gas.Charge(cost); !ok {
 		return nil, gas.ExitHalt(), ErrOutOfGas
 	}
+	current, original := evm.StateDB.GetStateAndCommittedState(params.RecentRootAddress, key)
 	evm.StateDB.SetState(params.RecentRootAddress, key, entry)
+	if evm.TxContext.FrameCtx != nil && original == (common.Hash{}) && current == (common.Hash{}) {
+		evm.TxContext.FrameCtx.recordStateGas(params.RecentRootAddress, key)
+	}
 	return nil, gas, nil
 }

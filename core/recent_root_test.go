@@ -38,10 +38,11 @@ func newRecentRootEVM(t *testing.T, timestamp uint64) (*vm.EVM, *state.StateDB) 
 	db.CreateAccount(params.RecentRootAddress)
 	db.SetCode(params.RecentRootAddress, params.RecentRootCode, 0)
 	random := common.Hash{1}
-	ctx := vm.BlockContext{CanTransfer: CanTransfer, Transfer: Transfer, GetHash: func(uint64) common.Hash { return common.Hash{} }, BlockNumber: big.NewInt(1), Time: timestamp, BaseFee: big.NewInt(1), BlobBaseFee: big.NewInt(1), Difficulty: big.NewInt(0), Random: &random}
+	ctx := vm.BlockContext{CanTransfer: CanTransfer, Transfer: Transfer, GetHash: func(uint64) common.Hash { return common.Hash{} }, BlockNumber: big.NewInt(1), Time: timestamp, BaseFee: big.NewInt(1), BlobBaseFee: big.NewInt(1), Difficulty: big.NewInt(0), Random: &random, CostPerStateByte: params.CostPerStateByte}
 	config := *params.MergedTestChainConfig
-	bogotaTime := uint64(0)
-	config.BogotaTime = &bogotaTime
+	forkTime := uint64(0)
+	config.AmsterdamTime = &forkTime
+	config.BogotaTime = &forkTime
 	return vm.NewEVM(ctx, db, &config, vm.Config{}), db
 }
 
@@ -53,16 +54,19 @@ func TestRecentRootNativeWriteLastWriteWins(t *testing.T) {
 	root2 := common.HexToHash("0x02")
 	for i, root := range []common.Hash{root1, root2} {
 		input := append(bytes.Clone(salt[:]), root[:]...)
-		_, remaining, err := evm.Call(source, params.RecentRootAddress, input, vm.NewGasBudget(100_000, 0), new(uint256.Int))
+		_, remaining, err := evm.Call(source, params.RecentRootAddress, input, vm.NewFrameGasBudget(100_000, 100_000), new(uint256.Int))
 		if err != nil {
 			t.Fatalf("write failed: %v", err)
 		}
-		wantUsed := uint64(22_244)
+		wantExecution, wantState := uint64(12_244), uint64(params.StorageCreationSize*params.CostPerStateByte)
 		if i == 1 {
-			wantUsed = 244
+			wantExecution, wantState = 244, 0
 		}
-		if got := uint64(100_000) - remaining.ExecutionGas - remaining.StateGas; got != wantUsed {
-			t.Fatalf("write %d gas = %d, want %d", i, got, wantUsed)
+		if got := uint64(100_000) - remaining.ExecutionGas; got != wantExecution {
+			t.Fatalf("write %d execution gas = %d, want %d", i, got, wantExecution)
+		}
+		if got := uint64(100_000) - remaining.StateGas; got != wantState {
+			t.Fatalf("write %d state gas = %d, want %d", i, got, wantState)
 		}
 	}
 	sourceID := types.RecentRootSourceID(source, salt)
@@ -79,7 +83,7 @@ func TestRecentRootNativeWriteUsesConsensusSlot(t *testing.T) {
 	salt := common.HexToHash("0x55")
 	root := common.HexToHash("0x01")
 	input := append(bytes.Clone(salt[:]), root[:]...)
-	if _, _, err := evm.Call(source, params.RecentRootAddress, input, vm.NewGasBudget(100_000, 0), new(uint256.Int)); err != nil {
+	if _, _, err := evm.Call(source, params.RecentRootAddress, input, vm.NewFrameGasBudget(100_000, 100_000), new(uint256.Int)); err != nil {
 		t.Fatal(err)
 	}
 	sourceID := types.RecentRootSourceID(source, salt)

@@ -174,7 +174,7 @@ func TestRecentRootIntrospection(t *testing.T) {
 	if RECENTROOTREFLOAD != 0xb5 || RECENTROOTREFLOAD.String() != "RECENTROOTREFLOAD" {
 		t.Fatalf("unexpected recent-root opcode assignment: %#x %s", RECENTROOTREFLOAD, RECENTROOTREFLOAD)
 	}
-	if op := bogotaInstructionSet[RECENTROOTREFLOAD]; op == nil || op.undefined || op.constantGas != GasQuickStep {
+	if op := bogotaInstructionSet[RECENTROOTREFLOAD]; op == nil || op.undefined || op.constantGas != GasFastestStep {
 		t.Fatalf("recent-root opcode not enabled with gas 3: %#v", op)
 	}
 	ref := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: 77, Root: common.HexToHash("0x5678")}
@@ -204,8 +204,8 @@ func TestRecentRootIntrospection(t *testing.T) {
 	}
 	for _, tt := range fields {
 		stack := newStackForTesting()
-		stack.push(uint256.NewInt(tt.field))
 		stack.push(uint256.NewInt(0))
+		stack.push(uint256.NewInt(tt.field))
 		if _, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack}); err != nil {
 			stack.release()
 			t.Fatalf("field %d: %v", tt.field, err)
@@ -218,8 +218,8 @@ func TestRecentRootIntrospection(t *testing.T) {
 	}
 	for _, pair := range [][2]uint64{{1, 0}, {0, 3}} {
 		stack := newStackForTesting()
-		stack.push(uint256.NewInt(pair[1]))
 		stack.push(uint256.NewInt(pair[0]))
+		stack.push(uint256.NewInt(pair[1]))
 		_, err := opRecentRootRefLoad(&pc, evm, &ScopeContext{Memory: NewMemory(), Stack: stack})
 		stack.release()
 		if err == nil {
