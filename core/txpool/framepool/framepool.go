@@ -127,6 +127,7 @@ type FramePool struct {
 	meta           map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
 	stalePayerCode map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
 	blobSidecars   map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
+	blobCells      map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
 
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
@@ -193,6 +194,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		meta:                       make(map[common.Hash]frameTxMeta),
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
 		blobSidecars:               make(map[common.Hash]cachedBlobSidecar),
+		blobCells:                  make(map[common.Hash][]kzg4844.Cell),
 		slotProvider: func(head *types.Header) vm.SlotProvider {
 			if head.SlotNumber != nil {
 				return vm.SlotNumberProvider(*head.SlotNumber)
@@ -286,6 +288,10 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	for hash, identity := range p.stalePayerCode {
 		stalePayerCode[hash] = identity
 	}
+	blobCells := make(map[common.Hash][]kzg4844.Cell, len(p.blobCells))
+	for hash, cells := range p.blobCells {
+		blobCells[hash] = cells
+	}
 	reserver := &resetReserver{base: p.reserver, existing: existingSenders, acquired: make(map[common.Address]struct{})}
 	candidate := &FramePool{
 		chain:                      p.chain,
@@ -305,6 +311,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		all:                        make(map[common.Hash]*types.Transaction),
 		meta:                       make(map[common.Hash]frameTxMeta),
 		stalePayerCode:             stalePayerCode,
+		blobCells:                  blobCells,
 		paymasterReserved:          make(map[common.Address]*big.Int),
 		paymasterPending:           make(map[common.Address]int),
 	}
@@ -320,10 +327,18 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.currentHead = newHead
 	p.currentState = statedb
+	for hash := range candidate.blobCells {
+		if candidate.all[hash] == nil {
+			if _, cached := p.blobSidecars[hash]; !cached {
+				delete(candidate.blobCells, hash)
+			}
+		}
+	}
 	p.pending = candidate.pending
 	p.all = candidate.all
 	p.meta = candidate.meta
 	p.stalePayerCode = candidate.stalePayerCode
+	p.blobCells = candidate.blobCells
 	p.paymasterReserved = candidate.paymasterReserved
 	p.paymasterPending = candidate.paymasterPending
 
@@ -397,6 +412,15 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		}
 		if err := p.ValidateTxBasics(tx); err != nil {
 			continue
+		}
+		if tx.BlobGas() > 0 {
+			if _, ok := p.blobCells[tx.Hash()]; !ok {
+				cells, err := validateFrameBlobProofs(tx)
+				if err != nil {
+					continue
+				}
+				p.blobCells[tx.Hash()] = cells
+			}
 		}
 		sender := frameTx.Sender
 		if err := validateFrameNonce(frameTx, p.currentState); err != nil {
@@ -545,6 +569,7 @@ func (p *FramePool) cacheIncludedBlobSidecars(included types.Transactions, block
 	for hash, cached := range p.blobSidecars {
 		if cached.blockNumber < oldest {
 			delete(p.blobSidecars, hash)
+			delete(p.blobCells, hash)
 		}
 	}
 }
@@ -566,6 +591,7 @@ func (p *FramePool) SetGasTip(tip *big.Int) {
 				valid = append(valid, tx)
 			} else {
 				delete(p.all, tx.Hash())
+				delete(p.blobCells, tx.Hash())
 				p.releaseTxAccounting(tx.Hash())
 			}
 		}
@@ -592,6 +618,27 @@ func (p *FramePool) Get(hash common.Hash) *types.Transaction {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.all[hash]
+}
+
+// GetCells returns validated cells for a pooled blob frame transaction.
+func (p *FramePool) GetCells(hash common.Hash, mask types.CustodyBitmap) []kzg4844.Cell {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.all[hash] == nil {
+		return nil
+	}
+	all := p.blobCells[hash]
+	if len(all) == 0 {
+		return nil
+	}
+	indices := mask.Indices()
+	cells := make([]kzg4844.Cell, 0, len(all)/kzg4844.CellsPerBlob*len(indices))
+	for blob := 0; blob < len(all)/kzg4844.CellsPerBlob; blob++ {
+		for _, index := range indices {
+			cells = append(cells, all[blob*kzg4844.CellsPerBlob+int(index)])
+		}
+	}
+	return cells
 }
 
 // GetRLP returns the RLP-encoded transaction if found.
@@ -665,11 +712,12 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 			errs[i] = err
 			continue
 		}
-		if err := validateFrameBlobProofs(tx); err != nil {
+		cells, err := validateFrameBlobProofs(tx)
+		if err != nil {
 			errs[i] = err
 			continue
 		}
-		if err := p.validateAndAdd(tx); err != nil {
+		if err := p.validateAndAdd(tx, cells); err != nil {
 			errs[i] = err
 			continue
 		}
@@ -683,25 +731,28 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 	return errs
 }
 
-func validateFrameBlobProofs(tx *types.Transaction) error {
+func validateFrameBlobProofs(tx *types.Transaction) ([]kzg4844.Cell, error) {
 	if tx.BlobGas() == 0 {
-		return nil
+		return nil, nil
 	}
 	sidecar := tx.BlobTxSidecar()
 	if sidecar == nil {
-		return errors.New("missing sidecar in blob frame transaction")
+		return nil, errors.New("missing sidecar in blob frame transaction")
 	}
 	cells, err := kzg4844.ComputeCells(sidecar.Blobs)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return txpool.ValidateCells(&types.BlobTxCellSidecar{
+	if err := txpool.ValidateCells(&types.BlobTxCellSidecar{
 		Version:     sidecar.Version,
 		Commitments: sidecar.Commitments,
 		Proofs:      sidecar.Proofs,
 		Cells:       cells,
 		Custody:     types.CustodyBitmapAll,
-	})
+	}); err != nil {
+		return nil, err
+	}
+	return cells, nil
 }
 
 func validateFrameNonce(tx *types.FrameTx, statedb *state.StateDB) error {
@@ -820,7 +871,7 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 }
 
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
-func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
+func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) error {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
 		return fmt.Errorf("not a frame transaction")
@@ -905,6 +956,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	if replacement != nil {
 		p.releaseTxAccounting(replacement.Hash())
 		delete(p.all, replacement.Hash())
+		delete(p.blobCells, replacement.Hash())
 		p.pending[sender][replacementIndex] = tx
 	} else {
 		if eviction != nil {
@@ -913,6 +965,9 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		p.pending[sender] = append(p.pending[sender], tx)
 	}
 	p.all[tx.Hash()] = tx
+	if len(cells) > 0 {
+		p.blobCells[tx.Hash()] = cells
+	}
 	p.reserveTxAccounting(tx.Hash(), meta)
 	delete(p.stalePayerCode, tx.Hash())
 	return nil
@@ -952,6 +1007,7 @@ func (p *FramePool) removeTransaction(tx *types.Transaction) {
 	}
 	p.releaseTxAccounting(hash)
 	delete(p.all, hash)
+	delete(p.blobCells, hash)
 	sender := frameTx.Sender
 	txs := p.pending[sender]
 	for i, pendingTx := range txs {

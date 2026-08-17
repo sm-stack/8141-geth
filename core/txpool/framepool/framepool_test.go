@@ -244,6 +244,45 @@ func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
 	}
 }
 
+func TestFramePoolCachesBlobCells(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	var zero uint64
+	pool.currentHead.ExcessBlobGas = &zero
+	pool.currentHead.BlobGasUsed = &zero
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	var blob kzg4844.Blob
+	commitment, err := kzg4844.BlobToCommitment(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := kzg4844.ComputeCellProofs(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ftx := baseFTX(sender, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		proofs,
+	))
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("add blob frame transaction: %v", err)
+	}
+	mask := types.NewCustodyBitmap([]uint64{1})
+	indices := mask.Indices()
+	cells := pool.GetCells(tx.Hash(), mask)
+	if len(cells) != len(indices) {
+		t.Fatalf("cached cell count = %d, want %d", len(cells), len(indices))
+	}
+}
+
 func TestFramePoolFullSelectsLowestPricedEviction(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	for i := 0; i < maxFramePoolSize; i++ {

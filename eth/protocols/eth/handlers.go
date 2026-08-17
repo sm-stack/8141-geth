@@ -741,6 +741,13 @@ func pooledBlobCells(backend Backend, hash common.Hash, mask types.CustodyBitmap
 		}
 		return flat
 	}
+	if pool, ok := backend.TxPool().(interface {
+		GetCells(common.Hash, types.CustodyBitmap) []kzg4844.Cell
+	}); ok {
+		if cells := pool.GetCells(hash, mask); len(cells) > 0 {
+			return cells
+		}
+	}
 	tx := backend.TxPool().Get(hash)
 	if tx == nil || tx.BlobGas() == 0 || tx.BlobTxSidecar() == nil {
 		return nil

@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -282,6 +283,20 @@ func (p *TxPool) Get(hash common.Hash) *types.Transaction {
 	for _, subpool := range p.subpools {
 		if tx := subpool.Get(hash); tx != nil {
 			return tx
+		}
+	}
+	return nil
+}
+
+// GetCells returns cached blob cells from a subpool that supports cell serving.
+func (p *TxPool) GetCells(hash common.Hash, mask types.CustodyBitmap) []kzg4844.Cell {
+	for _, subpool := range p.subpools {
+		if pool, ok := subpool.(interface {
+			GetCells(common.Hash, types.CustodyBitmap) []kzg4844.Cell
+		}); ok {
+			if cells := pool.GetCells(hash, mask); len(cells) > 0 {
+				return cells
+			}
 		}
 	}
 	return nil
