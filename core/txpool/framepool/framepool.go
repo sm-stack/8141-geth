@@ -459,10 +459,17 @@ func (p *FramePool) Get(hash common.Hash) *types.Transaction {
 }
 
 // GetRLP returns the RLP-encoded transaction if found.
-func (p *FramePool) GetRLP(hash common.Hash, _ uint) []byte {
+func (p *FramePool) GetRLP(hash common.Hash, version uint) []byte {
 	tx := p.Get(hash)
 	if tx == nil {
 		return nil
+	}
+	if version >= 72 && tx.BlobGas() > 0 {
+		sidecar := tx.BlobTxSidecar()
+		if sidecar == nil {
+			return nil
+		}
+		tx = tx.WithBlobTxSidecar(types.NewBlobTxSidecar(sidecar.Version, nil, sidecar.Commitments, sidecar.Proofs))
 	}
 	data, _ := rlp.EncodeToBytes(tx)
 	return data
@@ -476,10 +483,24 @@ func (p *FramePool) GetMetadata(hash common.Hash) *txpool.TxMetadata {
 	if tx == nil {
 		return nil
 	}
-	return &txpool.TxMetadata{
-		Type: tx.Type(),
-		Size: tx.Size(),
+	encoded, err := rlp.EncodeToBytes(tx)
+	if err != nil {
+		return nil
 	}
+	meta := &txpool.TxMetadata{Type: tx.Type(), Size: uint64(len(encoded))}
+	if tx.BlobGas() > 0 {
+		sidecar := tx.BlobTxSidecar()
+		if sidecar == nil {
+			return nil
+		}
+		withoutBlobs := tx.WithBlobTxSidecar(types.NewBlobTxSidecar(sidecar.Version, nil, sidecar.Commitments, sidecar.Proofs))
+		encoded, err := rlp.EncodeToBytes(withoutBlobs)
+		if err != nil {
+			return nil
+		}
+		meta.SizeWithoutBlob = uint64(len(encoded))
+	}
+	return meta
 }
 
 // ValidateTxBasics performs stateless validation of a frame transaction.

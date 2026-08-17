@@ -84,6 +84,9 @@ type txPool interface {
 	// given transaction hash.
 	GetMetadata(hash common.Hash) *txpool.TxMetadata
 
+	// ValidateTxBasics checks a transaction against the stateless rules of its subpool.
+	ValidateTxBasics(tx *types.Transaction) error
+
 	// Add should add the given transactions to the pool.
 	Add(txs []*types.Transaction, sync bool) []error
 
@@ -193,9 +196,18 @@ func newHandler(config *handlerConfig) (*handler, error) {
 
 	// Construct the blob buffer for assembling blob txs from separate tx and cell deliveries.
 	blobBuffer := blobpool.NewBlobBuffer(blobpool.BlobBufferFunctions{
-		ValidateTx: h.blobpool.ValidateTxBasics,
-		AddToPool:  h.blobpool.AddPooledTx,
-		DropPeer:   h.removePeer,
+		ValidateTx: h.txpool.ValidateTxBasics,
+		AddToPool: func(ptx *blobpool.BlobTxForPool) error {
+			if ptx.Tx.Type() != types.FrameTxType {
+				return h.blobpool.AddPooledTx(ptx)
+			}
+			tx, err := ptx.ToTx()
+			if err != nil {
+				return err
+			}
+			return h.txpool.Add([]*types.Transaction{tx}, false)[0]
+		},
+		DropPeer: h.removePeer,
 	})
 
 	addTxs := func(txs []*types.Transaction) []error {

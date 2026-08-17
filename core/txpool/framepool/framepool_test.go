@@ -18,6 +18,7 @@ package framepool
 
 import (
 	"crypto/ecdsa"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"math/big"
@@ -32,7 +33,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
 )
 
@@ -151,6 +154,56 @@ func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
 // makeFrameTx creates a wrapped *types.Transaction from a FrameTx.
 func makeFrameTx(ftx *types.FrameTx) *types.Transaction {
 	return types.NewTx(ftx)
+}
+
+func TestBlobFrameNetworkEncoding(t *testing.T) {
+	pool, _, config := newTestEnv()
+	defer pool.Close()
+
+	var (
+		blob       kzg4844.Blob
+		commitment kzg4844.Commitment
+		proofs     = make([]kzg4844.Proof, kzg4844.CellProofsPerBlob)
+	)
+	ftx := baseFTX(common.Address{0x01}, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Value: new(uint256.Int)}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		proofs,
+	))
+	pool.all[tx.Hash()] = tx
+
+	meta := pool.GetMetadata(tx.Hash())
+	if meta == nil || meta.SizeWithoutBlob == 0 || meta.SizeWithoutBlob >= meta.Size {
+		t.Fatalf("invalid blob frame metadata: %#v", meta)
+	}
+	for _, test := range []struct {
+		version   uint
+		wantBlobs int
+		wantSize  uint64
+	}{
+		{version: 71, wantBlobs: 1, wantSize: meta.Size},
+		{version: 72, wantBlobs: 0, wantSize: meta.SizeWithoutBlob},
+	} {
+		var got types.Transaction
+		encoded := pool.GetRLP(tx.Hash(), test.version)
+		if err := rlp.DecodeBytes(encoded, &got); err != nil {
+			t.Fatalf("decode ETH/%d transaction: %v", test.version, err)
+		}
+		if got.Hash() != tx.Hash() {
+			t.Fatalf("ETH/%d transaction hash changed: have %s want %s", test.version, got.Hash(), tx.Hash())
+		}
+		if blobs := len(got.BlobTxSidecar().Blobs); blobs != test.wantBlobs {
+			t.Fatalf("ETH/%d blob count %d, want %d", test.version, blobs, test.wantBlobs)
+		}
+		if size := uint64(len(encoded)); size != test.wantSize {
+			t.Fatalf("ETH/%d encoded size %d, want %d", test.version, size, test.wantSize)
+		}
+	}
 }
 
 // baseFTX returns a valid FrameTx skeleton for the given sender.

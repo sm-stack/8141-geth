@@ -116,10 +116,20 @@ func (p *Peer) announceTransactions() {
 				mask         types.CustodyBitmap
 				size         common.StorageSize
 				processed    = make(map[int]bool)
+				batchBlob    bool
+				batchSet     bool
 			)
 			for count = 0; count < len(queue) && size < maxTxPacketSize; count++ {
 				if meta := p.txpool.GetMetadata(queue[count]); meta != nil {
+					isBlob := p.version >= ETH72 && meta.SizeWithoutBlob > 0
+					if batchSet && batchBlob != isBlob {
+						continue
+					}
+					batchBlob, batchSet = isBlob, true
 					custody := p.blobpool.GetCustody(queue[count])
+					if isBlob && custody == nil {
+						custody = &types.CustodyBitmapAll
+					}
 					if custody != nil {
 						// Blob txs should be batched into the same announcement
 						// if they share the same custody.

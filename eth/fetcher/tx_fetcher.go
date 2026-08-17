@@ -105,6 +105,7 @@ type txMetadata struct {
 	kind    byte   // Transaction consensus type
 	size    uint32 // Transaction size in bytes, as announced
 	version uint   // Protocol version of the announcing peer
+	blob    bool   // Transaction carries blobs through the ETH/72 cell protocol
 }
 
 // txDeliveryMeta is the metadata of a delivered transaction. eth72 announces
@@ -113,11 +114,12 @@ type txDeliveryMeta struct {
 	kind            byte   // Transaction consensus type
 	size            uint32 // Size with blobs
 	sizeWithoutBlob uint32 // Size without blobs (eth72)
+	blob            bool   // Transaction carries blobs
 }
 
 // sizeForVersion returns the size an announcer on the given version advertises.
 func (m *txDeliveryMeta) sizeForVersion(version uint) uint32 {
-	if m.kind == types.BlobTxType && version >= eth.ETH72 {
+	if m.blob && version >= eth.ETH72 {
 		return m.sizeWithoutBlob
 	}
 	return m.size
@@ -266,6 +268,16 @@ func NewTxFetcherForTests(
 // Notify announces the fetcher of the potential availability of a new batch of
 // transactions in the network. It returns array of hashes decided to be fetched.
 func (f *TxFetcher) Notify(peer string, version uint, kinds []byte, sizes []uint32, hashes []common.Hash) ([]common.Hash, error) {
+	return f.notifyBatch(peer, version, kinds, sizes, hashes, false)
+}
+
+// NotifyWithBlobs announces an ETH/72 batch whose transactions carry blobs and
+// whose blob payloads will be delivered separately through the cell protocol.
+func (f *TxFetcher) NotifyWithBlobs(peer string, version uint, kinds []byte, sizes []uint32, hashes []common.Hash) ([]common.Hash, error) {
+	return f.notifyBatch(peer, version, kinds, sizes, hashes, true)
+}
+
+func (f *TxFetcher) notifyBatch(peer string, version uint, kinds []byte, sizes []uint32, hashes []common.Hash, blobBatch bool) ([]common.Hash, error) {
 	// Keep track of all the announced transactions
 	txAnnounceInMeter.Mark(int64(len(hashes)))
 
@@ -285,9 +297,10 @@ func (f *TxFetcher) Notify(peer string, version uint, kinds []byte, sizes []uint
 		underpriced int64
 	)
 	for i, hash := range hashes {
+		isBlob := blobBatch || kinds[i] == types.BlobTxType
 		err := f.validateMeta(hash, kinds[i])
 		if errors.Is(err, txpool.ErrAlreadyKnown) {
-			if kinds[i] == types.BlobTxType {
+			if isBlob {
 				blobFetchHashes = append(blobFetchHashes, hash)
 			}
 			duplicate++
@@ -309,14 +322,14 @@ func (f *TxFetcher) Notify(peer string, version uint, kinds []byte, sizes []uint
 		}
 
 		unknownHashes = append(unknownHashes, hash)
-		if kinds[i] == types.BlobTxType {
+		if isBlob {
 			blobFetchHashes = append(blobFetchHashes, hash)
 		}
 
 		// Transaction metadata has been available since eth68, and all
 		// legacy eth protocols (prior to eth68) have been deprecated.
 		// Therefore, metadata is always expected in the announcement.
-		unknownMetas = append(unknownMetas, txMetadata{kind: kinds[i], size: sizes[i], version: version})
+		unknownMetas = append(unknownMetas, txMetadata{kind: kinds[i], size: sizes[i], version: version, blob: isBlob})
 	}
 	txAnnounceKnownMeter.Mark(duplicate)
 	txAnnounceUnderpricedMeter.Mark(underpriced)
@@ -395,7 +408,7 @@ func (f *TxFetcher) Enqueue(peer string, version uint, txs []*types.Transaction,
 		)
 		if version >= eth.ETH72 {
 			for _, tx := range batch {
-				if tx.Type() == types.BlobTxType {
+				if tx.BlobGas() > 0 {
 					blobTxs = append(blobTxs, tx)
 				} else {
 					poolTxs = append(poolTxs, tx)
@@ -430,6 +443,7 @@ func (f *TxFetcher) Enqueue(peer string, version uint, txs []*types.Transaction,
 				kind:            batch[j].Type(),
 				size:            size,
 				sizeWithoutBlob: size,
+				blob:            batch[j].BlobGas() > 0,
 			}
 			if sc := batch[j].BlobTxSidecar(); sc != nil {
 				if version >= eth.ETH72 {
@@ -670,7 +684,7 @@ func (f *TxFetcher) loop() {
 
 				// Assign the current timestamp as the wait time, but for blob transactions,
 				// skip the wait time since they are only announced.
-				if ann.metas[i].kind != types.BlobTxType {
+				if !ann.metas[i].blob {
 					f.waittime[hash] = f.clock.Now()
 				} else {
 					hasBlob = true

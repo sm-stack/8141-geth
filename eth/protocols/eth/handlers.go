@@ -710,33 +710,8 @@ func answerGetCells(backend Backend, query GetCellsRequest) ([]common.Hash, [][]
 			break
 		}
 		// Look up the blob versioned hashes for this transaction
-		vhashes := backend.BlobPool().GetBlobHashes(hash)
-		if len(vhashes) == 0 {
-			continue
-		}
-		blobCells, _, _ := backend.BlobPool().GetBlobCells(vhashes, query.Mask)
-
-		// Flatten per-blob cells into a single slice. If any blob has a nil
-		// entry (unavailable cell), skip the entire transaction.
-		var flat []kzg4844.Cell
-		skip := false
-		for _, bc := range blobCells {
-			if bc == nil {
-				skip = true
-				break
-			}
-			for _, c := range bc {
-				if c == nil {
-					skip = true
-					break
-				}
-				flat = append(flat, *c)
-			}
-			if skip {
-				break
-			}
-		}
-		if skip || len(flat) == 0 {
+		flat := pooledBlobCells(backend, hash, query.Mask)
+		if len(flat) == 0 {
 			continue
 		}
 		hashes = append(hashes, hash)
@@ -744,6 +719,48 @@ func answerGetCells(backend Backend, query GetCellsRequest) ([]common.Hash, [][]
 		cellCounts += len(flat)
 	}
 	return hashes, cells, query.Mask
+}
+
+// pooledBlobCells retrieves the requested cells from either the blob pool or a
+// blob-carrying transaction held by another subpool, such as the frame pool.
+func pooledBlobCells(backend Backend, hash common.Hash, mask types.CustodyBitmap) []kzg4844.Cell {
+	vhashes := backend.BlobPool().GetBlobHashes(hash)
+	if len(vhashes) > 0 {
+		blobCells, _, _ := backend.BlobPool().GetBlobCells(vhashes, mask)
+		var flat []kzg4844.Cell
+		for _, cells := range blobCells {
+			if cells == nil {
+				return nil
+			}
+			for _, cell := range cells {
+				if cell == nil {
+					return nil
+				}
+				flat = append(flat, *cell)
+			}
+		}
+		return flat
+	}
+	tx := backend.TxPool().Get(hash)
+	if tx == nil || tx.BlobGas() == 0 || tx.BlobTxSidecar() == nil {
+		return nil
+	}
+	sidecar := tx.BlobTxSidecar()
+	if len(sidecar.Blobs) != len(tx.BlobHashes()) {
+		return nil
+	}
+	all, err := kzg4844.ComputeCells(sidecar.Blobs)
+	if err != nil {
+		return nil
+	}
+	indices := mask.Indices()
+	flat := make([]kzg4844.Cell, 0, len(sidecar.Blobs)*len(indices))
+	for blob := range sidecar.Blobs {
+		for _, index := range indices {
+			flat = append(flat, all[blob*kzg4844.CellsPerBlob+int(index)])
+		}
+	}
+	return flat
 }
 
 func handleCells(backend Backend, msg Decoder, peer *Peer) error {

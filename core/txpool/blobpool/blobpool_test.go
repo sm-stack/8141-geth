@@ -1423,7 +1423,7 @@ func TestLegacyLimboConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to pull converted limbo entry: %v", err)
 	}
-	full, err := ptx.toTx()
+	full, err := ptx.ToTx()
 	if err != nil {
 		t.Fatalf("failed to reconstruct tx from converted limbo entry: %v", err)
 	}

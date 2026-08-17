@@ -214,7 +214,7 @@ func (ptx *BlobTxForPool) txSizeWithoutBlob() uint64 {
 }
 
 // ToTx reconstructs a full Transaction with the sidecar attached.
-func (ptx *BlobTxForPool) toTx() (*types.Transaction, error) {
+func (ptx *BlobTxForPool) ToTx() (*types.Transaction, error) {
 	sc, err := ptx.sidecar()
 	if err != nil {
 		return nil, err
@@ -1744,7 +1744,7 @@ func (p *BlobPool) Get(hash common.Hash) *types.Transaction {
 		log.Error("Blobs corrupted for traced transaction", "hash", hash, "id", id, "err", err)
 		return nil
 	}
-	tx, err := ptx.toTx()
+	tx, err := ptx.ToTx()
 	if err != nil {
 		log.Error("Failed to recover transaction in blobpool", "hash", hash, "err", err)
 		return nil

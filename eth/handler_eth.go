@@ -62,7 +62,15 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 	// Consume any broadcasts and announces, forwarding the rest to the downloader
 	switch packet := packet.(type) {
 	case *eth.NewPooledTransactionHashesPacket72:
-		hashes, err := h.txFetcher.Notify(peer.ID(), peer.Version(), packet.Types, packet.Sizes, packet.Hashes)
+		var (
+			hashes []common.Hash
+			err    error
+		)
+		if packet.Mask.OneCount() > 0 {
+			hashes, err = h.txFetcher.NotifyWithBlobs(peer.ID(), peer.Version(), packet.Types, packet.Sizes, packet.Hashes)
+		} else {
+			hashes, err = h.txFetcher.Notify(peer.ID(), peer.Version(), packet.Types, packet.Sizes, packet.Hashes)
+		}
 		if err != nil {
 			return err
 		}
@@ -136,7 +144,7 @@ func handleTransactions(peer *eth.Peer, list []*types.Transaction, directBroadca
 				}
 				// eth72 delivers blob transactions without the blob payload,
 				// earlier versions with all blobs.
-				if blobs := len(tx.BlobTxSidecar().Blobs); tx.Type() == types.BlobTxType && peer.Version() >= eth.ETH72 {
+				if blobs := len(tx.BlobTxSidecar().Blobs); peer.Version() >= eth.ETH72 {
 					if blobs != 0 {
 						return errors.New("received blob transaction with blob payload on eth72")
 					}

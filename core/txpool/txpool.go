@@ -309,6 +309,16 @@ func (p *TxPool) GetMetadata(hash common.Hash) *TxMetadata {
 	return nil
 }
 
+// ValidateTxBasics checks a transaction against the stateless rules of its subpool.
+func (p *TxPool) ValidateTxBasics(tx *types.Transaction) error {
+	for _, subpool := range p.subpools {
+		if subpool.Filter(tx) {
+			return subpool.ValidateTxBasics(tx)
+		}
+	}
+	return fmt.Errorf("%w: type %d", types.ErrTxTypeNotSupported, tx.Type())
+}
+
 // Add enqueues a batch of transactions into the pool if they are valid. Due
 // to the large transaction churn, add may postpone fully integrating the tx
 // to a later point to batch multiple ones together.
