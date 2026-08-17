@@ -156,6 +156,33 @@ type storedReceiptRLP struct {
 	Logs              []*Log
 }
 
+func encodeFrameStorageStatus(r *Receipt) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte(FrameTxType)
+	if err := rlp.Encode(&buf, r.framePayload()); err != nil {
+		return nil, err
+	}
+	// A 32-byte value is reserved for the pre-Byzantium post-state root. Pad
+	// the otherwise ambiguous frame payload; the padding is storage-only and
+	// is removed before consensus hashing.
+	if buf.Len() == common.HashLength {
+		buf.WriteByte(0)
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeFrameStorageStatus(input []byte) (frameReceiptPayload, error) {
+	var frame frameReceiptPayload
+	if len(input) <= 1 || input[0] != FrameTxType {
+		return frame, ErrTxTypeNotSupported
+	}
+	err := rlp.DecodeBytes(input[1:], &frame)
+	if err != nil && len(input) == common.HashLength+1 && input[len(input)-1] == 0 {
+		err = rlp.DecodeBytes(input[1:len(input)-1], &frame)
+	}
+	return frame, err
+}
+
 // NewReceipt creates a barebone transaction receipt, copying the init fields.
 // Deprecated: create receipts using a struct literal instead.
 func NewReceipt(root []byte, failed bool, cumulativeGasUsed uint64) *Receipt {
@@ -471,12 +498,11 @@ func (r *ReceiptForStorage) EncodeRLP(_w io.Writer) error {
 	statusEncoding := (*Receipt)(r).statusEncoding()
 	logs := r.Logs
 	if r.Type == FrameTxType {
-		var buf bytes.Buffer
-		buf.WriteByte(FrameTxType)
-		if err := rlp.Encode(&buf, (*Receipt)(r).framePayload()); err != nil {
+		var err error
+		statusEncoding, err = encodeFrameStorageStatus((*Receipt)(r))
+		if err != nil {
 			return err
 		}
-		statusEncoding = buf.Bytes()
 		if logs == nil {
 			logs = flattenFrameLogs(r.FrameReceipts)
 		}
@@ -508,9 +534,9 @@ func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
 		if err := s.Decode(&stored); err != nil {
 			return err
 		}
-		if len(stored.PostStateOrStatus) > 1 && stored.PostStateOrStatus[0] == FrameTxType {
-			var frame frameReceiptPayload
-			if err := rlp.DecodeBytes(stored.PostStateOrStatus[1:], &frame); err != nil {
+		if len(stored.PostStateOrStatus) != common.HashLength && len(stored.PostStateOrStatus) > 1 && stored.PostStateOrStatus[0] == FrameTxType {
+			frame, err := decodeFrameStorageStatus(stored.PostStateOrStatus)
+			if err != nil {
 				return err
 			}
 			r.Type = FrameTxType
@@ -642,7 +668,19 @@ type slimReceiptRLP struct {
 // EncodeRLP implements rlp.Encoder, encoding the receipt as
 // [tx-type, post-state-or-status, cumulative-gas, logs].
 func (r *SlimReceipt) EncodeRLP(w io.Writer) error {
-	data := &slimReceiptRLP{r.Type, (*Receipt)(r).statusEncoding(), r.CumulativeGasUsed, r.Logs}
+	status := (*Receipt)(r).statusEncoding()
+	logs := r.Logs
+	if r.Type == FrameTxType {
+		var err error
+		status, err = encodeFrameStorageStatus((*Receipt)(r))
+		if err != nil {
+			return err
+		}
+		if logs == nil {
+			logs = flattenFrameLogs(r.FrameReceipts)
+		}
+	}
+	data := &slimReceiptRLP{r.Type, status, r.CumulativeGasUsed, logs}
 	return rlp.Encode(w, data)
 }
 
@@ -651,6 +689,29 @@ func (r *SlimReceipt) DecodeRLP(s *rlp.Stream) error {
 	var data slimReceiptRLP
 	if err := s.Decode(&data); err != nil {
 		return err
+	}
+	if data.Type == FrameTxType {
+		frame, err := decodeFrameStorageStatus(data.StatusEncoding)
+		if err != nil {
+			return err
+		}
+		if frame.CumulativeGasUsed != data.CumulativeGasUsed {
+			return errors.New("frame receipt cumulative gas mismatch")
+		}
+		frameLogs, err := rlp.EncodeToBytes(flattenFrameLogs(frameReceiptsFromRLP(frame.FrameReceipts)))
+		if err != nil {
+			return err
+		}
+		logs, err := rlp.EncodeToBytes(data.Logs)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(frameLogs, logs) {
+			return errors.New("frame receipt logs mismatch")
+		}
+		(*Receipt)(r).Type = FrameTxType
+		(*Receipt)(r).setFromFrameRLP(frame)
+		return nil
 	}
 	r.Type = data.Type
 	r.CumulativeGasUsed = data.CumulativeGasUsed

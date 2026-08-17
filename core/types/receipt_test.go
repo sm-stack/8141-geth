@@ -523,6 +523,17 @@ func TestSlimReceiptEncodingDecoding(t *testing.T) {
 			CumulativeGasUsed: 100,
 			Logs:              []*Log{},
 		},
+		{
+			Type:              FrameTxType,
+			CumulativeGasUsed: 128,
+			Payer:             common.HexToAddress("0x8250"),
+			FrameReceipts: []FrameReceipt{{
+				Status:  FrameReceiptStatusSuccessful,
+				GasUsed: FrameGasUsed{Execution: 10, State: 20},
+				Logs:    legacyReceipt.Logs,
+			}},
+			Logs: legacyReceipt.Logs,
+		},
 	}
 	for i, want := range tests {
 		enc, err := rlp.EncodeToBytes((*SlimReceipt)(want))
@@ -536,7 +547,7 @@ func TestSlimReceiptEncodingDecoding(t *testing.T) {
 		if got.Type != want.Type {
 			t.Errorf("test %d: Type mismatch: got %d, want %d", i, got.Type, want.Type)
 		}
-		if got.Status != want.Status {
+		if want.Type != FrameTxType && got.Status != want.Status {
 			t.Errorf("test %d: Status mismatch: got %d, want %d", i, got.Status, want.Status)
 		}
 		if !bytes.Equal(got.PostState, want.PostState) {
@@ -547,6 +558,14 @@ func TestSlimReceiptEncodingDecoding(t *testing.T) {
 		}
 		if len(got.Logs) != len(want.Logs) {
 			t.Errorf("test %d: Logs length mismatch: got %d, want %d", i, len(got.Logs), len(want.Logs))
+		}
+		if want.Type == FrameTxType {
+			if got.Payer != want.Payer {
+				t.Errorf("test %d: Payer mismatch: got %s, want %s", i, got.Payer, want.Payer)
+			}
+			if !reflect.DeepEqual(got.FrameReceipts, want.FrameReceipts) {
+				t.Errorf("test %d: FrameReceipts mismatch: got %#v, want %#v", i, got.FrameReceipts, want.FrameReceipts)
+			}
 		}
 	}
 }
@@ -711,6 +730,51 @@ func TestReceiptForStorageFrameRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(dec.FrameReceipts, stored.FrameReceipts) {
 		t.Fatalf("frame receipts mismatch: got %#v want %#v", dec.FrameReceipts, stored.FrameReceipts)
+	}
+}
+
+func TestReceiptForStorageFramePayloadDoesNotCollideWithPostState(t *testing.T) {
+	postState := make([]byte, common.HashLength)
+	postState[0] = FrameTxType
+	postState[1] = 0xff
+	legacy := &ReceiptForStorage{PostState: postState, CumulativeGasUsed: 1}
+	enc, err := rlp.EncodeToBytes(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ReceiptForStorage
+	if err := rlp.DecodeBytes(enc, &decoded); err != nil {
+		t.Fatalf("legacy post-state misclassified as frame receipt: %v", err)
+	}
+	if decoded.Type != LegacyTxType || !bytes.Equal(decoded.PostState, postState) {
+		t.Fatalf("legacy post-state mismatch: type %d state %x", decoded.Type, decoded.PostState)
+	}
+
+	frame := &ReceiptForStorage{
+		Type:              FrameTxType,
+		CumulativeGasUsed: 128,
+		FrameReceipts: []FrameReceipt{{
+			Status:  FrameReceiptStatusFailed,
+			GasUsed: FrameGasUsed{},
+			Logs:    []*Log{},
+		}},
+	}
+	enc, err = rlp.EncodeToBytes(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw storedReceiptRLP
+	if err := rlp.DecodeBytes(enc, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.PostStateOrStatus) != common.HashLength+1 {
+		t.Fatalf("ambiguous frame storage payload length: got %d want %d", len(raw.PostStateOrStatus), common.HashLength+1)
+	}
+	if err := rlp.DecodeBytes(enc, &decoded); err != nil {
+		t.Fatalf("decode padded frame receipt: %v", err)
+	}
+	if decoded.Type != FrameTxType || !reflect.DeepEqual(decoded.FrameReceipts, frame.FrameReceipts) {
+		t.Fatalf("frame receipt mismatch: got %#v want %#v", decoded.FrameReceipts, frame.FrameReceipts)
 	}
 }
 

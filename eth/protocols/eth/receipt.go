@@ -23,6 +23,7 @@ import (
 	"iter"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -39,6 +40,9 @@ func newReceipt(tr *types.Receipt) Receipt {
 	r := Receipt{TxType: tr.Type, GasUsed: tr.CumulativeGasUsed}
 	if tr.Type == types.FrameTxType {
 		r.PostStateOrStatus, _ = tr.MarshalBinary()
+		if len(r.PostStateOrStatus) == common.HashLength {
+			r.PostStateOrStatus = append(r.PostStateOrStatus, 0)
+		}
 	} else if tr.PostState != nil {
 		r.PostStateOrStatus = tr.PostState
 	} else {
@@ -51,8 +55,8 @@ func newReceipt(tr *types.Receipt) Receipt {
 // encodeForHash encodes a receipt for the block receiptsRoot derivation.
 func (r *Receipt) encodeForHash(bloomBuf *[6]byte, out *bytes.Buffer) {
 	if r.TxType == types.FrameTxType {
-		if len(r.PostStateOrStatus) > 1 && r.PostStateOrStatus[0] == types.FrameTxType {
-			out.Write(r.PostStateOrStatus)
+		if _, consensus, err := decodeFrameStorageReceipt(r.PostStateOrStatus); err == nil {
+			out.Write(consensus)
 		}
 		return
 	}
@@ -141,8 +145,8 @@ func (r *Receipt) decode(input []byte) error {
 	}
 	r.Logs = input
 	if r.TxType == types.FrameTxType {
-		var receipt types.Receipt
-		if err := receipt.UnmarshalBinary(r.PostStateOrStatus); err != nil {
+		receipt, _, err := decodeFrameStorageReceipt(r.PostStateOrStatus)
+		if err != nil {
 			return fmt.Errorf("invalid frame receipt payload: %w", err)
 		}
 		if receipt.Type != types.FrameTxType {
@@ -160,6 +164,17 @@ func (r *Receipt) decode(input []byte) error {
 		}
 	}
 	return nil
+}
+
+func decodeFrameStorageReceipt(input []byte) (*types.Receipt, []byte, error) {
+	consensus := input
+	var receipt types.Receipt
+	err := receipt.UnmarshalBinary(consensus)
+	if err != nil && len(input) == common.HashLength+1 && input[len(input)-1] == 0 {
+		consensus = input[:len(input)-1]
+		err = receipt.UnmarshalBinary(consensus)
+	}
+	return &receipt, consensus, err
 }
 
 // ReceiptList is the block receipt list as downloaded by eth/69.
