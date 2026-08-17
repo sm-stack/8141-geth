@@ -34,16 +34,13 @@ type payerPreflightFixture struct {
 const payerPreflightSignerKey = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
 
 func TestPayerSolvencyPreflightConfig(t *testing.T) {
-	baseline, _, _ := newTestEnv()
-	if DefaultConfig.PayerSolvencyPreflight || baseline.payerSolvencyPreflight {
-		t.Fatal("payer solvency preflight must be opt-in for the A/B baseline")
+	standard, _, _ := newTestEnv()
+	if !DefaultConfig.PayerSolvencyPreflight || !standard.payerSolvencyPreflight {
+		t.Fatal("payer solvency preflight must be enabled by default")
 	}
-	configured := NewWithConfig(Config{
-		MaxVerifyGas:           PublicMaxVerifyGas,
-		PayerSolvencyPreflight: true,
-	}, baseline.chain)
-	if !configured.payerSolvencyPreflight {
-		t.Fatal("configured payer solvency preflight was not propagated to the pool")
+	baseline := NewWithConfig(Config{MaxVerifyGas: PublicMaxVerifyGas}, standard.chain)
+	if baseline.payerSolvencyPreflight {
+		t.Fatal("explicit A/B baseline unexpectedly enabled payer solvency preflight")
 	}
 }
 
@@ -94,10 +91,11 @@ func TestPayerSolvencyPreflightAdmissionAB(t *testing.T) {
 		name              string
 		enabled           bool
 		wantVerify        int64
+		wantSignature     int64
 		wantPreflightRun  int64
 		wantPreflightDrop int64
 	}{
-		{name: "baseline", wantVerify: 1},
+		{name: "baseline", wantVerify: 1, wantSignature: 1},
 		{name: "preflight", enabled: true, wantPreflightRun: 1, wantPreflightDrop: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -128,14 +126,14 @@ func TestPayerSolvencyPreflightAdmissionAB(t *testing.T) {
 			if test.wantVerify > 0 && verifyGasDelta <= 0 {
 				t.Fatalf("VERIFY gas: have %d want positive", verifyGasDelta)
 			}
-			if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 1 {
-				t.Fatalf("signature validation runs: have %d want 1", delta)
+			if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != test.wantSignature {
+				t.Fatalf("signature validation runs: have %d want %d", delta, test.wantSignature)
 			}
-			if delta := signatureSuccessMeter.Snapshot().Count() - signatureSuccessBefore; delta != 1 {
-				t.Fatalf("successful signature validations: have %d want 1", delta)
+			if delta := signatureSuccessMeter.Snapshot().Count() - signatureSuccessBefore; delta != test.wantSignature {
+				t.Fatalf("successful signature validations: have %d want %d", delta, test.wantSignature)
 			}
-			if delta := signatureGasMeter.Snapshot().Count() - signatureGasBefore; delta != int64(params.SigGasSecp256k1) {
-				t.Fatalf("signature validation gas: have %d want %d", delta, params.SigGasSecp256k1)
+			if delta := signatureGasMeter.Snapshot().Count() - signatureGasBefore; delta != test.wantSignature*int64(params.SigGasSecp256k1) {
+				t.Fatalf("signature validation gas: have %d want %d", delta, test.wantSignature*int64(params.SigGasSecp256k1))
 			}
 			if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != test.wantPreflightRun {
 				t.Fatalf("preflight runs: have %d want %d", delta, test.wantPreflightRun)
@@ -267,6 +265,7 @@ func TestPayerSolvencyPreflightDefersMalformedNoPayPrefix(t *testing.T) {
 	tx := makeFrameTx(frameTx)
 
 	verifyBefore := verifyRunMeter.Snapshot().Count()
+	signatureBefore := signatureRunMeter.Snapshot().Count()
 	senderVerifyBefore := senderVerifyRunMeter.Snapshot().Count()
 	runBefore := preflightRunMeter.Snapshot().Count()
 	err := pool.Add([]*types.Transaction{tx}, false)[0]
@@ -279,8 +278,11 @@ func TestPayerSolvencyPreflightDefersMalformedNoPayPrefix(t *testing.T) {
 	if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != 0 {
 		t.Fatalf("malformed no-pay preflight runs: have %d want 0", delta)
 	}
-	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 1 {
-		t.Fatalf("malformed no-pay normal validation attempts: have %d want 1", delta)
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("malformed no-pay normal validation attempts: have %d want 0", delta)
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("malformed no-pay signature validations: have %d want 0", delta)
 	}
 	if delta := senderVerifyRunMeter.Snapshot().Count() - senderVerifyBefore; delta != 0 {
 		t.Fatalf("malformed no-pay sender VERIFY runs: have %d want 0", delta)

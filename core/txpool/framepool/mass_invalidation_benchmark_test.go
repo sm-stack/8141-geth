@@ -210,8 +210,8 @@ func TestFramePoolCanonicalPaymasterWithdrawalMassInvalidation(t *testing.T) {
 	if pending, _ := fixture.pool.Stats(); pending != 0 {
 		t.Fatalf("pending after withdrawal trigger: have %d want 0", pending)
 	}
-	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != count {
-		t.Fatalf("revalidated after withdrawal trigger: have %d want %d", delta, count)
+	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 0 {
+		t.Fatalf("revalidated after withdrawal trigger: have %d want 0", delta)
 	}
 	if delta := resetEvictedMeter.Snapshot().Count() - evictedBefore; delta != count {
 		t.Fatalf("evicted after withdrawal trigger: have %d want %d", delta, count)
@@ -224,8 +224,8 @@ func TestFramePoolCanonicalPaymasterWithdrawalMassInvalidation(t *testing.T) {
 			t.Fatalf("withdrawal replay tx %d: have %v want %v", i, err, core.ErrInsufficientFunds)
 		}
 	}
-	if delta := verifyRunMeter.Snapshot().Count() - verifyBeforeInvalidReplay; delta != count {
-		t.Fatalf("withdrawal replay VERIFY runs: have %d want %d", delta, count)
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBeforeInvalidReplay; delta != 0 {
+		t.Fatalf("withdrawal replay VERIFY runs: have %d want 0", delta)
 	}
 	if delta := accountingRejectMeter.Snapshot().Count() - rejectBefore; delta != count {
 		t.Fatalf("withdrawal replay accounting rejects: have %d want %d", delta, count)

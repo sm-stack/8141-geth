@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 func resetWithStateChange(pool *FramePool, chain *testChain, mutate func(*state.StateDB)) *state.StateDB {
@@ -60,6 +61,75 @@ func TestSelectiveRevalidationSkipsUnrelatedHeads(t *testing.T) {
 		if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 0 {
 			t.Fatalf("head %d sender VERIFY runs: have %d want 0", head, delta)
 		}
+	}
+}
+
+func TestSelectiveRevalidationBalanceChangesOnlyRebuildSolvency(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		initialExtra int64
+		nextDelta    int64
+		wantPending  int
+		wantReused   int64
+	}{
+		{name: "increase", nextDelta: 100, wantPending: 1, wantReused: 1},
+		{name: "decrease-solvent", initialExtra: 100, wantPending: 1, wantReused: 1},
+		{name: "decrease-insolvent", initialExtra: 100, nextDelta: -1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPayerPreflightFixture(t, true, true)
+			fixture.pool.selectiveRevalidation = true
+			tx := fixture.tx(0x09)
+			initialBalance := new(big.Int).Add(tx.Cost(), big.NewInt(test.initialExtra))
+			fixture.state.SetBalance(fixture.payer, uint256.MustFromBig(initialBalance), tracing.BalanceChangeUnspecified)
+			if err := fixture.pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+				t.Fatalf("initial transaction rejected: %v", err)
+			}
+
+			signatureBefore := signatureRunMeter.Snapshot().Count()
+			verifyBefore := verifyRunMeter.Snapshot().Count()
+			reusedBefore := resetReusedMeter.Snapshot().Count()
+			resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
+				nextBalance := new(big.Int).Add(tx.Cost(), big.NewInt(test.nextDelta))
+				nextState.SetBalance(fixture.payer, uint256.MustFromBig(nextBalance), tracing.BalanceChangeUnspecified)
+			})
+
+			if pending, _ := fixture.pool.Stats(); pending != test.wantPending {
+				t.Fatalf("pending after balance change: have %d want %d", pending, test.wantPending)
+			}
+			if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+				t.Fatalf("signature runs after balance-only change: have %d want 0", delta)
+			}
+			if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+				t.Fatalf("VERIFY runs after balance-only change: have %d want 0", delta)
+			}
+			if delta := resetReusedMeter.Snapshot().Count() - reusedBefore; delta != test.wantReused {
+				t.Fatalf("reused after balance-only change: have %d want %d", delta, test.wantReused)
+			}
+			if test.wantPending == 1 {
+				if reserved := fixture.pool.paymasterReserved[fixture.payer]; reserved == nil || reserved.Cmp(tx.Cost()) != 0 {
+					t.Fatalf("rebuilt payer reservation: have %v want %v", reserved, tx.Cost())
+				}
+			}
+		})
+	}
+}
+
+func TestSortResetTransactionsPrioritizesHigherTipForSharedPayer(t *testing.T) {
+	fixture := newPayerPreflightFixture(t, true, true)
+	low := fixture.tx(0x0a)
+	highFrame := *fixture.tx(0x0b).GetFrameTx()
+	highFrame.GasTipCap = uint256.NewInt(2)
+	high := makeFrameTx(&highFrame)
+	txs := []*types.Transaction{low, high}
+	meta := map[common.Hash]frameTxMeta{
+		low.Hash():  {payer: fixture.payer},
+		high.Hash(): {payer: fixture.payer},
+	}
+
+	sortResetTransactions(txs, meta)
+	if txs[0].Hash() != high.Hash() {
+		t.Fatalf("reset priority: have %s want higher-tip %s", txs[0].Hash(), high.Hash())
 	}
 }
 

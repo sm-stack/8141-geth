@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -71,12 +72,11 @@ type Config struct {
 	SelectiveRevalidation      bool
 }
 
-// DefaultConfig follows the EIP-8141 public-mempool constants.
-// PayerSolvencyPreflight is disabled by default so benchmark runs can opt in
-// explicitly and compare against the unmodified validation order.
+// DefaultConfig follows the EIP-8141 public-mempool constants. Payer solvency
+// is checked before protocol signatures and validation-prefix execution.
 var DefaultConfig = Config{
 	MaxVerifyGas:               maxVerifyGas,
-	PayerSolvencyPreflight:     false,
+	PayerSolvencyPreflight:     true,
 	PayerCodeIdentityPreflight: false,
 	SelectiveRevalidation:      true,
 }
@@ -141,6 +141,7 @@ type frameTxMeta struct {
 	canonicalPaymaster    bool
 	nonCanonicalPaymaster bool
 	maxCost               *big.Int
+	payerAvailableBalance *big.Int
 	payerCodeHash         common.Hash
 	validationDeps        *validationDependencySnapshot
 }
@@ -250,6 +251,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	resetCandidateMeter.Mark(int64(len(txs)))
 	oldMeta := p.meta
+	sortResetTransactions(txs, oldMeta)
 	// revalidated counts full validation-prefix simulations. Transactions rejected
 	// by the payer solvency preflight are candidates and evictions, but not revalidations.
 	revalidated := int64(0)
@@ -302,9 +304,15 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 				continue
 			}
 			if metaOK && p.validationDependenciesUnchanged(frameTx, meta) {
-				if err := p.validatePaymasterAccounting(tx, meta, nil); err != nil {
-					continue
+				available := p.payerAvailableBalance(meta)
+				// An increase cannot invalidate prior solvency, so only rebuild
+				// reservations. A decrease needs the aggregate solvency check.
+				if meta.payerAvailableBalance == nil || available.Cmp(meta.payerAvailableBalance) < 0 {
+					if err := p.validatePayerSolvency(tx, meta, nil); err != nil {
+						continue
+					}
 				}
+				meta.payerAvailableBalance = available
 				if len(p.pending[sender]) == 0 && p.reserver != nil {
 					if err := p.reserver.Hold(sender); err != nil {
 						continue
@@ -487,23 +495,88 @@ func warmRecentRootReferences(statedb *state.StateDB, refs []types.RecentRootRef
 	}
 }
 
+type admissionCheck struct {
+	replacement      *types.Transaction
+	replacementIndex int
+}
+
+// checkAdmissionCheap performs all rejection-only admission checks that don't
+// require protocol-signature verification or validation-prefix EVM execution.
+// The caller must hold p.mu. Since signature verification runs without p.mu,
+// callers must repeat this check immediately before insertion.
+func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bool) (admissionCheck, error) {
+	check := admissionCheck{replacementIndex: -1}
+	frameTx := tx.GetFrameTx()
+	if frameTx == nil {
+		return check, fmt.Errorf("not a frame transaction")
+	}
+	if p.all[tx.Hash()] != nil {
+		return check, txpool.ErrAlreadyKnown
+	}
+	if staleCode, stale := p.stalePayerCode[tx.Hash()]; p.payerCodeIdentityPreflight && stale && p.currentState.GetCodeHash(staleCode.payer) != staleCode.codeHash {
+		if meterPreflight {
+			payerCodeIdentityReplayRejectMeter.Mark(1)
+		}
+		return check, fmt.Errorf("%w: payer %s code hash changed since transaction admission", core.ErrFrameTxInvalid, staleCode.payer)
+	}
+	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
+		return check, err
+	}
+	if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
+		return check, err
+	}
+	sender := frameTx.Sender
+	if txs := p.pending[sender]; len(txs) > 0 {
+		for index, pendingTx := range txs {
+			oldFrameTx := pendingTx.GetFrameTx()
+			if frameTx.NonceSeq == oldFrameTx.NonceSeq && frameTx.NonceKeySetEqual(oldFrameTx) {
+				check.replacement = pendingTx
+				check.replacementIndex = index
+				break
+			}
+		}
+		if check.replacement != nil {
+			if !isFrameTxPriceBumped(tx, check.replacement) {
+				return check, txpool.ErrReplaceUnderpriced
+			}
+		} else if len(txs) >= maxFrameTxsPerAccount {
+			return check, fmt.Errorf("%w: sender %s has %d pending frame transactions", txpool.ErrAccountLimitExceeded, sender.Hex(), len(txs))
+		}
+	}
+	if check.replacement == nil && len(p.all) >= maxFramePoolSize {
+		return check, fmt.Errorf("frame pool full")
+	}
+	if err := validateFrameOrdering(frameTx.Frames, sender); err != nil {
+		return check, err
+	}
+	simulationTime := p.currentHead.Time + params.SecondsPerSlot
+	plan, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime)
+	if err != nil {
+		return check, err
+	}
+	if p.payerSolvencyPreflight {
+		if err := p.preflightPayerSolvencyWithPlan(tx, check.replacement, plan, meterPreflight); err != nil {
+			return check, err
+		}
+	}
+	return check, nil
+}
+
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
 func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
 		return fmt.Errorf("not a frame transaction")
 	}
-	p.mu.RLock()
-	alreadyKnown := p.all[tx.Hash()] != nil
-	staleCode, stale := p.stalePayerCode[tx.Hash()]
-	staleCodeChanged := p.payerCodeIdentityPreflight && stale && p.currentState.GetCodeHash(staleCode.payer) != staleCode.codeHash
-	p.mu.RUnlock()
-	if alreadyKnown {
-		return txpool.ErrAlreadyKnown
-	}
-	if staleCodeChanged {
-		payerCodeIdentityReplayRejectMeter.Mark(1)
-		return fmt.Errorf("%w: payer %s code hash changed since transaction admission", core.ErrFrameTxInvalid, staleCode.payer)
+	p.mu.Lock()
+	_, err := p.checkAdmissionCheap(tx, true)
+	p.mu.Unlock()
+	if err != nil {
+		if errors.Is(err, core.ErrInsufficientFunds) {
+			accountingRejectMeter.Mark(1)
+			accountingInsufficientMeter.Mark(1)
+		}
+		return err
 	}
 	signatureGas, err := p.validateFrameSignatures(frameTx)
 	if err != nil {
@@ -513,55 +586,17 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.all[tx.Hash()] != nil {
-		return txpool.ErrAlreadyKnown
-	}
-
-	sender := frameTx.Sender
-
-	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
-		return err
-	}
-	if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
-		return err
-	}
-
-	var (
-		replacement      *types.Transaction
-		replacementIndex = -1
-	)
-	if txs := p.pending[sender]; len(txs) > 0 {
-		for index, pendingTx := range txs {
-			oldFrameTx := pendingTx.GetFrameTx()
-			if frameTx.NonceSeq == oldFrameTx.NonceSeq && frameTx.NonceKeySetEqual(oldFrameTx) {
-				replacement = pendingTx
-				replacementIndex = index
-				break
-			}
-		}
-		if replacement != nil {
-			if !isFrameTxPriceBumped(tx, replacement) {
-				return txpool.ErrReplaceUnderpriced
-			}
-		} else if len(txs) >= maxFrameTxsPerAccount {
-			return fmt.Errorf("%w: sender %s has %d pending frame transactions", txpool.ErrAccountLimitExceeded, sender.Hex(), len(txs))
-		}
-	}
-	if replacement == nil && len(p.all) >= maxFramePoolSize {
-		return fmt.Errorf("frame pool full")
-	}
-
-	// Static frame ordering validation (pre-simulation, O(n)).
-	if err := validateFrameOrdering(frameTx.Frames, sender); err != nil {
-		return err
-	}
-	if err := p.preflightPayerSolvency(tx, replacement); err != nil {
-		accountingRejectMeter.Mark(1)
+	check, err := p.checkAdmissionCheap(tx, false)
+	if err != nil {
 		if errors.Is(err, core.ErrInsufficientFunds) {
+			accountingRejectMeter.Mark(1)
 			accountingInsufficientMeter.Mark(1)
 		}
 		return err
 	}
+	replacement := check.replacement
+	replacementIndex := check.replacementIndex
+	sender := frameTx.Sender
 
 	// Reserve address (if first tx for this sender).
 	held := false
@@ -792,9 +827,10 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			return frameTxMeta{}, senderResult, err
 		}
 		meta := frameTxMeta{
-			payer:         frameTx.Sender,
-			maxCost:       tx.Cost(),
-			payerCodeHash: p.currentState.GetCodeHash(frameTx.Sender),
+			payer:                 frameTx.Sender,
+			maxCost:               tx.Cost(),
+			payerAvailableBalance: p.currentState.GetBalance(frameTx.Sender).ToBig(),
+			payerCodeHash:         p.currentState.GetCodeHash(frameTx.Sender),
 		}
 		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads)
 		return meta, senderResult, nil
@@ -823,6 +859,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		return frameTxMeta{}, payResult, err
 	}
 	meta.maxCost = tx.Cost()
+	meta.payerAvailableBalance = p.payerAvailableBalance(meta)
 	meta.payerCodeHash = p.currentState.GetCodeHash(meta.payer)
 	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads)
 	return meta, payResult, nil
@@ -1197,7 +1234,6 @@ func (p *FramePool) preflightPayerSolvency(tx *types.Transaction, replacement *t
 	if frameTx == nil {
 		return nil
 	}
-	start := time.Now()
 	simulationTime := p.currentHead.Time + params.SecondsPerSlot
 	plan, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime)
 	if err != nil {
@@ -1205,11 +1241,22 @@ func (p *FramePool) preflightPayerSolvency(tx *types.Transaction, replacement *t
 		// This keeps the optimization limited to necessary payer accounting.
 		return nil
 	}
+	return p.preflightPayerSolvencyWithPlan(tx, replacement, plan, true)
+}
+
+func (p *FramePool) preflightPayerSolvencyWithPlan(tx *types.Transaction, replacement *types.Transaction, plan validationPrefixPlan, meter bool) error {
+	frameTx := tx.GetFrameTx()
+	if frameTx == nil {
+		return nil
+	}
+	start := time.Now()
 	payer := frameTx.Sender
 	if plan.payVerifyIndex >= 0 {
 		payer = resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
 	}
-	preflightRunMeter.Mark(1)
+	if meter {
+		preflightRunMeter.Mark(1)
+	}
 	usesPaymaster := payer != frameTx.Sender
 	meta := frameTxMeta{
 		payer:              payer,
@@ -1217,14 +1264,49 @@ func (p *FramePool) preflightPayerSolvency(tx *types.Transaction, replacement *t
 		canonicalPaymaster: usesPaymaster && p.isCanonicalPaymaster(payer),
 		maxCost:            tx.Cost(),
 	}
-	err = p.validatePayerSolvency(tx, meta, replacement)
-	preflightTimeTimer.UpdateSince(start)
+	err := p.validatePayerSolvency(tx, meta, replacement)
+	if meter {
+		preflightTimeTimer.UpdateSince(start)
+	}
 	if err != nil {
-		preflightRejectMeter.Mark(1)
+		if meter {
+			preflightRejectMeter.Mark(1)
+		}
 		return err
 	}
-	preflightPassMeter.Mark(1)
+	if meter {
+		preflightPassMeter.Mark(1)
+	}
 	return nil
+}
+
+// sortResetTransactions makes shared-payer reservation rebuilding independent
+// of Go map iteration order. Higher-paying transactions win scarce payer balance;
+// transaction hash provides a stable final tie-breaker.
+func sortResetTransactions(txs []*types.Transaction, oldMeta map[common.Hash]frameTxMeta) {
+	slices.SortFunc(txs, func(a, b *types.Transaction) int {
+		aMeta, aOK := oldMeta[a.Hash()]
+		bMeta, bOK := oldMeta[b.Hash()]
+		if aOK != bOK {
+			if aOK {
+				return -1
+			}
+			return 1
+		}
+		if aOK {
+			if cmp := bytes.Compare(aMeta.payer[:], bMeta.payer[:]); cmp != 0 {
+				return cmp
+			}
+		}
+		if cmp := b.GasTipCap().Cmp(a.GasTipCap()); cmp != 0 {
+			return cmp
+		}
+		if cmp := b.GasFeeCap().Cmp(a.GasFeeCap()); cmp != 0 {
+			return cmp
+		}
+		aHash, bHash := a.Hash(), b.Hash()
+		return bytes.Compare(aHash[:], bHash[:])
+	})
 }
 
 // hasNoCode returns true if the given address has no code (is an EOA).
@@ -1319,19 +1401,28 @@ func (p *FramePool) validatePayerSolvency(tx *types.Transaction, meta frameTxMet
 	}
 	reserved := p.reservedExcluding(meta.payer, replacement)
 	required := new(big.Int).Add(reserved, meta.maxCost)
-	balance := p.currentState.GetBalance(meta.payer).ToBig()
-	pendingWithdrawal := new(big.Int)
-	if meta.usesPaymaster && meta.canonicalPaymaster {
-		pendingWithdrawal = p.pendingCanonicalWithdrawal(meta.payer)
-		balance.Sub(balance, pendingWithdrawal)
-		if balance.Sign() < 0 {
-			balance.SetInt64(0)
-		}
-	}
+	balance := p.payerAvailableBalance(meta)
+	pendingWithdrawal := p.pendingCanonicalWithdrawalForMeta(meta)
 	if balance.Cmp(required) < 0 {
 		return fmt.Errorf("%w: payer %s available balance %v, reserved %v, pending withdrawal %v, tx cost %v", core.ErrInsufficientFunds, meta.payer.Hex(), balance, reserved, pendingWithdrawal, meta.maxCost)
 	}
 	return nil
+}
+
+func (p *FramePool) pendingCanonicalWithdrawalForMeta(meta frameTxMeta) *big.Int {
+	if !meta.usesPaymaster || !meta.canonicalPaymaster {
+		return new(big.Int)
+	}
+	return p.pendingCanonicalWithdrawal(meta.payer)
+}
+
+func (p *FramePool) payerAvailableBalance(meta frameTxMeta) *big.Int {
+	balance := p.currentState.GetBalance(meta.payer).ToBig()
+	balance.Sub(balance, p.pendingCanonicalWithdrawalForMeta(meta))
+	if balance.Sign() < 0 {
+		balance.SetInt64(0)
+	}
+	return balance
 }
 
 // validatePaymasterAccounting performs full post-simulation accounting: common
@@ -1354,6 +1445,9 @@ func (p *FramePool) reserveTxAccounting(hash common.Hash, meta frameTxMeta) {
 		meta.maxCost = new(big.Int)
 	}
 	meta.maxCost = new(big.Int).Set(meta.maxCost)
+	if meta.payerAvailableBalance != nil {
+		meta.payerAvailableBalance = new(big.Int).Set(meta.payerAvailableBalance)
+	}
 	p.meta[hash] = meta
 	if p.paymasterReserved[meta.payer] == nil {
 		p.paymasterReserved[meta.payer] = new(big.Int)
