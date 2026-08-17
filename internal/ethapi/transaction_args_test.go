@@ -387,6 +387,21 @@ func TestCallDefaultsAcceptsFrameNonceKeys(t *testing.T) {
 	}
 }
 
+func TestToMessageRejectsFrameTransactions(t *testing.T) {
+	gas := hexutil.Uint64(100_000)
+	value := (*hexutil.Big)(new(big.Int))
+	fee := (*hexutil.Big)(big.NewInt(1))
+	tip := (*hexutil.Big)(new(big.Int))
+	blobFee := (*hexutil.Big)(new(big.Int))
+	frames := []types.Frame{}
+	args := &TransactionArgs{
+		Gas: &gas, Value: value, MaxFeePerGas: fee, MaxPriorityFeePerGas: tip, BlobFeeCap: blobFee, Frames: &frames,
+	}
+	if _, err := args.ToMessage(big.NewInt(1), true); err == nil || !strings.Contains(err.Error(), "frame transactions") {
+		t.Fatalf("ToMessage error = %v, want explicit frame rejection", err)
+	}
+}
+
 func TestSetFeeDefaultsRejectsFrameTxGasPrice(t *testing.T) {
 	t.Parallel()
 

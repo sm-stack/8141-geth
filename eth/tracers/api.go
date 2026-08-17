@@ -953,8 +953,11 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 	if err := args.CallDefaults(api.backend.RPCGasCap(), blockContext.BaseFee, api.backend.ChainConfig().ChainID); err != nil {
 		return nil, err
 	}
+	msg, err := args.ToMessage(blockContext.BaseFee, true)
+	if err != nil {
+		return nil, err
+	}
 	var (
-		msg         = args.ToMessage(blockContext.BaseFee, true)
 		tx          = args.ToTransaction(types.DynamicFeeTxType)
 		traceConfig *TraceConfig
 	)
