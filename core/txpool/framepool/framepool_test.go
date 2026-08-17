@@ -607,6 +607,63 @@ func TestFramePoolResetReinjectsTransactionFromDiscardedBranch(t *testing.T) {
 	}
 }
 
+func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	var (
+		blob       kzg4844.Blob
+		commitment kzg4844.Commitment
+		zero       uint64
+	)
+	pool.currentHead.ExcessBlobGas = &zero
+	pool.currentHead.BlobGasUsed = &zero
+	ftx := baseFTX(sender, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		make([]kzg4844.Proof, kzg4844.CellProofsPerBlob),
+	))
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("add blob frame transaction: %v", err)
+	}
+
+	parent := types.NewBlockWithHeader(pool.currentHead)
+	oldBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("old"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+		ExcessBlobGas: &zero, BlobGasUsed: &zero,
+	}).WithBody(types.Body{Transactions: types.Transactions{tx.WithoutBlobTxSidecar()}})
+	newBlock := types.NewBlockWithHeader(&types.Header{
+		Number: big.NewInt(1), ParentHash: parent.Hash(), Extra: []byte("new"),
+		GasLimit: 30_000_000, BaseFee: big.NewInt(params.InitialBaseFee), Difficulty: big.NewInt(0),
+		ExcessBlobGas: &zero, BlobGasUsed: &zero,
+	})
+	chain := pool.chain.(*testChain)
+	for _, block := range []*types.Block{parent, oldBlock, newBlock} {
+		chain.blocks[block.Hash()] = block
+	}
+
+	statedb.SetNonce(sender, 1, tracing.NonceChangeUnspecified)
+	pool.Reset(parent.Header(), oldBlock.Header())
+	if pool.Has(tx.Hash()) {
+		t.Fatal("mined blob frame transaction remained pending")
+	}
+	statedb.SetNonce(sender, 0, tracing.NonceChangeUnspecified)
+	pool.Reset(oldBlock.Header(), newBlock.Header())
+	reinjected := pool.Get(tx.Hash())
+	if reinjected == nil || reinjected.BlobTxSidecar() == nil || len(reinjected.BlobTxSidecar().Blobs) != 1 {
+		t.Fatal("blob frame transaction from discarded branch was not reinjected with its sidecar")
+	}
+}
+
 func TestFramePoolRejectsSecondIndependentNonceDomain(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")

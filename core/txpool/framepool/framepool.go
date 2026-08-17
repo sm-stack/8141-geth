@@ -125,6 +125,7 @@ type FramePool struct {
 	all            map[common.Hash]*types.Transaction      // hash → tx
 	meta           map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
 	stalePayerCode map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
+	blobSidecars   map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
 
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
@@ -160,6 +161,11 @@ type payerCodeIdentity struct {
 	codeHash common.Hash
 }
 
+type cachedBlobSidecar struct {
+	sidecar     *types.BlobTxSidecar
+	blockNumber uint64
+}
+
 // New creates a new frame transaction pool.
 func New(chain BlockChain) *FramePool {
 	return NewWithConfig(DefaultConfig, chain)
@@ -183,6 +189,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		all:                        make(map[common.Hash]*types.Transaction),
 		meta:                       make(map[common.Hash]frameTxMeta),
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
+		blobSidecars:               make(map[common.Hash]cachedBlobSidecar),
 		slotProvider: func(head *types.Header) vm.SlotProvider {
 			return vm.TimestampSlotProvider{Timestamp: head.Time}
 		},
@@ -234,7 +241,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		resetLastTimeGauge.Update(elapsed.Nanoseconds())
 	}()
 
-	reinject := p.reorgTransactions(oldHead, newHead)
+	reinject, included := p.reorgTransactions(oldHead, newHead)
 	statedb, err := p.chain.StateAt(newHead)
 	if err != nil {
 		log.Error("Failed to reset frame pool state", "err", err)
@@ -242,6 +249,15 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.cacheIncludedBlobSidecars(included, newHead.Number.Uint64())
+	for i, tx := range reinject {
+		if tx.BlobGas() == 0 || tx.BlobTxSidecar() != nil {
+			continue
+		}
+		if cached, ok := p.blobSidecars[tx.Hash()]; ok {
+			reinject[i] = tx.WithBlobTxSidecar(cached.sidecar)
+		}
+	}
 
 	p.currentHead = newHead
 	p.currentState = statedb
@@ -361,9 +377,16 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 }
 
-func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) types.Transactions {
-	if oldHead == nil || newHead == nil || oldHead.Hash() == newHead.ParentHash {
-		return nil
+func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions) {
+	if oldHead == nil || newHead == nil {
+		return nil, nil
+	}
+	if oldHead.Hash() == newHead.ParentHash {
+		block := p.chain.GetBlock(newHead.Hash(), newHead.Number.Uint64())
+		if block == nil {
+			return nil, nil
+		}
+		return nil, block.Transactions()
 	}
 	oldNum, newNum := oldHead.Number.Uint64(), newHead.Number.Uint64()
 	var depth uint64
@@ -373,47 +396,69 @@ func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) types.Tran
 		depth = oldNum - newNum
 	}
 	if depth > 64 {
-		return nil
+		return nil, nil
 	}
 	rem := p.chain.GetBlock(oldHead.Hash(), oldNum)
 	add := p.chain.GetBlock(newHead.Hash(), newNum)
 	if rem == nil || add == nil {
-		return nil
+		return nil, nil
 	}
 	var discarded, included types.Transactions
 	for rem.NumberU64() > add.NumberU64() {
 		discarded = append(discarded, rem.Transactions()...)
 		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
 		if rem == nil {
-			return nil
+			return nil, nil
 		}
 	}
 	for add.NumberU64() > rem.NumberU64() {
 		included = append(included, add.Transactions()...)
 		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
 		if add == nil {
-			return nil
+			return nil, nil
 		}
 	}
 	for rem.Hash() != add.Hash() {
 		discarded = append(discarded, rem.Transactions()...)
 		included = append(included, add.Transactions()...)
 		if rem.NumberU64() == 0 || add.NumberU64() == 0 {
-			return nil
+			return nil, nil
 		}
 		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
 		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
 		if rem == nil || add == nil {
-			return nil
+			return nil, nil
 		}
 	}
 	var lost types.Transactions
 	for _, tx := range types.TxDifference(discarded, included) {
-		if p.Filter(tx) && (tx.BlobGas() == 0 || tx.BlobTxSidecar() != nil) {
+		if p.Filter(tx) {
 			lost = append(lost, tx)
 		}
 	}
-	return lost
+	return lost, included
+}
+
+func (p *FramePool) cacheIncludedBlobSidecars(included types.Transactions, blockNumber uint64) {
+	for _, tx := range included {
+		pooled := p.all[tx.Hash()]
+		if pooled == nil || pooled.BlobGas() == 0 || pooled.BlobTxSidecar() == nil {
+			continue
+		}
+		p.blobSidecars[tx.Hash()] = cachedBlobSidecar{
+			sidecar:     pooled.BlobTxSidecar(),
+			blockNumber: blockNumber,
+		}
+	}
+	if blockNumber <= 64 {
+		return
+	}
+	oldest := blockNumber - 64
+	for hash, cached := range p.blobSidecars {
+		if cached.blockNumber < oldest {
+			delete(p.blobSidecars, hash)
+		}
+	}
 }
 
 // SetGasTip updates the minimum gas tip and evicts underpriced transactions.
