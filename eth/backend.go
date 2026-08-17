@@ -398,9 +398,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 }
 
 func validateFramePoolNetworkPolicy(maxVerifyGas uint64, p2pConfig p2p.Config) error {
-	// Uncommitted benchmark override: this disposable test build may expose the
-	// P2P admission path with a validation budget up to 1M gas.
-	if maxVerifyGas <= 1_000_000 {
+	if maxVerifyGas <= framepool.PublicMaxVerifyGas {
 		return nil
 	}
 	isolated := p2pConfig.MaxPeers == 0 && p2pConfig.NoDial && p2pConfig.NoDiscovery &&

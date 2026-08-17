@@ -21,8 +21,8 @@ func TestValidateFramePoolNetworkPolicy(t *testing.T) {
 	if err := validateFramePoolNetworkPolicy(framepool.PublicMaxVerifyGas, networked); err != nil {
 		t.Fatalf("public validation limit must be accepted on networked nodes: %v", err)
 	}
-	if err := validateFramePoolNetworkPolicy(1_000_000, networked); err != nil {
-		t.Fatalf("benchmark validation limit must be accepted on networked nodes: %v", err)
+	if err := validateFramePoolNetworkPolicy(framepool.PublicMaxVerifyGas+1, networked); err == nil {
+		t.Fatal("networked node accepted a private validation override")
 	}
 	isolated := p2p.Config{MaxPeers: 0, NoDial: true, NoDiscovery: true}
 	if err := validateFramePoolNetworkPolicy(500_000, isolated); err != nil {
