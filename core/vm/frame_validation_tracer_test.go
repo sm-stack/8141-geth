@@ -39,6 +39,7 @@ type mockStateDB struct {
 }
 
 func (m *mockStateDB) GetCodeSize(addr common.Address) int { return m.codeSize[addr] }
+func (m *mockStateDB) StorageEmpty(common.Address) bool    { return true }
 
 // Boilerplate — unused by the tracer.
 func (m *mockStateDB) CreateAccount(common.Address)  {}

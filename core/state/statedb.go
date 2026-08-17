@@ -375,6 +375,24 @@ func (s *StateDB) GetStorageRoot(addr common.Address) common.Hash {
 	return common.Hash{}
 }
 
+// StorageEmpty reports whether an account has no committed or pending storage.
+func (s *StateDB) StorageEmpty(addr common.Address) bool {
+	stateObject := s.getStateObject(addr)
+	if stateObject == nil {
+		return true
+	}
+	for _, value := range stateObject.dirtyStorage {
+		if value != (common.Hash{}) {
+			return false
+		}
+	}
+	root := stateObject.Root()
+	if s.db.Type().Is(TypeUBT) {
+		return root == (common.Hash{}) || root == types.EmptyBinaryHash
+	}
+	return root == (common.Hash{}) || root == types.EmptyRootHash
+}
+
 // TxIndex returns the current transaction index set by SetTxContext.
 func (s *StateDB) TxIndex() int {
 	return s.txIndex

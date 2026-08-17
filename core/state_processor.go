@@ -104,7 +104,11 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		evm.SetPrecompileCache(precompileCache)
 	}
 	// Run the pre-execution system calls
-	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
+	preBAL, err := PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time())
+	if err != nil {
+		return nil, err
+	}
+	blockAccessList.Merge(preBAL)
 
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
@@ -153,13 +157,16 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 }
 
 // PreExecution processes pre-execution state changes and system calls.
-func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.Header, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64) *bal.ConstructionBlockAccessList {
+func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.Header, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64) (*bal.ConstructionBlockAccessList, error) {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "core.preExecution")
 	defer spanEnd(nil)
 
 	var blockAccessList *bal.ConstructionBlockAccessList
 	if config.IsAmsterdam(number, time) {
 		blockAccessList = bal.NewConstructionBlockAccessList()
+	}
+	if err := ApplyBogotaSystemContracts(parent, config, evm, number, time, blockAccessList); err != nil {
+		return nil, err
 	}
 	// EIP-4788
 	if beaconRoot != nil {
@@ -169,7 +176,40 @@ func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.He
 	if config.IsPrague(number, time) || config.IsUBT(number, time) {
 		ProcessParentBlockHash(parent.Hash(), evm, blockAccessList)
 	}
-	return blockAccessList
+	return blockAccessList, nil
+}
+
+// ApplyBogotaSystemContracts installs the frame-transaction system contracts
+// at the Bogota fork boundary while preserving any pre-existing balances.
+func ApplyBogotaSystemContracts(parent *types.Header, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64, blockAccessList *bal.ConstructionBlockAccessList) error {
+	if !config.IsBogota(number, time) || config.IsBogota(parent.Number, parent.Time) {
+		return nil
+	}
+	contracts := []struct {
+		address common.Address
+		code    []byte
+	}{
+		{params.FrameExpiryVerifierAddress, params.FrameExpiryVerifierCode},
+		{params.NonceManagerAddress, params.NonceManagerCode},
+		{params.RecentRootAddress, params.RecentRootCode},
+	}
+	evm.StateDB.SetTxContext(common.Hash{}, 0, 0)
+	for _, contract := range contracts {
+		if code := evm.StateDB.GetCode(contract.address); len(code) != 0 || !evm.StateDB.StorageEmpty(contract.address) {
+			return fmt.Errorf("Bogota system contract address %s is occupied", contract.address)
+		}
+	}
+	for _, contract := range contracts {
+		evm.StateDB.SetCode(contract.address, contract.code, tracing.CodeChangeUnspecified)
+		if evm.StateDB.GetNonce(contract.address) < 1 {
+			evm.StateDB.SetNonce(contract.address, 1, tracing.NonceChangeUnspecified)
+		}
+	}
+	changes := evm.StateDB.Finalise(evm.GetRules())
+	if blockAccessList != nil {
+		blockAccessList.Merge(changes)
+	}
+	return nil
 }
 
 // PostExecution processes post-execution system calls when Prague is enabled.

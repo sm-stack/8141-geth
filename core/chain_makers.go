@@ -384,6 +384,15 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(b.header.Number) == 0 {
 			misc.ApplyDAOHardFork(statedb)
 		}
+		if config.IsBogota(b.header.Number, b.header.Time) && !config.IsBogota(parent.Number(), parent.Time()) {
+			blockContext := NewEVMBlockContext(b.header, cm, &b.header.Coinbase)
+			blockContext.Random = &common.Hash{}
+			evm := vm.NewEVM(blockContext, statedb, cm.config, vm.Config{})
+			if err := ApplyBogotaSystemContracts(parent.Header(), config, evm, b.header.Number, b.header.Time, b.bal); err != nil {
+				panic(err)
+			}
+			evm.Release()
+		}
 		if config.IsPrague(b.header.Number, b.header.Time) || config.IsUBT(b.header.Number, b.header.Time) {
 			// EIP-2935
 			blockContext := NewEVMBlockContext(b.header, cm, &b.header.Coinbase)

@@ -41,6 +41,8 @@ type sigCache struct {
 func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint64) Signer {
 	var signer Signer
 	switch {
+	case config.IsBogota(blockNumber, blockTime):
+		signer = NewBogotaSigner(config.ChainID)
 	case config.IsPrague(blockNumber, blockTime):
 		signer = NewPragueSigner(config.ChainID)
 	case config.IsCancun(blockNumber, blockTime):
@@ -70,6 +72,8 @@ func LatestSigner(config *params.ChainConfig) Signer {
 	var signer Signer
 	if config.ChainID != nil {
 		switch {
+		case config.BogotaTime != nil:
+			signer = NewBogotaSigner(config.ChainID)
 		case config.PragueTime != nil:
 			signer = NewPragueSigner(config.ChainID)
 		case config.CancunTime != nil:
@@ -99,7 +103,7 @@ func LatestSigner(config *params.ChainConfig) Signer {
 func LatestSignerForChainID(chainID *big.Int) Signer {
 	var signer Signer
 	if chainID != nil {
-		signer = NewPragueSigner(chainID)
+		signer = NewBogotaSigner(chainID)
 	} else {
 		signer = HomesteadSigner{}
 	}
@@ -230,6 +234,8 @@ func newModernSigner(chainID *big.Int, fork forks.Fork) Signer {
 	}
 	if fork >= forks.Prague {
 		s.txtypes.set(SetCodeTxType)
+	}
+	if fork >= forks.Bogota {
 		s.txtypes.set(FrameTxType)
 	}
 	return s
@@ -308,6 +314,12 @@ func (s *modernSigner) SignatureValues(tx *Transaction, sig []byte) (R, S, V *bi
 // - legacy Homestead transactions.
 func NewPragueSigner(chainId *big.Int) Signer {
 	return newModernSigner(chainId, forks.Prague)
+}
+
+// NewBogotaSigner returns a signer that accepts frame transactions and all
+// transaction types supported by NewPragueSigner.
+func NewBogotaSigner(chainId *big.Int) Signer {
+	return newModernSigner(chainId, forks.Bogota)
 }
 
 // NewCancunSigner returns a signer that accepts

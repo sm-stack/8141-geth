@@ -22,6 +22,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"math"
 	"math/big"
 	"os"
@@ -312,6 +313,20 @@ func TestFrameTxType(t *testing.T) {
 	}
 	if FrameTxType != 0x06 {
 		t.Errorf("FrameTxType = %d, want 0x06", FrameTxType)
+	}
+}
+
+func TestFrameTxSignerActivatesAtBogota(t *testing.T) {
+	config := *params.TestChainConfig
+	prague, bogota := uint64(0), uint64(10)
+	config.PragueTime = &prague
+	config.BogotaTime = &bogota
+	tx := NewTx(testFrameTx())
+	if _, err := Sender(MakeSigner(&config, big.NewInt(1), bogota-1), tx); !errors.Is(err, ErrTxTypeNotSupported) {
+		t.Fatalf("pre-Bogota sender error = %v, want unsupported type", err)
+	}
+	if got, err := Sender(MakeSigner(&config, big.NewInt(1), bogota), tx); err != nil || got != tx.FrameSender() {
+		t.Fatalf("Bogota sender = %s, %v", got, err)
 	}
 }
 
@@ -640,7 +655,7 @@ func TestFrameTxTransactionAccessors(t *testing.T) {
 func TestFrameTxSigner(t *testing.T) {
 	ftx := testFrameTx()
 	tx := NewTx(ftx)
-	signer := NewPragueSigner(ftx.chainID())
+	signer := NewBogotaSigner(ftx.chainID())
 
 	// Sender should return the explicit sender from the tx.
 	sender, err := Sender(signer, tx)

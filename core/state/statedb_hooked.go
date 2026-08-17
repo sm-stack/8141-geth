@@ -79,6 +79,10 @@ func (s *hookedStateDB) GetCodeSize(addr common.Address) int {
 	return s.inner.GetCodeSize(addr)
 }
 
+func (s *hookedStateDB) StorageEmpty(addr common.Address) bool {
+	return s.inner.StorageEmpty(addr)
+}
+
 func (s *hookedStateDB) AddRefund(u uint64) {
 	s.inner.AddRefund(u)
 }

@@ -322,7 +322,11 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 		evm.SetPrecompiles(precompiles)
 	}
 	// Run pre-execution system calls
-	blockAccessList.Merge(core.PreExecution(ctx, header.ParentBeaconRoot, parent, sim.chainConfig, evm, header.Number, header.Time))
+	preBAL, err := core.PreExecution(ctx, header.ParentBeaconRoot, parent, sim.chainConfig, evm, header.Number, header.Time)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	blockAccessList.Merge(preBAL)
 
 	var allLogs []*types.Log
 	for i, call := range block.Calls {
