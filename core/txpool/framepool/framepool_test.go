@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"sync"
@@ -1286,6 +1287,49 @@ func TestFramePoolDeployValidationPrefixShapes(t *testing.T) {
 			t.Fatalf("expected sender deployment followed by VERIFY to pass: %v", err)
 		}
 	})
+}
+
+func TestFramePoolReusableValidationStateRevertsDeploy(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	sender := crypto.CreateAddress(factory, 0)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(factory)
+	statedb.SetCode(factory, createFactoryCode(approveBothCode), tracing.CodeChangeUnspecified)
+
+	frameTx := baseFTX(sender, 0, config)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 60_000},
+		{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000},
+	}
+	view := pool.validationViewLocked()
+	factoryNonce := view.currentState.GetNonce(factory)
+	assertReverted := func(phase string) {
+		t.Helper()
+		if code := view.currentState.GetCode(sender); len(code) != 0 {
+			t.Fatalf("%s left sender code in reusable state: %x", phase, code)
+		}
+		if nonce := view.currentState.GetNonce(factory); nonce != factoryNonce {
+			t.Fatalf("%s left factory nonce in reusable state: have %d want %d", phase, nonce, factoryNonce)
+		}
+	}
+
+	failed := *frameTx
+	failed.Frames = append([]types.Frame(nil), frameTx.Frames...)
+	failed.Frames[0].GasLimit = 1
+	if _, _, err := view.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(&failed), 0); err == nil {
+		t.Fatal("expected underfunded deploy validation to fail")
+	}
+	assertReverted("failed validation")
+
+	transaction := makeFrameTx(frameTx)
+	for attempt := range 2 {
+		if _, _, err := view.simulateVerifyFramesWithSignatureGasOutcome(transaction, 0); err != nil {
+			t.Fatalf("validation attempt %d failed: %v", attempt, err)
+		}
+		assertReverted(fmt.Sprintf("validation attempt %d", attempt))
+	}
 }
 
 func TestFramePoolRejectsVerifyAfterValidationPrefix(t *testing.T) {

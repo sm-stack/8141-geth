@@ -606,8 +606,7 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 	}
 	workers := min(max(p.resetValidationWorkers, 1), len(full))
 	views := make([]*FramePool, workers)
-	views[0] = p
-	for i := 1; i < len(views); i++ {
+	for i := range views {
 		views[i] = p.validationViewLocked()
 	}
 	jobs := make(chan int)
@@ -1361,7 +1360,11 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, false, p.verifyGasCap); err != nil {
 		return frameTxMeta{}, verifyResult{}, err
 	}
-	baseState := p.currentState.Copy()
+	// Validation views are caller-owned. Reuse their StateDB read caches across
+	// transactions, but roll back the entire validation prefix before returning.
+	baseState := p.currentState
+	transactionSnapshot := baseState.Snapshot()
+	defer baseState.RevertToSnapshot(transactionSnapshot)
 	storageReads := make(map[common.Hash]struct{})
 	codeReads := make(map[common.Address]struct{})
 	legacyNonceRead := false
@@ -1591,7 +1594,11 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	frame := frameTx.Frames[index]
 	target := resolveFrameTarget(frameTx.Sender, frame)
 
-	simState := baseState.Copy()
+	// Preserve deploy-frame changes from the outer transaction snapshot while
+	// isolating this VERIFY frame's journaled state changes from the next one.
+	frameSnapshot := baseState.Snapshot()
+	defer baseState.RevertToSnapshot(frameSnapshot)
+	simState := baseState
 	var tracer *vm.FrameValidationTracer
 	evmConfig := vm.Config{}
 	if useTracer {
