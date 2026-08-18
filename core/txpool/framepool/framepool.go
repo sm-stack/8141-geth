@@ -126,14 +126,15 @@ type FramePool struct {
 
 	reserver txpool.Reserver
 
-	validationMu   sync.Mutex
-	mu             sync.RWMutex
-	pending        map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
-	all            map[common.Hash]*types.Transaction      // hash → tx
-	meta           map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
-	stalePayerCode map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
-	blobSidecars   map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
-	blobCells      map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
+	validationMu    sync.Mutex
+	mu              sync.RWMutex
+	pending         map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
+	all             map[common.Hash]*types.Transaction      // hash → tx
+	meta            map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
+	dependencyIndex *validationDependencyIndex              // mutable validation dependency → transaction hashes
+	stalePayerCode  map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
+	blobSidecars    map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
+	blobCells       map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
 
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
@@ -166,6 +167,39 @@ type validationDependencySnapshot struct {
 	legacyNonce    *uint64
 	storageValues  map[storageDependency]common.Hash
 	codeHashes     map[common.Address]common.Hash
+}
+
+type validationDependencyKind uint8
+
+const (
+	validationCodeDependency validationDependencyKind = iota
+	validationStorageDependency
+	validationNonceDependency
+)
+
+type validationDependencyKey struct {
+	kind    validationDependencyKind
+	address common.Address
+	slot    common.Hash
+}
+
+type validationDependencyEntry struct {
+	value      common.Hash
+	conflicted bool
+	dependents map[common.Hash]struct{}
+}
+
+// validationDependencyIndex is an acceleration structure over the authoritative
+// per-transaction snapshots in frameTxMeta. Missing or conflicted entries always
+// fall back to transaction-local comparison or full validation.
+type validationDependencyIndex struct {
+	byKey map[validationDependencyKey]*validationDependencyEntry
+	byTx  map[common.Hash][]validationDependencyKey
+}
+
+type validationDependencyChanges struct {
+	affected map[common.Hash]struct{}
+	indexed  map[common.Hash]struct{}
 }
 
 type payerCodeIdentity struct {
@@ -216,6 +250,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
 		meta:                       make(map[common.Hash]frameTxMeta),
+		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
 		blobSidecars:               make(map[common.Hash]cachedBlobSidecar),
 		blobCells:                  make(map[common.Hash][]kzg4844.Cell),
@@ -308,6 +343,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		}
 	}
 	oldMeta := p.meta
+	oldDependencyIndex := p.dependencyIndex
 	stalePayerCode := make(map[common.Hash]payerCodeIdentity, len(p.stalePayerCode))
 	for hash, identity := range p.stalePayerCode {
 		stalePayerCode[hash] = identity
@@ -335,6 +371,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
 		meta:                       make(map[common.Hash]frameTxMeta),
+		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             stalePayerCode,
 		blobCells:                  blobCells,
 		paymasterReserved:          make(map[common.Address]*big.Int),
@@ -342,7 +379,8 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.mu.Unlock()
 
-	candidate.revalidate(txs, oldMeta)
+	dependencyChanges := oldDependencyIndex.changes(statedb)
+	candidate.revalidate(txs, oldMeta, dependencyChanges)
 
 	p.mu.Lock()
 	for sender := range existingSenders {
@@ -362,6 +400,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	p.pending = candidate.pending
 	p.all = candidate.all
 	p.meta = candidate.meta
+	p.dependencyIndex = candidate.dependencyIndex
 	p.stalePayerCode = candidate.stalePayerCode
 	p.blobCells = candidate.blobCells
 	p.paymasterReserved = candidate.paymasterReserved
@@ -414,7 +453,7 @@ func (r *resetReserver) Has(addr common.Address) bool {
 	return r.base != nil && r.base.Has(addr)
 }
 
-func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash]frameTxMeta) {
+func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash]frameTxMeta, dependencyChanges *validationDependencyChanges) {
 	resetCandidateMeter.Mark(int64(len(txs)))
 	sortResetTransactions(txs, oldMeta)
 	// revalidated counts full validation-prefix simulations. Transactions rejected
@@ -463,7 +502,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			if _, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime); err != nil {
 				continue
 			}
-			if metaOK && p.validationDependenciesUnchanged(frameTx, meta) {
+			if metaOK && p.validationDependenciesUnchangedIndexed(tx.Hash(), frameTx, meta, dependencyChanges) {
 				available := p.payerAvailableBalance(meta)
 				class := resetReuse
 				// An increase cannot invalidate prior solvency. A decrease (or
@@ -510,7 +549,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		}
 		p.pending[sender] = append(p.pending[sender], tx)
 		p.all[tx.Hash()] = tx
-		p.reserveTxAccounting(tx.Hash(), validation.meta)
+		p.reserveTxAccounting(tx, validation.meta)
 		if validation.class != resetFullValidation {
 			reused++
 		}
@@ -1050,7 +1089,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) 
 	if len(cells) > 0 {
 		p.blobCells[tx.Hash()] = cells
 	}
-	p.reserveTxAccounting(tx.Hash(), meta)
+	p.reserveTxAccounting(tx, meta)
 	delete(p.stalePayerCode, tx.Hash())
 	return nil
 }
@@ -1625,6 +1664,130 @@ func (p *FramePool) classifyPayer(sender, payer common.Address) frameTxMeta {
 	}
 }
 
+func newValidationDependencyIndex() *validationDependencyIndex {
+	return &validationDependencyIndex{
+		byKey: make(map[validationDependencyKey]*validationDependencyEntry),
+		byTx:  make(map[common.Hash][]validationDependencyKey),
+	}
+}
+
+func (index *validationDependencyIndex) add(hash common.Hash, sender common.Address, meta frameTxMeta) {
+	if index == nil || meta.validationDeps == nil {
+		return
+	}
+	index.remove(hash)
+	snapshot := meta.validationDeps
+	dependencies := make(map[validationDependencyKey]common.Hash)
+	conflicts := make(map[validationDependencyKey]struct{})
+	addDependency := func(key validationDependencyKey, value common.Hash) {
+		if previous, ok := dependencies[key]; ok && previous != value {
+			conflicts[key] = struct{}{}
+		}
+		dependencies[key] = value
+	}
+	addDependency(validationDependencyKey{kind: validationCodeDependency, address: sender}, snapshot.senderCodeHash)
+	addDependency(validationDependencyKey{kind: validationCodeDependency, address: meta.payer}, meta.payerCodeHash)
+	if snapshot.legacyNonce != nil {
+		addDependency(validationDependencyKey{kind: validationNonceDependency, address: sender}, uint64DependencyValue(*snapshot.legacyNonce))
+	}
+	for location, value := range snapshot.storageValues {
+		addDependency(validationDependencyKey{kind: validationStorageDependency, address: location.address, slot: location.slot}, value)
+	}
+	for address, value := range snapshot.codeHashes {
+		addDependency(validationDependencyKey{kind: validationCodeDependency, address: address}, value)
+	}
+	keys := make([]validationDependencyKey, 0, len(dependencies))
+	for key, value := range dependencies {
+		entry := index.byKey[key]
+		if entry == nil {
+			entry = &validationDependencyEntry{value: value, dependents: make(map[common.Hash]struct{})}
+			index.byKey[key] = entry
+		} else if entry.value != value {
+			// This should not occur while validation and reset are serialized.
+			// Treat every dependent as affected rather than trusting either value.
+			entry.conflicted = true
+		}
+		if _, conflicted := conflicts[key]; conflicted {
+			entry.conflicted = true
+		}
+		entry.dependents[hash] = struct{}{}
+		keys = append(keys, key)
+	}
+	index.byTx[hash] = keys
+}
+
+func (index *validationDependencyIndex) remove(hash common.Hash) {
+	if index == nil {
+		return
+	}
+	for _, key := range index.byTx[hash] {
+		entry := index.byKey[key]
+		if entry == nil {
+			continue
+		}
+		delete(entry.dependents, hash)
+		if len(entry.dependents) == 0 {
+			delete(index.byKey, key)
+		}
+	}
+	delete(index.byTx, hash)
+}
+
+func (index *validationDependencyIndex) changes(statedb *state.StateDB) *validationDependencyChanges {
+	if index == nil {
+		return nil
+	}
+	changes := &validationDependencyChanges{
+		affected: make(map[common.Hash]struct{}),
+		indexed:  make(map[common.Hash]struct{}),
+	}
+	// Only advertise a transaction as indexed when both directions agree. Any
+	// partial entry is omitted and therefore uses the authoritative snapshot.
+	for hash, keys := range index.byTx {
+		complete := len(keys) > 0
+		for _, key := range keys {
+			entry := index.byKey[key]
+			if entry == nil {
+				complete = false
+				break
+			}
+			if _, ok := entry.dependents[hash]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			changes.indexed[hash] = struct{}{}
+		}
+	}
+	for key, entry := range index.byKey {
+		if !entry.conflicted && validationDependencyValue(statedb, key) == entry.value {
+			continue
+		}
+		for hash := range entry.dependents {
+			changes.affected[hash] = struct{}{}
+		}
+	}
+	return changes
+}
+
+func validationDependencyValue(statedb *state.StateDB, key validationDependencyKey) common.Hash {
+	switch key.kind {
+	case validationCodeDependency:
+		return statedb.GetCodeHash(key.address)
+	case validationStorageDependency:
+		return statedb.GetState(key.address, key.slot)
+	case validationNonceDependency:
+		return uint64DependencyValue(statedb.GetNonce(key.address))
+	default:
+		panic("unknown framepool validation dependency")
+	}
+}
+
+func uint64DependencyValue(value uint64) common.Hash {
+	return common.BigToHash(new(big.Int).SetUint64(value))
+}
+
 // snapshotValidationDependencies records the mutable state that a successful
 // public-mempool validation was permitted to observe. Transaction fields and
 // signatures are immutable for a given hash; nonce and recent-root references
@@ -1706,6 +1869,20 @@ func (p *FramePool) validationDependenciesUnchanged(frameTx *types.FrameTx, meta
 		}
 	}
 	return true
+}
+
+func (p *FramePool) validationDependenciesUnchangedIndexed(hash common.Hash, frameTx *types.FrameTx, meta frameTxMeta, changes *validationDependencyChanges) bool {
+	if changes == nil || meta.validationDeps == nil {
+		return p.validationDependenciesUnchanged(frameTx, meta)
+	}
+	if _, indexed := changes.indexed[hash]; !indexed {
+		return p.validationDependenciesUnchanged(frameTx, meta)
+	}
+	if _, affected := changes.affected[hash]; affected {
+		return false
+	}
+	currentRules := p.chainconfig.Rules(p.currentHead.Number, p.currentHead.Difficulty.Sign() == 0, p.currentHead.Time)
+	return currentRules == meta.validationDeps.rules
 }
 
 // rejectChangedPayerCode performs the admission-time payer code-identity gate
@@ -1962,7 +2139,8 @@ func (p *FramePool) validatePaymasterAccounting(tx *types.Transaction, meta fram
 	return nil
 }
 
-func (p *FramePool) reserveTxAccounting(hash common.Hash, meta frameTxMeta) {
+func (p *FramePool) reserveTxAccounting(tx *types.Transaction, meta frameTxMeta) {
+	hash := tx.Hash()
 	if meta.maxCost == nil {
 		meta.maxCost = new(big.Int)
 	}
@@ -1971,6 +2149,9 @@ func (p *FramePool) reserveTxAccounting(hash common.Hash, meta frameTxMeta) {
 		meta.payerAvailableBalance = new(big.Int).Set(meta.payerAvailableBalance)
 	}
 	p.meta[hash] = meta
+	if frameTx := tx.GetFrameTx(); frameTx != nil {
+		p.dependencyIndex.add(hash, frameTx.Sender, meta)
+	}
 	if p.paymasterReserved[meta.payer] == nil {
 		p.paymasterReserved[meta.payer] = new(big.Int)
 	}
@@ -1981,6 +2162,7 @@ func (p *FramePool) reserveTxAccounting(hash common.Hash, meta frameTxMeta) {
 }
 
 func (p *FramePool) releaseTxAccounting(hash common.Hash) {
+	p.dependencyIndex.remove(hash)
 	meta, ok := p.meta[hash]
 	if !ok {
 		return
