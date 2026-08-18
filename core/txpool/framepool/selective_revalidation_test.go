@@ -4,15 +4,18 @@
 package framepool
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -257,6 +260,74 @@ func TestSelectiveRevalidationDetectsCanonicalSignerChange(t *testing.T) {
 	}
 	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 1 {
 		t.Fatalf("revalidated after canonical signer change: have %d want 1", delta)
+	}
+}
+
+func TestResetPreparesFullValidationInParallel(t *testing.T) {
+	const count = 4
+	fixture := newPayerCodeToggleFixture(t, count, false)
+	fixture.pool.selectiveRevalidation = false
+	fixture.pool.resetValidationWorkers = 2
+	fixture.fill(t)
+
+	oldHead := fixture.chain.head
+	newHead := types.CopyHeader(oldHead)
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	newHead.Time = oldHead.Time + params.SecondsPerSlot
+	fixture.chain.statedb = fixture.pool.currentState.Copy()
+	fixture.chain.head = newHead
+
+	simulationNumber := new(big.Int).Add(newHead.Number, big.NewInt(1))
+	entered := make(chan struct{}, count)
+	release := make(chan struct{})
+	fixture.pool.slotProvider = func(head *types.Header) vm.SlotProvider {
+		if head.Number.Cmp(simulationNumber) == 0 {
+			entered <- struct{}{}
+			<-release
+		}
+		return vm.TimestampSlotProvider{Timestamp: head.Time}
+	}
+	done := make(chan struct{})
+	go func() {
+		fixture.pool.Reset(oldHead, newHead)
+		close(done)
+	}()
+	for i := 0; i < fixture.pool.resetValidationWorkers; i++ {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			<-done
+			t.Fatalf("parallel validation entries: have %d want %d", i, fixture.pool.resetValidationWorkers)
+		}
+	}
+	close(release)
+	<-done
+	if pending, _ := fixture.pool.Stats(); pending != count {
+		t.Fatalf("pending after parallel reset: have %d want %d", pending, count)
+	}
+}
+
+func TestResetCommitsSharedPayerInPriorityOrder(t *testing.T) {
+	fixture := newPayerCodeToggleFixture(t, 2, false)
+	fixture.pool.selectiveRevalidation = false
+	fixture.pool.resetValidationWorkers = 2
+	fixture.fill(t)
+
+	first, second := fixture.txs[0], fixture.txs[1]
+	firstHash, secondHash := first.Hash(), second.Hash()
+	if bytes.Compare(firstHash[:], secondHash[:]) > 0 {
+		first, second = second, first
+	}
+	resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
+		nextState.SetBalance(fixture.payer, uint256.MustFromBig(first.Cost()), tracing.BalanceChangeUnspecified)
+	})
+	if pending, _ := fixture.pool.Stats(); pending != 1 {
+		t.Fatalf("pending after shared-payer reset: have %d want 1", pending)
+	}
+	if !fixture.pool.Has(first.Hash()) || fixture.pool.Has(second.Hash()) {
+		t.Fatalf("retained transaction does not match deterministic priority: first=%t second=%t",
+			fixture.pool.Has(first.Hash()), fixture.pool.Has(second.Hash()))
 	}
 }
 

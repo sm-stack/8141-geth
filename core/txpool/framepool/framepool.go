@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -63,6 +64,10 @@ const (
 
 	// txMaxSize is the maximum frame transaction size.
 	txMaxSize uint64 = 512 * 1024
+
+	// maxResetValidationWorkers bounds the StateDB copies and EVMs used to
+	// prepare reset validation. Pool accounting is committed separately.
+	maxResetValidationWorkers = 4
 )
 
 // Config configures frame transaction validation policy. Values above
@@ -116,6 +121,7 @@ type FramePool struct {
 	payerSolvencyPreflight     bool
 	payerCodeIdentityPreflight bool
 	selectiveRevalidation      bool
+	resetValidationWorkers     int
 	canonicalPaymasters        map[common.Hash]common.Hash
 
 	reserver txpool.Reserver
@@ -172,6 +178,21 @@ type cachedBlobSidecar struct {
 	blockNumber uint64
 }
 
+type resetValidationClass uint8
+
+const (
+	resetReuse resetValidationClass = iota
+	resetAccountingOnly
+	resetFullValidation
+)
+
+type resetValidation struct {
+	tx    *types.Transaction
+	class resetValidationClass
+	meta  frameTxMeta
+	err   error
+}
+
 // New creates a new frame transaction pool.
 func New(chain BlockChain) *FramePool {
 	return NewWithConfig(DefaultConfig, chain)
@@ -190,6 +211,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		payerSolvencyPreflight:     config.PayerSolvencyPreflight,
 		payerCodeIdentityPreflight: config.PayerCodeIdentityPreflight,
 		selectiveRevalidation:      config.SelectiveRevalidation,
+		resetValidationWorkers:     defaultResetValidationWorkers(),
 		canonicalPaymasters:        make(map[common.Hash]common.Hash),
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
@@ -307,6 +329,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
 		selectiveRevalidation:      p.selectiveRevalidation,
+		resetValidationWorkers:     p.resetValidationWorkers,
 		canonicalPaymasters:        p.canonicalPaymasters,
 		reserver:                   reserver,
 		pending:                    make(map[common.Address][]*types.Transaction),
@@ -407,6 +430,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		resetRetainedMeter.Mark(retained)
 		resetEvictedMeter.Mark(int64(len(txs)) - retained)
 	}()
+	validations := make([]resetValidation, 0, len(txs))
 	for _, tx := range txs {
 		frameTx := tx.GetFrameTx()
 		if frameTx == nil {
@@ -424,14 +448,10 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 				p.blobCells[tx.Hash()] = cells
 			}
 		}
-		sender := frameTx.Sender
 		if err := validateFrameNonce(frameTx, p.currentState); err != nil {
 			continue
 		}
 		if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
-			continue
-		}
-		if len(p.pending[sender]) >= maxFrameTxsPerAccount {
 			continue
 		}
 		meta, metaOK := oldMeta[tx.Hash()]
@@ -445,25 +465,14 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			}
 			if metaOK && p.validationDependenciesUnchanged(frameTx, meta) {
 				available := p.payerAvailableBalance(meta)
-				// An increase cannot invalidate prior solvency, so only rebuild
-				// reservations. A decrease needs the aggregate solvency check.
+				class := resetReuse
+				// An increase cannot invalidate prior solvency. A decrease (or
+				// legacy metadata without a balance) needs accounting only.
 				if meta.payerAvailableBalance == nil || available.Cmp(meta.payerAvailableBalance) < 0 {
-					if err := p.validatePayerSolvency(tx, meta, nil); err != nil {
-						continue
-					}
+					class = resetAccountingOnly
 				}
 				meta.payerAvailableBalance = available
-				if len(p.pending[sender]) == 0 && p.reserver != nil {
-					if err := p.reserver.Hold(sender); err != nil {
-						continue
-					}
-				}
-				p.pending[sender] = append(p.pending[sender], tx)
-				p.all[tx.Hash()] = tx
-				p.meta[tx.Hash()] = meta
-				p.reserveTxAccounting(tx.Hash(), meta)
-				reused++
-				retained++
+				validations = append(validations, resetValidation{tx: tx, class: class, meta: meta})
 				continue
 			}
 			dependencyChanged++
@@ -472,21 +481,27 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			continue
 		}
 		revalidated++
-		var err error
-		if metaOK && meta.signatureValidated {
-			meta, err = p.simulateVerifyFramesWithSignatureGas(tx, meta.signatureGas)
-			if err == nil {
-				meta.signatureValidated = true
-				meta.signatureGas = oldMeta[tx.Hash()].signatureGas
+		validations = append(validations, resetValidation{tx: tx, class: resetFullValidation, meta: meta})
+	}
+	p.prepareResetValidations(validations)
+
+	// Commit in the sorted candidate order. Payer reservations, sender limits,
+	// and reserver ownership are deliberately never mutated by workers.
+	for _, validation := range validations {
+		tx := validation.tx
+		sender := tx.GetFrameTx().Sender
+		if validation.err != nil || len(p.pending[sender]) >= maxFrameTxsPerAccount {
+			continue
+		}
+		if validation.class == resetAccountingOnly {
+			if err := p.validatePayerSolvency(tx, validation.meta, nil); err != nil {
+				continue
 			}
-		} else {
-			meta, err = p.simulateVerifyFrames(tx)
 		}
-		if err != nil {
-			continue
-		}
-		if err := p.validatePaymasterAccounting(tx, meta, nil); err != nil {
-			continue
+		if validation.class == resetFullValidation {
+			if err := p.validatePaymasterAccounting(tx, validation.meta, nil); err != nil {
+				continue
+			}
 		}
 		if len(p.pending[sender]) == 0 && p.reserver != nil {
 			if err := p.reserver.Hold(sender); err != nil {
@@ -495,9 +510,63 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		}
 		p.pending[sender] = append(p.pending[sender], tx)
 		p.all[tx.Hash()] = tx
-		p.reserveTxAccounting(tx.Hash(), meta)
+		p.reserveTxAccounting(tx.Hash(), validation.meta)
+		if validation.class != resetFullValidation {
+			reused++
+		}
 		retained++
 	}
+}
+
+func defaultResetValidationWorkers() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), maxResetValidationWorkers)
+}
+
+// prepareResetValidations runs only the state-dependent EVM work in parallel.
+// Each worker owns a StateDB snapshot; results are written to their original
+// positions and committed later in deterministic reset priority order.
+func (p *FramePool) prepareResetValidations(validations []resetValidation) {
+	var full []int
+	for i := range validations {
+		if validations[i].class == resetFullValidation {
+			full = append(full, i)
+		}
+	}
+	if len(full) == 0 {
+		return
+	}
+	workers := min(max(p.resetValidationWorkers, 1), len(full))
+	views := make([]*FramePool, workers)
+	views[0] = p
+	for i := 1; i < len(views); i++ {
+		views[i] = p.validationViewLocked()
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for _, view := range views {
+		wg.Add(1)
+		go func(view *FramePool) {
+			defer wg.Done()
+			for index := range jobs {
+				validation := &validations[index]
+				cached := validation.meta
+				if cached.signatureValidated {
+					validation.meta, validation.err = view.simulateVerifyFramesWithSignatureGas(validation.tx, cached.signatureGas)
+					if validation.err == nil {
+						validation.meta.signatureValidated = true
+						validation.meta.signatureGas = cached.signatureGas
+					}
+				} else {
+					validation.meta, validation.err = view.simulateVerifyFrames(validation.tx)
+				}
+			}
+		}(view)
+	}
+	for _, index := range full {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions) {
@@ -1058,6 +1127,7 @@ func (p *FramePool) validationViewLocked() *FramePool {
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
 		selectiveRevalidation:      p.selectiveRevalidation,
+		resetValidationWorkers:     p.resetValidationWorkers,
 		canonicalPaymasters:        canonicalPaymasters,
 	}
 }
