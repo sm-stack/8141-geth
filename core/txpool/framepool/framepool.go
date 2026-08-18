@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
@@ -175,6 +176,7 @@ const (
 	validationCodeDependency validationDependencyKind = iota
 	validationStorageDependency
 	validationNonceDependency
+	validationBalanceDependency
 )
 
 type validationDependencyKey struct {
@@ -193,13 +195,22 @@ type validationDependencyEntry struct {
 // per-transaction snapshots in frameTxMeta. Missing or conflicted entries always
 // fall back to transaction-local comparison or full validation.
 type validationDependencyIndex struct {
-	byKey map[validationDependencyKey]*validationDependencyEntry
-	byTx  map[common.Hash][]validationDependencyKey
+	byKey           map[validationDependencyKey]*validationDependencyEntry
+	byTx            map[common.Hash][]validationDependencyKey
+	accountingByKey map[validationDependencyKey]map[common.Hash]struct{}
+	accountingByTx  map[common.Hash][]validationDependencyKey
 }
 
 type validationDependencyChanges struct {
-	affected map[common.Hash]struct{}
-	indexed  map[common.Hash]struct{}
+	affected                map[common.Hash]struct{}
+	indexed                 map[common.Hash]struct{}
+	accountingAffected      map[common.Hash]struct{}
+	accountingIndexed       map[common.Hash]struct{}
+	selectiveAccountingScan bool
+}
+
+type validationDependencyTouches struct {
+	keys map[validationDependencyKey]struct{}
 }
 
 type payerCodeIdentity struct {
@@ -308,7 +319,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		resetLastTimeGauge.Update(elapsed.Nanoseconds())
 	}()
 
-	reinject, included := p.reorgTransactions(oldHead, newHead)
+	reinject, included, dependencyTouches := p.reorgTransactions(oldHead, newHead)
 	statedb, err := p.chain.StateAt(newHead)
 	if err != nil {
 		log.Error("Failed to reset frame pool state", "err", err)
@@ -379,7 +390,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.mu.Unlock()
 
-	dependencyChanges := oldDependencyIndex.changes(statedb)
+	dependencyChanges := oldDependencyIndex.changes(statedb, dependencyTouches)
 	candidate.revalidate(txs, oldMeta, dependencyChanges)
 
 	p.mu.Lock()
@@ -503,14 +514,22 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 				continue
 			}
 			if metaOK && p.validationDependenciesUnchangedIndexed(tx.Hash(), frameTx, meta, dependencyChanges) {
-				available := p.payerAvailableBalance(meta)
 				class := resetReuse
-				// An increase cannot invalidate prior solvency. A decrease (or
-				// legacy metadata without a balance) needs accounting only.
-				if meta.payerAvailableBalance == nil || available.Cmp(meta.payerAvailableBalance) < 0 {
-					class = resetAccountingOnly
+				checkAccounting := true
+				if dependencyChanges != nil && dependencyChanges.selectiveAccountingScan && meta.payerAvailableBalance != nil {
+					_, indexed := dependencyChanges.accountingIndexed[tx.Hash()]
+					_, affected := dependencyChanges.accountingAffected[tx.Hash()]
+					checkAccounting = !indexed || affected
 				}
-				meta.payerAvailableBalance = available
+				if checkAccounting {
+					available := p.payerAvailableBalance(meta)
+					// An increase cannot invalidate prior solvency. A decrease (or
+					// legacy metadata without a balance) needs accounting only.
+					if meta.payerAvailableBalance == nil || available.Cmp(meta.payerAvailableBalance) < 0 {
+						class = resetAccountingOnly
+					}
+					meta.payerAvailableBalance = available
+				}
 				validations = append(validations, resetValidation{tx: tx, class: class, meta: meta})
 				continue
 			}
@@ -608,16 +627,21 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 	wg.Wait()
 }
 
-func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions) {
+func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions, *validationDependencyTouches) {
 	if oldHead == nil || newHead == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if oldHead.Hash() == newHead.ParentHash {
 		block := p.chain.GetBlock(newHead.Hash(), newHead.Number.Uint64())
 		if block == nil {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, block.Transactions()
+		if accessList := block.AccessList(); accessList != nil {
+			touches := newValidationDependencyTouches()
+			touches.add(accessList)
+			return nil, block.Transactions(), touches
+		}
+		return nil, block.Transactions(), nil
 	}
 	oldNum, newNum := oldHead.Number.Uint64(), newHead.Number.Uint64()
 	var depth uint64
@@ -627,38 +651,51 @@ func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Tra
 		depth = oldNum - newNum
 	}
 	if depth > 64 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rem := p.chain.GetBlock(oldHead.Hash(), oldNum)
 	add := p.chain.GetBlock(newHead.Hash(), newNum)
 	if rem == nil || add == nil {
-		return nil, nil
+		return nil, nil, nil
+	}
+	touches := newValidationDependencyTouches()
+	touchesComplete := true
+	addTouches := func(block *types.Block) {
+		if accessList := block.AccessList(); accessList != nil {
+			touches.add(accessList)
+		} else {
+			touchesComplete = false
+		}
 	}
 	var discarded, included types.Transactions
 	for rem.NumberU64() > add.NumberU64() {
 		discarded = append(discarded, rem.Transactions()...)
+		addTouches(rem)
 		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
 		if rem == nil {
-			return nil, nil
+			return nil, nil, nil
 		}
 	}
 	for add.NumberU64() > rem.NumberU64() {
 		included = append(included, add.Transactions()...)
+		addTouches(add)
 		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
 		if add == nil {
-			return nil, nil
+			return nil, nil, nil
 		}
 	}
 	for rem.Hash() != add.Hash() {
 		discarded = append(discarded, rem.Transactions()...)
 		included = append(included, add.Transactions()...)
+		addTouches(rem)
+		addTouches(add)
 		if rem.NumberU64() == 0 || add.NumberU64() == 0 {
-			return nil, nil
+			return nil, nil, nil
 		}
 		rem = p.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1)
 		add = p.chain.GetBlock(add.ParentHash(), add.NumberU64()-1)
 		if rem == nil || add == nil {
-			return nil, nil
+			return nil, nil, nil
 		}
 	}
 	var lost types.Transactions
@@ -667,7 +704,10 @@ func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Tra
 			lost = append(lost, tx)
 		}
 	}
-	return lost, included
+	if !touchesComplete {
+		touches = nil
+	}
+	return lost, included, touches
 }
 
 func (p *FramePool) cacheIncludedBlobSidecars(included types.Transactions, blockNumber uint64) {
@@ -1666,12 +1706,42 @@ func (p *FramePool) classifyPayer(sender, payer common.Address) frameTxMeta {
 
 func newValidationDependencyIndex() *validationDependencyIndex {
 	return &validationDependencyIndex{
-		byKey: make(map[validationDependencyKey]*validationDependencyEntry),
-		byTx:  make(map[common.Hash][]validationDependencyKey),
+		byKey:           make(map[validationDependencyKey]*validationDependencyEntry),
+		byTx:            make(map[common.Hash][]validationDependencyKey),
+		accountingByKey: make(map[validationDependencyKey]map[common.Hash]struct{}),
+		accountingByTx:  make(map[common.Hash][]validationDependencyKey),
 	}
 }
 
-func (index *validationDependencyIndex) add(hash common.Hash, sender common.Address, meta frameTxMeta) {
+func newValidationDependencyTouches() *validationDependencyTouches {
+	return &validationDependencyTouches{keys: make(map[validationDependencyKey]struct{})}
+}
+
+func (touches *validationDependencyTouches) add(accessList *bal.BlockAccessList) {
+	for _, account := range *accessList {
+		if len(account.BalanceChanges) > 0 {
+			touches.keys[validationDependencyKey{kind: validationBalanceDependency, address: account.Address}] = struct{}{}
+		}
+		if len(account.NonceChanges) > 0 {
+			touches.keys[validationDependencyKey{kind: validationNonceDependency, address: account.Address}] = struct{}{}
+		}
+		if len(account.CodeChanges) > 0 {
+			touches.keys[validationDependencyKey{kind: validationCodeDependency, address: account.Address}] = struct{}{}
+		}
+		for _, storage := range account.StorageChanges {
+			if storage.Slot == nil {
+				continue
+			}
+			touches.keys[validationDependencyKey{
+				kind:    validationStorageDependency,
+				address: account.Address,
+				slot:    storage.Slot.Bytes32(),
+			}] = struct{}{}
+		}
+	}
+}
+
+func (index *validationDependencyIndex) add(hash common.Hash, sender common.Address, meta frameTxMeta, accountingKeys ...validationDependencyKey) {
 	if index == nil || meta.validationDeps == nil {
 		return
 	}
@@ -1714,6 +1784,15 @@ func (index *validationDependencyIndex) add(hash common.Hash, sender common.Addr
 		keys = append(keys, key)
 	}
 	index.byTx[hash] = keys
+	for _, key := range accountingKeys {
+		dependents := index.accountingByKey[key]
+		if dependents == nil {
+			dependents = make(map[common.Hash]struct{})
+			index.accountingByKey[key] = dependents
+		}
+		dependents[hash] = struct{}{}
+	}
+	index.accountingByTx[hash] = accountingKeys
 }
 
 func (index *validationDependencyIndex) remove(hash common.Hash) {
@@ -1731,15 +1810,26 @@ func (index *validationDependencyIndex) remove(hash common.Hash) {
 		}
 	}
 	delete(index.byTx, hash)
+	for _, key := range index.accountingByTx[hash] {
+		dependents := index.accountingByKey[key]
+		delete(dependents, hash)
+		if len(dependents) == 0 {
+			delete(index.accountingByKey, key)
+		}
+	}
+	delete(index.accountingByTx, hash)
 }
 
-func (index *validationDependencyIndex) changes(statedb *state.StateDB) *validationDependencyChanges {
+func (index *validationDependencyIndex) changes(statedb *state.StateDB, touches *validationDependencyTouches) *validationDependencyChanges {
 	if index == nil {
 		return nil
 	}
 	changes := &validationDependencyChanges{
-		affected: make(map[common.Hash]struct{}),
-		indexed:  make(map[common.Hash]struct{}),
+		affected:                make(map[common.Hash]struct{}),
+		indexed:                 make(map[common.Hash]struct{}),
+		accountingAffected:      make(map[common.Hash]struct{}),
+		accountingIndexed:       make(map[common.Hash]struct{}),
+		selectiveAccountingScan: touches != nil,
 	}
 	// Only advertise a transaction as indexed when both directions agree. Any
 	// partial entry is omitted and therefore uses the authoritative snapshot.
@@ -1760,12 +1850,38 @@ func (index *validationDependencyIndex) changes(statedb *state.StateDB) *validat
 			changes.indexed[hash] = struct{}{}
 		}
 	}
-	for key, entry := range index.byKey {
+	for hash, keys := range index.accountingByTx {
+		complete := len(keys) > 0
+		for _, key := range keys {
+			if _, ok := index.accountingByKey[key][hash]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			changes.accountingIndexed[hash] = struct{}{}
+		}
+	}
+	checkDependency := func(key validationDependencyKey, entry *validationDependencyEntry) {
 		if !entry.conflicted && validationDependencyValue(statedb, key) == entry.value {
-			continue
+			return
 		}
 		for hash := range entry.dependents {
 			changes.affected[hash] = struct{}{}
+		}
+	}
+	if touches == nil {
+		for key, entry := range index.byKey {
+			checkDependency(key, entry)
+		}
+	} else {
+		for key := range touches.keys {
+			if entry := index.byKey[key]; entry != nil {
+				checkDependency(key, entry)
+			}
+			for hash := range index.accountingByKey[key] {
+				changes.accountingAffected[hash] = struct{}{}
+			}
 		}
 	}
 	return changes
@@ -2150,7 +2266,13 @@ func (p *FramePool) reserveTxAccounting(tx *types.Transaction, meta frameTxMeta)
 	}
 	p.meta[hash] = meta
 	if frameTx := tx.GetFrameTx(); frameTx != nil {
-		p.dependencyIndex.add(hash, frameTx.Sender, meta)
+		accountingKeys := []validationDependencyKey{{kind: validationBalanceDependency, address: meta.payer}}
+		if meta.canonicalPaymaster {
+			if slot, ok := p.canonicalPaymasterWithdrawalSlot(meta.payer); ok {
+				accountingKeys = append(accountingKeys, validationDependencyKey{kind: validationStorageDependency, address: meta.payer, slot: slot})
+			}
+		}
+		p.dependencyIndex.add(hash, frameTx.Sender, meta, accountingKeys...)
 	}
 	if p.paymasterReserved[meta.payer] == nil {
 		p.paymasterReserved[meta.payer] = new(big.Int)
