@@ -56,6 +56,13 @@ var (
 	resetEvictedMeter           = metrics.NewRegisteredMeter("framepool/reset/evicted", nil)
 	resetTimeTimer              = metrics.NewRegisteredTimer("framepool/reset/time", nil)
 	resetLastTimeGauge          = metrics.NewRegisteredGauge("framepool/reset/lasttime", nil)
+	resetLastHoldGauge          = metrics.NewRegisteredGauge("framepool/reset/lasthold", nil)
+	resetLastLockWaitGauge      = metrics.NewRegisteredGauge("framepool/reset/lastlockwait", nil)
+	resetLastVerifySumGauge     = metrics.NewRegisteredGauge("framepool/reset/lastverifysum", nil)
+	resetLastVerifyMeanGauge    = metrics.NewRegisteredGauge("framepool/reset/lastverifymean", nil)
+	resetLastVerifyMaxGauge     = metrics.NewRegisteredGauge("framepool/reset/lastverifymax", nil)
+	resetLastVerifyCountGauge   = metrics.NewRegisteredGauge("framepool/reset/lastverifycount", nil)
+	resetLastVerifyWorkersGauge = metrics.NewRegisteredGauge("framepool/reset/lastverifyworkers", nil)
 )
 
 func markVerifyOutcome(class verifyFailureClass, failed bool) {

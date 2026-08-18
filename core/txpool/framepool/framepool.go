@@ -232,10 +232,11 @@ const (
 )
 
 type resetValidation struct {
-	tx    *types.Transaction
-	class resetValidationClass
-	meta  frameTxMeta
-	err   error
+	tx            *types.Transaction
+	class         resetValidationClass
+	meta          frameTxMeta
+	err           error
+	verifyElapsed time.Duration
 }
 
 // New creates a new frame transaction pool.
@@ -309,14 +310,24 @@ func (p *FramePool) Close() error { return nil }
 
 // Reset updates the pool state when the chain head changes.
 func (p *FramePool) Reset(oldHead, newHead *types.Header) {
+	lockWaitStart := time.Now()
 	p.validationMu.Lock()
-	defer p.validationMu.Unlock()
+	lockWait := time.Since(lockWaitStart)
+	holdStart := time.Now()
+	resetLastLockWaitGauge.Update(lockWait.Nanoseconds())
+	resetLastVerifySumGauge.Update(0)
+	resetLastVerifyMeanGauge.Update(0)
+	resetLastVerifyMaxGauge.Update(0)
+	resetLastVerifyCountGauge.Update(0)
+	resetLastVerifyWorkersGauge.Update(0)
+
 	resetRunMeter.Mark(1)
-	resetStart := time.Now()
 	defer func() {
-		elapsed := time.Since(resetStart)
-		resetTimeTimer.Update(elapsed)
-		resetLastTimeGauge.Update(elapsed.Nanoseconds())
+		hold := time.Since(holdStart)
+		resetTimeTimer.Update(hold)
+		resetLastTimeGauge.Update(hold.Nanoseconds())
+		resetLastHoldGauge.Update(hold.Nanoseconds())
+		p.validationMu.Unlock()
 	}()
 
 	reinject, included, dependencyTouches := p.reorgTransactions(oldHead, newHead)
@@ -608,6 +619,7 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 			for index := range jobs {
 				validation := &validations[index]
 				cached := validation.meta
+				start := time.Now()
 				if cached.signatureValidated {
 					validation.meta, validation.err = view.simulateVerifyFramesWithSignatureGas(validation.tx, cached.signatureGas)
 					if validation.err == nil {
@@ -617,6 +629,7 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 				} else {
 					validation.meta, validation.err = view.simulateVerifyFrames(validation.tx)
 				}
+				validation.verifyElapsed = time.Since(start)
 			}
 		}(view)
 	}
@@ -625,6 +638,18 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 	}
 	close(jobs)
 	wg.Wait()
+
+	var sum, maximum time.Duration
+	for _, index := range full {
+		elapsed := validations[index].verifyElapsed
+		sum += elapsed
+		maximum = max(maximum, elapsed)
+	}
+	resetLastVerifySumGauge.Update(sum.Nanoseconds())
+	resetLastVerifyMeanGauge.Update((sum / time.Duration(len(full))).Nanoseconds())
+	resetLastVerifyMaxGauge.Update(maximum.Nanoseconds())
+	resetLastVerifyCountGauge.Update(int64(len(full)))
+	resetLastVerifyWorkersGauge.Update(int64(workers))
 }
 
 func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions, *validationDependencyTouches) {

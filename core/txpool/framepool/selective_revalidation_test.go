@@ -64,6 +64,17 @@ func TestSelectiveRevalidationSkipsUnrelatedHeads(t *testing.T) {
 		if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 0 {
 			t.Fatalf("head %d sender VERIFY runs: have %d want 0", head, delta)
 		}
+		for name, value := range map[string]int64{
+			"sum":     resetLastVerifySumGauge.Snapshot().Value(),
+			"mean":    resetLastVerifyMeanGauge.Snapshot().Value(),
+			"max":     resetLastVerifyMaxGauge.Snapshot().Value(),
+			"count":   resetLastVerifyCountGauge.Snapshot().Value(),
+			"workers": resetLastVerifyWorkersGauge.Snapshot().Value(),
+		} {
+			if value != 0 {
+				t.Fatalf("head %d reset VERIFY %s: have %d want 0", head, name, value)
+			}
+		}
 	}
 }
 
@@ -305,6 +316,30 @@ func TestResetPreparesFullValidationInParallel(t *testing.T) {
 	<-done
 	if pending, _ := fixture.pool.Stats(); pending != count {
 		t.Fatalf("pending after parallel reset: have %d want %d", pending, count)
+	}
+	verifySum := resetLastVerifySumGauge.Snapshot().Value()
+	verifyMean := resetLastVerifyMeanGauge.Snapshot().Value()
+	verifyMax := resetLastVerifyMaxGauge.Snapshot().Value()
+	if verifySum <= 0 || verifyMean <= 0 || verifyMax <= 0 {
+		t.Fatalf("reset VERIFY timing not recorded: sum=%d mean=%d max=%d", verifySum, verifyMean, verifyMax)
+	}
+	if have := resetLastVerifyCountGauge.Snapshot().Value(); have != count {
+		t.Fatalf("reset VERIFY count: have %d want %d", have, count)
+	}
+	if have := resetLastVerifyWorkersGauge.Snapshot().Value(); have != int64(fixture.pool.resetValidationWorkers) {
+		t.Fatalf("reset VERIFY workers: have %d want %d", have, fixture.pool.resetValidationWorkers)
+	}
+	if want := verifySum / count; verifyMean != want {
+		t.Fatalf("reset VERIFY mean: have %d want %d", verifyMean, want)
+	}
+	if verifyMax > verifySum {
+		t.Fatalf("reset VERIFY max %d exceeds sum %d", verifyMax, verifySum)
+	}
+	if hold := resetLastHoldGauge.Snapshot().Value(); hold <= 0 || hold != resetLastTimeGauge.Snapshot().Value() {
+		t.Fatalf("reset hold time mismatch: hold=%d legacy=%d", hold, resetLastTimeGauge.Snapshot().Value())
+	}
+	if wait := resetLastLockWaitGauge.Snapshot().Value(); wait < 0 {
+		t.Fatalf("reset lock wait is negative: %d", wait)
 	}
 }
 
