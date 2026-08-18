@@ -141,6 +141,8 @@ type frameTxMeta struct {
 	usesPaymaster         bool
 	canonicalPaymaster    bool
 	nonCanonicalPaymaster bool
+	signatureValidated    bool
+	signatureGas          uint64
 	maxCost               *big.Int
 	payerAvailableBalance *big.Int
 	payerCodeHash         common.Hash
@@ -470,7 +472,16 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			continue
 		}
 		revalidated++
-		meta, err := p.simulateVerifyFrames(tx)
+		var err error
+		if metaOK && meta.signatureValidated {
+			meta, err = p.simulateVerifyFramesWithSignatureGas(tx, meta.signatureGas)
+			if err == nil {
+				meta.signatureValidated = true
+				meta.signatureGas = oldMeta[tx.Hash()].signatureGas
+			}
+		} else {
+			meta, err = p.simulateVerifyFrames(tx)
+		}
 		if err != nil {
 			continue
 		}
@@ -935,6 +946,8 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) 
 		}
 		return err
 	}
+	meta.signatureValidated = true
+	meta.signatureGas = signatureGas
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	accountingReplacement := replacement
@@ -1061,7 +1074,13 @@ func (p *FramePool) simulateVerifyFrames(tx *types.Transaction) (frameTxMeta, er
 	if err != nil {
 		return frameTxMeta{}, err
 	}
-	return p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
+	meta, err := p.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
+	if err != nil {
+		return frameTxMeta{}, err
+	}
+	meta.signatureValidated = true
+	meta.signatureGas = signatureGas
+	return meta, nil
 }
 
 func (p *FramePool) validateFrameSignatures(frameTx *types.FrameTx) (signatureGas uint64, err error) {

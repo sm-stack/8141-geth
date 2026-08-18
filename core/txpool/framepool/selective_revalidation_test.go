@@ -142,6 +142,7 @@ func TestSelectiveRevalidationDetectsSenderStorageChange(t *testing.T) {
 
 	changedBefore := resetDependencyChangedMeter.Snapshot().Count()
 	revalidatedBefore := resetRevalidatedMeter.Snapshot().Count()
+	signatureBefore := signatureRunMeter.Snapshot().Count()
 	senderBefore := senderVerifyRunMeter.Snapshot().Count()
 	fixture.state = resetWithStateChange(fixture.pool, fixture.chain, func(nextState *state.StateDB) {
 		nextState.SetState(sender, common.Hash{}, common.HexToHash("0x01"))
@@ -154,6 +155,9 @@ func TestSelectiveRevalidationDetectsSenderStorageChange(t *testing.T) {
 	}
 	if delta := resetRevalidatedMeter.Snapshot().Count() - revalidatedBefore; delta != 1 {
 		t.Fatalf("revalidated after sender storage change: have %d want 1", delta)
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("signature runs after sender storage change: have %d want 0", delta)
 	}
 	if delta := senderVerifyRunMeter.Snapshot().Count() - senderBefore; delta != 1 {
 		t.Fatalf("sender VERIFY after storage change: have %d want 1", delta)
