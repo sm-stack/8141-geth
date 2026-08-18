@@ -147,15 +147,14 @@ func (f *payerCodeToggleFixture) toggleAndReset() {
 
 func TestPayerCodeIdentityPreflightConfig(t *testing.T) {
 	baseline, _, _ := newTestEnv()
-	if DefaultConfig.PayerCodeIdentityPreflight || baseline.payerCodeIdentityPreflight {
-		t.Fatal("payer code-identity preflight must be opt-in for the A/B baseline")
+	if !DefaultConfig.PayerCodeIdentityPreflight || !baseline.payerCodeIdentityPreflight {
+		t.Fatal("payer code-identity preflight must be enabled by default")
 	}
 	configured := NewWithConfig(Config{
-		MaxVerifyGas:               PublicMaxVerifyGas,
-		PayerCodeIdentityPreflight: true,
+		MaxVerifyGas: PublicMaxVerifyGas,
 	}, baseline.chain)
-	if !configured.payerCodeIdentityPreflight {
-		t.Fatal("configured payer code-identity preflight was not propagated to the pool")
+	if configured.payerCodeIdentityPreflight {
+		t.Fatal("disabled payer code-identity preflight was not propagated to the pool")
 	}
 }
 
@@ -266,6 +265,52 @@ func TestPayerCodeIdentityPreflightKeepsUnchangedControlKnown(t *testing.T) {
 		if !errors.Is(err, txpool.ErrAlreadyKnown) {
 			t.Fatalf("known control tx %d: have %v want %v", i, err, txpool.ErrAlreadyKnown)
 		}
+	}
+}
+
+func TestPayerCodeIdentityPreflightKeepsSelfPayingDeploy(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	sender := crypto.CreateAddress(factory, 0)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(factory)
+	statedb.SetCode(factory, createFactoryCode(approveBothCode), tracing.CodeChangeUnspecified)
+
+	frameTx := baseFTX(sender, 0, config)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 60_000},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveScopeMask, GasLimit: 30_000},
+	}
+	tx := makeFrameTx(frameTx)
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("add self-paying deploy transaction: %v", err)
+	}
+	meta := pool.meta[tx.Hash()]
+	if meta.usesPaymaster {
+		t.Fatal("self-paying deploy transaction classified as using a paymaster")
+	}
+	if statedb.GetCodeHash(sender) == meta.payerCodeHash {
+		t.Fatal("test requires validation-view payer code to differ from pre-state code")
+	}
+
+	chain := pool.chain.(*testChain)
+	oldHead := chain.head
+	newHead := types.CopyHeader(oldHead)
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	newHead.Time = oldHead.Time + params.SecondsPerSlot
+	chain.statedb = pool.currentState.Copy()
+	chain.head = newHead
+	pool.Reset(oldHead, newHead)
+
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("pending self-paying deploy transactions after reset: have %d want 1", pending)
+	}
+	if len(pool.stalePayerCode) != 0 {
+		t.Fatalf("self-paying deploy recorded %d stale payer identities", len(pool.stalePayerCode))
+	}
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; !errors.Is(err, txpool.ErrAlreadyKnown) {
+		t.Fatalf("known self-paying deploy after reset: have %v want %v", err, txpool.ErrAlreadyKnown)
 	}
 }
 

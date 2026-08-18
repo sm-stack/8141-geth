@@ -492,7 +492,7 @@ var (
 	}
 	FramePoolPayerCodeIdentityPreflightFlag = &cli.BoolFlag{
 		Name:     "framepool.payercodeidentitypreflight",
-		Usage:    "Reject replayed frame transactions when payer code changed since admission (research A/B)",
+		Usage:    "Evict frame transactions without revalidation when external payer code changed since admission",
 		Value:    ethconfig.Defaults.FramePool.PayerCodeIdentityPreflight,
 		Category: flags.TxPoolCategory,
 	}

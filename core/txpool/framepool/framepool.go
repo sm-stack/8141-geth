@@ -80,12 +80,12 @@ type Config struct {
 	SelectiveRevalidation      bool
 }
 
-// DefaultConfig follows the EIP-8141 public-mempool constants. Payer solvency
-// is checked before protocol signatures and validation-prefix execution.
+// DefaultConfig follows the EIP-8141 public-mempool constants. Cheap payer
+// checks run before protocol signatures and validation-prefix execution.
 var DefaultConfig = Config{
 	MaxVerifyGas:               maxVerifyGas,
 	PayerSolvencyPreflight:     true,
-	PayerCodeIdentityPreflight: false,
+	PayerCodeIdentityPreflight: true,
 	SelectiveRevalidation:      true,
 }
 
@@ -2033,12 +2033,14 @@ func (p *FramePool) validationDependenciesUnchangedIndexed(hash common.Hash, fra
 	return currentRules == meta.validationDeps.rules
 }
 
-// rejectChangedPayerCode performs the admission-time payer code-identity gate
-// during head reset. A mismatch is known before signatures or validation-prefix
-// EVM execution, so the transaction is evicted directly and remembered for
-// cheap rejection if the exact same hash is replayed while the mismatch remains.
+// rejectChangedPayerCode performs the admission-time external-payer code-identity
+// gate during head reset. A mismatch is known before signatures or validation-prefix
+// EVM execution, so the transaction is evicted directly and remembered for cheap
+// rejection if the exact same hash is replayed while the mismatch remains. Self-paid
+// transactions are excluded because a deploy prefix changes the sender's code only
+// inside the validation view before the payer metadata is captured.
 func (p *FramePool) rejectChangedPayerCode(hash common.Hash, meta frameTxMeta) bool {
-	if !p.payerCodeIdentityPreflight {
+	if !p.payerCodeIdentityPreflight || !meta.usesPaymaster {
 		return false
 	}
 	payerCodeIdentityCheckMeter.Mark(1)
