@@ -11,16 +11,17 @@ package framepool
 import "github.com/ethereum/go-ethereum/metrics"
 
 var (
-	// verifyRunMeter counts full EVM validation-prefix simulation attempts, one
-	// per transaction. Signature validation is accounted for separately below.
-	verifyRunMeter     = metrics.NewRegisteredMeter("framepool/verify/run", nil)
-	verifySuccessMeter = metrics.NewRegisteredMeter("framepool/verify/success", nil)
-	verifyGasMeter     = metrics.NewRegisteredMeter("framepool/verify/gastotal", nil)
-	verifyGasHistogram = metrics.NewRegisteredHistogram("framepool/verify/gas", nil, metrics.NewExpDecaySample(1028, 0.015))
-	verifyTimeTimer    = metrics.NewRegisteredTimer("framepool/verify/time", nil)
+	// verifyRunMeter counts validation-prefix evaluation attempts, one per
+	// transaction. Signature validation is accounted for separately below.
+	verifyRunMeter       = metrics.NewRegisteredMeter("framepool/verify/run", nil)
+	verifySuccessMeter   = metrics.NewRegisteredMeter("framepool/verify/success", nil)
+	verifyGasMeter       = metrics.NewRegisteredMeter("framepool/verify/gastotal", nil)
+	verifyGasHistogram   = metrics.NewRegisteredHistogram("framepool/verify/gas", nil, metrics.NewExpDecaySample(1028, 0.015))
+	verifyTimeTimer      = metrics.NewRegisteredTimer("framepool/verify/time", nil)
+	directVerifyRunMeter = metrics.NewRegisteredMeter("framepool/verify/direct", nil)
 
-	// senderVerifyRunMeter and senderVerifyGasMeter count actual sender VERIFY
-	// frame executions. They are marked immediately after the sender frame
+	// senderVerifyRunMeter and senderVerifyGasMeter count sender VERIFY frame
+	// evaluations. They are marked immediately after the sender frame
 	// returns so a later payer VERIFY outcome cannot overwrite the sender work.
 	senderVerifyRunMeter = metrics.NewRegisteredMeter("framepool/verify/sender/run", nil)
 	senderVerifyGasMeter = metrics.NewRegisteredMeter("framepool/verify/sender/gastotal", nil)

@@ -155,6 +155,38 @@ func TestValidationDependencyTouchesUseBALChanges(t *testing.T) {
 	}
 }
 
+func TestValidationDependencyIndexTracksDirectSenderBalance(t *testing.T) {
+	pool, statedb, _ := newTestEnv()
+	sender := common.HexToAddress("0x4444444444444444444444444444444444444444")
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	balance := common.Hash(statedb.GetBalance(sender).Bytes32())
+	hash := common.HexToHash("0x01")
+	index := newValidationDependencyIndex()
+	index.add(hash, sender, frameTxMeta{
+		payer:         common.HexToAddress("0x5555555555555555555555555555555555555555"),
+		payerCodeHash: types.EmptyCodeHash,
+		validationDeps: &validationDependencySnapshot{
+			senderCodeHash: types.EmptyCodeHash,
+			senderBalance:  &balance,
+			rules:          pool.chainconfig.Rules(pool.currentHead.Number, pool.currentHead.Difficulty.Sign() == 0, pool.currentHead.Time),
+			storageValues:  make(map[storageDependency]common.Hash),
+			codeHashes:     make(map[common.Address]common.Hash),
+		},
+	})
+
+	nextState := statedb.Copy()
+	nextState.SetBalance(sender, uint256.NewInt(2), tracing.BalanceChangeUnspecified)
+	construction := bal.NewConstructionBlockAccessList()
+	construction.BalanceChange(1, sender, uint256.NewInt(2))
+	touches := newValidationDependencyTouches()
+	touches.add(construction.ToEncodingObj())
+	changes := index.changes(nextState, touches)
+	if _, ok := changes.affected[hash]; !ok {
+		t.Fatal("direct-evaluation sender balance change did not invalidate its transaction")
+	}
+}
+
 func TestValidationDependencyIndexUsesBALTouches(t *testing.T) {
 	pool, statedb, _ := newTestEnv()
 	firstHelper := common.HexToAddress("0x5555555555555555555555555555555555555555")

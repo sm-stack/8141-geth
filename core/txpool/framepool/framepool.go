@@ -167,6 +167,7 @@ type validationDependencySnapshot struct {
 	senderCodeHash common.Hash
 	rules          params.Rules
 	legacyNonce    *uint64
+	senderBalance  *common.Hash
 	storageValues  map[storageDependency]common.Hash
 	codeHashes     map[common.Address]common.Hash
 }
@@ -1090,6 +1091,9 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if err := validateValidationPrefixState(frameTx, plan, p.currentState, simulationTime); err != nil {
 		return check, err
 	}
+	if err := validateDefaultCodeVerifyFrames(frameTx, plan, p.currentState); err != nil {
+		return check, err
+	}
 	accountingReplacement := check.replacement
 	if accountingReplacement == nil {
 		accountingReplacement = check.eviction
@@ -1454,6 +1458,10 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		}
 		legacyNonceRead = legacyNonceRead || result.legacyNonceRead
 	}
+	directDefaultCode := canDirectEvaluateDefaultCodePrefix(frameTx, plan, baseState)
+	if directDefaultCode {
+		directVerifyRunMeter.Mark(1)
+	}
 
 	if plan.deployIndex >= 0 {
 		if len(baseState.GetCode(frameTx.Sender)) != 0 {
@@ -1498,7 +1506,12 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		}
 	}
 
-	senderResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.senderVerifyIndex, true)
+	var senderResult verifyResult
+	if directDefaultCode {
+		senderResult, err = evaluateDefaultCodeVerifyFrame(frameTx, plan.senderVerifyIndex)
+	} else {
+		senderResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.senderVerifyIndex, true)
+	}
 	mergeDependencies(senderResult)
 	senderVerifyRunMeter.Mark(1)
 	senderVerifyGasMeter.Mark(int64(senderResult.frameGasUsed()))
@@ -1515,7 +1528,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			payerAvailableBalance: p.currentState.GetBalance(frameTx.Sender).ToBig(),
 			payerCodeHash:         p.currentState.GetCodeHash(frameTx.Sender),
 		}
-		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead)
+		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead, directDefaultCode)
 		return meta, senderResult, nil
 	}
 	if senderResult.approveScope != vm.ApproveExecution {
@@ -1526,7 +1539,12 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	}
 	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
 	meta := p.classifyPayer(frameTx.Sender, payTarget)
-	payResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !meta.canonicalPaymaster)
+	var payResult verifyResult
+	if directDefaultCode {
+		payResult, err = evaluateDefaultCodeVerifyFrame(frameTx, plan.payVerifyIndex)
+	} else {
+		payResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !meta.canonicalPaymaster)
+	}
 	mergeDependencies(payResult)
 	payResult.prefixGasUsed = senderResult.gasUsed() + payResult.frameGasUsed()
 	if err != nil {
@@ -1541,7 +1559,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	meta.maxCost = p.maxCost(tx)
 	meta.payerAvailableBalance = p.payerAvailableBalance(meta)
 	meta.payerCodeHash = p.currentState.GetCodeHash(meta.payer)
-	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead)
+	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead, directDefaultCode)
 	return meta, payResult, nil
 }
 
@@ -1642,6 +1660,28 @@ func validateValidationPrefixState(frameTx *types.FrameTx, plan validationPrefix
 	return validateExpiryVerifierFrame(statedb, plan.expiryIndex, frame, target, timestamp)
 }
 
+func validateDefaultCodeVerifyFrames(frameTx *types.FrameTx, plan validationPrefixPlan, statedb *state.StateDB) error {
+	for _, index := range []int{plan.senderVerifyIndex, plan.payVerifyIndex} {
+		if index < 0 {
+			continue
+		}
+		target := resolveFrameTarget(frameTx.Sender, frameTx.Frames[index])
+		// A deploy frame may replace the sender's default code before either
+		// sender-targeted VERIFY executes. Its result requires simulation.
+		if plan.deployIndex >= 0 && target == frameTx.Sender {
+			continue
+		}
+		if !hasNoCode(statedb, target) {
+			continue
+		}
+		frame := frameTx.Frames[index]
+		if _, _, err := vm.EvaluateDefaultCodeVerify(frame, frameTx.Signatures, frameTx.Sender, target, vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit)); err != nil {
+			return fmt.Errorf("default-code VERIFY frame %d failed preflight: %w", index, err)
+		}
+	}
+	return nil
+}
+
 func validateExpiryVerifierFrame(statedb *state.StateDB, index int, frame types.Frame, target common.Address, timestamp uint64) error {
 	if !bytes.Equal(statedb.GetCode(target), params.FrameExpiryVerifierCode) {
 		return fmt.Errorf("expiry verifier frame %d missing canonical code", index)
@@ -1682,6 +1722,42 @@ func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, 
 		}
 	}
 	return nil
+}
+
+func canDirectEvaluateDefaultCodePrefix(frameTx *types.FrameTx, plan validationPrefixPlan, statedb *state.StateDB) bool {
+	if plan.deployIndex >= 0 || !hasNoCode(statedb, frameTx.Sender) {
+		return false
+	}
+	if plan.payVerifyIndex < 0 {
+		return true
+	}
+	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
+	return hasNoCode(statedb, payTarget)
+}
+
+func evaluateDefaultCodeVerifyFrame(frameTx *types.FrameTx, index int) (verifyResult, error) {
+	frame := frameTx.Frames[index]
+	target := resolveFrameTarget(frameTx.Sender, frame)
+	scope, remaining, err := vm.EvaluateDefaultCodeVerify(frame, frameTx.Signatures, frameTx.Sender, target, vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit))
+	result := verifyResult{
+		approveScope: scope,
+		frameIndex:   index,
+		target:       target,
+		gasLimit:     frame.GasLimit,
+		gasRemaining: remaining.ExecutionGas,
+	}
+	if err == nil {
+		return result, nil
+	}
+	switch {
+	case errors.Is(err, vm.ErrOutOfGas):
+		result.failureClass = verifyFailureOutOfGas
+	case errors.Is(err, vm.ErrExecutionReverted):
+		result.failureClass = verifyFailureReverted
+	default:
+		result.failureClass = verifyFailureEVM
+	}
+	return result, fmt.Errorf("VERIFY frame %d execution failed: %v", index, err)
 }
 
 func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.FrameContext, blockCtx vm.BlockContext, rules params.Rules, precompiles []common.Address, baseState *state.StateDB, index int, useTracer bool) (verifyResult, error) {
@@ -1901,6 +1977,9 @@ func (index *validationDependencyIndex) add(hash common.Hash, sender common.Addr
 	if snapshot.legacyNonce != nil {
 		addDependency(validationDependencyKey{kind: validationNonceDependency, address: sender}, uint64DependencyValue(*snapshot.legacyNonce))
 	}
+	if snapshot.senderBalance != nil {
+		addDependency(validationDependencyKey{kind: validationBalanceDependency, address: sender}, *snapshot.senderBalance)
+	}
 	for location, value := range snapshot.storageValues {
 		addDependency(validationDependencyKey{kind: validationStorageDependency, address: location.address, slot: location.slot}, value)
 	}
@@ -2036,6 +2115,8 @@ func validationDependencyValue(statedb *state.StateDB, key validationDependencyK
 		return statedb.GetState(key.address, key.slot)
 	case validationNonceDependency:
 		return uint64DependencyValue(statedb.GetNonce(key.address))
+	case validationBalanceDependency:
+		return common.Hash(statedb.GetBalance(key.address).Bytes32())
 	default:
 		panic("unknown framepool validation dependency")
 	}
@@ -2049,17 +2130,23 @@ func uint64DependencyValue(value uint64) common.Hash {
 // public-mempool validation was permitted to observe. Transaction fields and
 // signatures are immutable for a given hash; nonce and recent-root references
 // are checked directly on every reset. The remaining reusable dependencies are
-// sender storage, validation-reached code, sender code, and payer code.
-func (p *FramePool) snapshotValidationDependencies(frameTx *types.FrameTx, plan validationPrefixPlan, meta frameTxMeta, storageReads map[common.Hash]struct{}, codeReads map[common.Address]struct{}, legacyNonceRead bool) *validationDependencySnapshot {
+// sender storage, validation-reached code, sender code, and payer code. Direct
+// default-code evaluation additionally depends on sender existence, represented
+// by the sender's legacy nonce and balance together with its code hash.
+func (p *FramePool) snapshotValidationDependencies(frameTx *types.FrameTx, plan validationPrefixPlan, meta frameTxMeta, storageReads map[common.Hash]struct{}, codeReads map[common.Address]struct{}, legacyNonceRead, senderExistence bool) *validationDependencySnapshot {
 	snapshot := &validationDependencySnapshot{
 		senderCodeHash: p.currentState.GetCodeHash(frameTx.Sender),
 		rules:          p.chainconfig.Rules(p.currentHead.Number, p.currentHead.Difficulty.Sign() == 0, p.currentHead.Time),
 		storageValues:  make(map[storageDependency]common.Hash),
 		codeHashes:     make(map[common.Address]common.Hash),
 	}
-	if legacyNonceRead {
+	if legacyNonceRead || senderExistence {
 		nonce := p.currentState.GetNonce(frameTx.Sender)
 		snapshot.legacyNonce = &nonce
+	}
+	if senderExistence {
+		balance := common.Hash(p.currentState.GetBalance(frameTx.Sender).Bytes32())
+		snapshot.senderBalance = &balance
 	}
 	for slot := range storageReads {
 		location := storageDependency{address: frameTx.Sender, slot: slot}
@@ -2113,6 +2200,9 @@ func (p *FramePool) validationDependenciesUnchanged(frameTx *types.FrameTx, meta
 		return false
 	}
 	if snapshot.legacyNonce != nil && p.currentState.GetNonce(frameTx.Sender) != *snapshot.legacyNonce {
+		return false
+	}
+	if snapshot.senderBalance != nil && common.Hash(p.currentState.GetBalance(frameTx.Sender).Bytes32()) != *snapshot.senderBalance {
 		return false
 	}
 	for location, value := range snapshot.storageValues {

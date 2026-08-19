@@ -216,7 +216,7 @@ func TestValidationDependenciesTrackIntrospectedLegacyNonce(t *testing.T) {
 		payerCodeHash: fixture.state.GetCodeHash(frameTx.Sender),
 	}
 	meta.validationDeps = fixture.pool.snapshotValidationDependencies(
-		frameTx, validationPrefixPlan{}, meta, nil, nil, true,
+		frameTx, validationPrefixPlan{}, meta, nil, nil, true, false,
 	)
 	if !fixture.pool.validationDependenciesUnchanged(frameTx, meta) {
 		t.Fatal("fresh legacy nonce dependency reported as changed")

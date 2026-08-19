@@ -420,6 +420,7 @@ func TestPayerSolvencyPreflightPassesDefaultCodeSponsor(t *testing.T) {
 	statedb.SetBalance(payer, uint256.MustFromBig(tx.Cost()), tracing.BalanceChangeUnspecified)
 
 	verifyBefore := verifyRunMeter.Snapshot().Count()
+	directBefore := directVerifyRunMeter.Snapshot().Count()
 	runBefore := preflightRunMeter.Snapshot().Count()
 	passBefore := preflightPassMeter.Snapshot().Count()
 	rejectBefore := preflightRejectMeter.Snapshot().Count()
@@ -428,6 +429,9 @@ func TestPayerSolvencyPreflightPassesDefaultCodeSponsor(t *testing.T) {
 	}
 	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 1 {
 		t.Fatalf("default-code sponsor VERIFY runs: have %d want 1", delta)
+	}
+	if delta := directVerifyRunMeter.Snapshot().Count() - directBefore; delta != 0 {
+		t.Fatalf("mixed validation prefix used %d direct evaluations", delta)
 	}
 	if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != 1 {
 		t.Fatalf("default-code sponsor preflight runs: have %d want 1", delta)

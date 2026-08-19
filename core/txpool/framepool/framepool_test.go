@@ -472,6 +472,32 @@ func addFramePoolDefaultCodeSponsorSignatures(ftx *types.FrameTx, chainID *big.I
 	}
 }
 
+func addFramePoolSplitDefaultCodeSignatures(ftx *types.FrameTx, chainID *big.Int, senderKey, payerKey *ecdsa.PrivateKey) {
+	if len(ftx.Signatures) != 0 {
+		panic("split default-code test helper requires an empty signature list")
+	}
+	keys := []*ecdsa.PrivateKey{senderKey, payerKey}
+	ftx.Signatures = make([]types.TxSignature, len(keys))
+	for i, key := range keys {
+		ftx.Signatures[i] = types.TxSignature{
+			Scheme: types.SignatureSchemeSecp256k1,
+			Signer: crypto.PubkeyToAddress(key.PublicKey),
+		}
+	}
+	sigHash := ftx.SigHash(chainID)
+	for i, key := range keys {
+		sig, err := crypto.Sign(sigHash[:], key)
+		if err != nil {
+			panic(err)
+		}
+		vrs := make([]byte, 65)
+		vrs[0] = sig[64]
+		copy(vrs[1:33], sig[0:32])
+		copy(vrs[33:65], sig[32:64])
+		ftx.Signatures[i].Signature = vrs
+	}
+}
+
 // --- Tests ---
 
 func TestFramePoolFilter(t *testing.T) {
@@ -560,9 +586,57 @@ func TestFramePoolEOADefaultCodeUsesTxSignatures(t *testing.T) {
 	}
 	addFramePoolEOASignature(ftx, config.ChainID, key)
 
+	directBefore := directVerifyRunMeter.Snapshot().Count()
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] != nil {
 		t.Fatalf("expected EOA default VERIFY with tx-level signature to be accepted, got: %v", errs[0])
+	}
+	if delta := directVerifyRunMeter.Snapshot().Count() - directBefore; delta != 1 {
+		t.Fatalf("direct default-code evaluations: have %d want 1", delta)
+	}
+}
+
+func TestFramePoolDirectEvaluatesSplitDefaultCodePrefix(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	senderKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payerKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(senderKey.PublicKey)
+	payer := crypto.PubkeyToAddress(payerKey.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &payer, GasLimit: 40_000},
+	}
+	addFramePoolSplitDefaultCodeSignatures(ftx, config.ChainID, senderKey, payerKey)
+	tx := makeFrameTx(ftx)
+	directBefore := directVerifyRunMeter.Snapshot().Count()
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("split default-code prefix rejected: %v", err)
+	}
+	if delta := directVerifyRunMeter.Snapshot().Count() - directBefore; delta != 1 {
+		t.Fatalf("direct default-code evaluations: have %d want 1", delta)
+	}
+	meta := pool.meta[tx.Hash()]
+	if meta.payer != payer || !meta.usesPaymaster || meta.nonCanonicalPaymaster {
+		t.Fatalf("split default-code payer metadata: %+v", meta)
+	}
+	if meta.validationDeps == nil || meta.validationDeps.legacyNonce == nil || meta.validationDeps.senderBalance == nil {
+		t.Fatalf("split default-code sender-existence dependencies: %+v", meta.validationDeps)
+	}
+	wantBalance := common.Hash(statedb.GetBalance(sender).Bytes32())
+	if *meta.validationDeps.legacyNonce != statedb.GetNonce(sender) || *meta.validationDeps.senderBalance != wantBalance {
+		t.Fatalf("split default-code sender-existence dependency values: %+v", meta.validationDeps)
 	}
 }
 
@@ -609,9 +683,17 @@ func TestFramePoolEOADefaultCodeRejectsExplicitMsgSignature(t *testing.T) {
 	msg32[31] = 1
 	addFramePoolEOASignatureForMsg(ftx, config.ChainID, key, msg32)
 
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	verifyBefore := verifyRunMeter.Snapshot().Count()
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected rejection for explicit-msg tx-level signature")
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("signature validations before default-code descriptor rejection: have %d want 0", delta)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY evaluations before default-code descriptor rejection: have %d want 0", delta)
 	}
 }
 

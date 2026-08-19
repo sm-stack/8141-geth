@@ -46,17 +46,21 @@ func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, 
 func ExecuteDefaultCodeWithGasBudget(evm *EVM, caller common.Address, target common.Address, input []byte, gas GasBudget, frameMode uint8) ([]byte, GasBudget, error) {
 	switch frameMode {
 	case types.FrameModeVerify:
-		if !gas.ChargeExecutionOnly(defaultCodeBaseGas) {
-			return nil, gas.ExitHalt(), ErrOutOfGas
-		}
-		approveScope, ok := defaultCodeTxSignatureApproveScope(evm.TxContext.FrameCtx, target)
-		if !ok {
+		fc := evm.TxContext.FrameCtx
+		if fc == nil || fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
+			if !gas.ChargeExecutionOnly(defaultCodeBaseGas) {
+				return nil, gas.ExitHalt(), ErrOutOfGas
+			}
 			return nil, gas.ExitRevert(), ErrExecutionReverted
 		}
-		if _, _, err := applyDefaultApprove(evm, target, approveScope, gas.ExecutionGas); err != nil {
-			return nil, gas.ExitRevert(), err
+		approveScope, remaining, err := EvaluateDefaultCodeVerify(fc.Frames[fc.FrameIndex], fc.Signatures, fc.Sender, target, gas)
+		if err != nil {
+			return nil, remaining, err
 		}
-		return nil, gas, nil
+		if _, _, err := applyDefaultApprove(evm, target, approveScope, remaining.ExecutionGas); err != nil {
+			return nil, remaining.ExitRevert(), err
+		}
+		return nil, remaining, nil
 	case types.FrameModeSender, types.FrameModeDefault:
 		return nil, gas, nil
 	default:
@@ -64,11 +68,25 @@ func ExecuteDefaultCodeWithGasBudget(evm *EVM, caller common.Address, target com
 	}
 }
 
-func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address) (uint8, bool) {
-	if fc == nil || fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
-		return 0, false
+// EvaluateDefaultCodeVerify evaluates the state-independent portion of an
+// EIP-8141 default-code VERIFY frame. Protocol-signature cryptography must be
+// validated separately before callers rely on the returned approval scope.
+func EvaluateDefaultCodeVerify(frame types.Frame, signatures []types.TxSignature, sender, target common.Address, gas GasBudget) (uint8, GasBudget, error) {
+	if frame.Mode != types.FrameModeVerify {
+		return ApproveNone, gas.ExitRevert(), ErrExecutionReverted
 	}
-	allowedScope := fc.Frames[fc.FrameIndex].Flags & types.FrameFlagApproveScopeMask
+	if !gas.ChargeExecutionOnly(defaultCodeBaseGas) {
+		return ApproveNone, gas.ExitHalt(), ErrOutOfGas
+	}
+	approveScope, ok := defaultCodeTxSignatureApproveScopeForFrame(frame, signatures, sender, target)
+	if !ok || approveScope&ApproveExecution != 0 && target != sender {
+		return ApproveNone, gas.ExitRevert(), ErrExecutionReverted
+	}
+	return approveScope, gas, nil
+}
+
+func defaultCodeTxSignatureApproveScopeForFrame(frame types.Frame, signatures []types.TxSignature, sender, target common.Address) (uint8, bool) {
+	allowedScope := frame.Flags & types.FrameFlagApproveScopeMask
 	if allowedScope == ApproveNone {
 		return 0, false
 	}
@@ -76,11 +94,11 @@ func defaultCodeTxSignatureApproveScope(fc *FrameContext, target common.Address)
 	if allowedScope&ApproveExecution != 0 {
 		sigIndex = 0
 	}
-	if sigIndex >= len(fc.Signatures) {
+	if sigIndex >= len(signatures) {
 		return 0, false
 	}
-	sig := fc.Signatures[sigIndex]
-	if sig.Scheme == types.SignatureSchemeSecp256k1 && types.ResolveTxSignatureSigner(sig, fc.Sender) == target && len(sig.Msg) == 0 {
+	sig := signatures[sigIndex]
+	if sig.Scheme == types.SignatureSchemeSecp256k1 && types.ResolveTxSignatureSigner(sig, sender) == target && len(sig.Msg) == 0 {
 		return allowedScope, true
 	}
 	return 0, false
