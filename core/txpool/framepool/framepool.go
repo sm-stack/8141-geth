@@ -1048,8 +1048,16 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if err != nil {
 		return check, err
 	}
+	accountingReplacement := check.replacement
+	if accountingReplacement == nil {
+		accountingReplacement = check.eviction
+	}
+	payerMeta := p.validationPayerMeta(frameTx, plan)
+	if err := p.validateNonCanonicalPaymasterLimit(payerMeta, accountingReplacement); err != nil {
+		return check, err
+	}
 	if p.payerSolvencyPreflight {
-		if err := p.preflightPayerSolvencyWithPlan(tx, check.replacement, plan, meterPreflight); err != nil {
+		if err := p.preflightPayerSolvencyWithMeta(tx, accountingReplacement, payerMeta, meterPreflight); err != nil {
 			return check, err
 		}
 	}
@@ -2090,8 +2098,7 @@ func (p *FramePool) rejectChangedPayerCode(hash common.Hash, meta frameTxMeta) b
 // the payer to the sender; a split prefix resolves it from the explicit pay frame.
 // The check compares balance against existing pool reservations plus the candidate's
 // maximum cost, subtracting a pending withdrawal only for an exact canonical-paymaster
-// runtime. It intentionally does not enforce the non-canonical pending cap; that check
-// remains post-simulation. Passing never substitutes for complete VERIFY simulation.
+// runtime. Passing never substitutes for complete VERIFY simulation.
 func (p *FramePool) preflightPayerSolvency(tx *types.Transaction, replacement *types.Transaction) error {
 	if !p.payerSolvencyPreflight {
 		return nil
@@ -2107,29 +2114,23 @@ func (p *FramePool) preflightPayerSolvency(tx *types.Transaction, replacement *t
 		// This keeps the optimization limited to necessary payer accounting.
 		return nil
 	}
-	return p.preflightPayerSolvencyWithPlan(tx, replacement, plan, true)
+	return p.preflightPayerSolvencyWithMeta(tx, replacement, p.validationPayerMeta(frameTx, plan), true)
 }
 
-func (p *FramePool) preflightPayerSolvencyWithPlan(tx *types.Transaction, replacement *types.Transaction, plan validationPrefixPlan, meter bool) error {
-	frameTx := tx.GetFrameTx()
-	if frameTx == nil {
-		return nil
-	}
-	start := time.Now()
+func (p *FramePool) validationPayerMeta(frameTx *types.FrameTx, plan validationPrefixPlan) frameTxMeta {
 	payer := frameTx.Sender
 	if plan.payVerifyIndex >= 0 {
 		payer = resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
 	}
+	return p.classifyPayer(frameTx.Sender, payer)
+}
+
+func (p *FramePool) preflightPayerSolvencyWithMeta(tx *types.Transaction, replacement *types.Transaction, meta frameTxMeta, meter bool) error {
+	start := time.Now()
 	if meter {
 		preflightRunMeter.Mark(1)
 	}
-	usesPaymaster := payer != frameTx.Sender
-	meta := frameTxMeta{
-		payer:              payer,
-		usesPaymaster:      usesPaymaster,
-		canonicalPaymaster: usesPaymaster && p.isCanonicalPaymaster(payer),
-		maxCost:            p.maxCost(tx),
-	}
+	meta.maxCost = p.maxCost(tx)
 	err := p.validatePayerSolvency(tx, meta, replacement)
 	if meter {
 		preflightTimeTimer.UpdateSince(start)
@@ -2294,19 +2295,25 @@ func (p *FramePool) payerAvailableBalance(meta frameTxMeta) *big.Int {
 	return balance
 }
 
-// validatePaymasterAccounting performs full post-simulation accounting: common
-// payer solvency first, followed by the code-bearing non-canonical pending cap.
+func (p *FramePool) validateNonCanonicalPaymasterLimit(meta frameTxMeta, replacement *types.Transaction) error {
+	if !meta.nonCanonicalPaymaster {
+		return nil
+	}
+	pending := p.nonCanonicalPendingExcluding(meta.payer, replacement)
+	if pending >= maxPendingTxsUsingNonCanonicalPaymaster {
+		return fmt.Errorf("%w: non-canonical paymaster %s has %d pending frame txs", txpool.ErrAccountLimitExceeded, meta.payer.Hex(), pending)
+	}
+	return nil
+}
+
+// validatePaymasterAccounting performs full post-simulation accounting. The
+// caller repeats both checks immediately before insertion to protect against
+// pool changes since the rejection-only admission preflight.
 func (p *FramePool) validatePaymasterAccounting(tx *types.Transaction, meta frameTxMeta, replacement *types.Transaction) error {
 	if err := p.validatePayerSolvency(tx, meta, replacement); err != nil {
 		return err
 	}
-	if meta.nonCanonicalPaymaster {
-		pending := p.nonCanonicalPendingExcluding(meta.payer, replacement)
-		if pending >= maxPendingTxsUsingNonCanonicalPaymaster {
-			return fmt.Errorf("%w: non-canonical paymaster %s has %d pending frame txs", txpool.ErrAccountLimitExceeded, meta.payer.Hex(), pending)
-		}
-	}
-	return nil
+	return p.validateNonCanonicalPaymasterLimit(meta, replacement)
 }
 
 func (p *FramePool) reserveTxAccounting(tx *types.Transaction, meta frameTxMeta) {

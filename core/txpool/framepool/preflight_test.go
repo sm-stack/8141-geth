@@ -6,6 +6,7 @@ package framepool
 import (
 	"crypto/ecdsa"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -350,45 +351,45 @@ func TestPayerSolvencyPreflightRejectsInsolventNonCanonicalPayer(t *testing.T) {
 	}
 }
 
-func TestPayerSolvencyPreflightDefersNonCanonicalPendingCap(t *testing.T) {
-	fixture := newPayerPreflightFixture(t, true, false)
-	secondSender := common.HexToAddress("0x3333333333333333333333333333333333333333")
-	fixture.state.CreateAccount(secondSender)
-	fixture.state.SetCode(secondSender, approveExecCode, tracing.CodeChangeUnspecified)
+func TestNonCanonicalPendingCapRunsBeforeValidation(t *testing.T) {
+	for _, solvencyPreflight := range []bool{false, true} {
+		t.Run(fmt.Sprintf("solvency-preflight-%t", solvencyPreflight), func(t *testing.T) {
+			fixture := newPayerPreflightFixture(t, solvencyPreflight, false)
+			secondSender := common.HexToAddress("0x3333333333333333333333333333333333333333")
+			fixture.state.CreateAccount(secondSender)
+			fixture.state.SetCode(secondSender, approveExecCode, tracing.CodeChangeUnspecified)
 
-	firstTx := fixture.tx(0x04)
-	secondFrameTx := baseFTX(secondSender, 0, fixture.config)
-	secondFrameTx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000, Data: []byte{0x05}},
-		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &fixture.payer, GasLimit: 40_000},
-	}
-	addFramePoolEOASignature(secondFrameTx, fixture.config.ChainID, fixture.key)
-	secondTx := makeFrameTx(secondFrameTx)
-	balance := new(big.Int).Add(firstTx.Cost(), secondTx.Cost())
-	fixture.state.SetBalance(fixture.payer, uint256.MustFromBig(balance), tracing.BalanceChangeUnspecified)
+			firstTx := fixture.tx(0x04)
+			secondFrameTx := baseFTX(secondSender, 0, fixture.config)
+			secondFrameTx.Frames = []types.Frame{
+				{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000, Data: []byte{0x05}},
+				{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &fixture.payer, GasLimit: 40_000},
+			}
+			addFramePoolEOASignature(secondFrameTx, fixture.config.ChainID, fixture.key)
+			secondTx := makeFrameTx(secondFrameTx)
+			balance := new(big.Int).Add(firstTx.Cost(), secondTx.Cost())
+			fixture.state.SetBalance(fixture.payer, uint256.MustFromBig(balance), tracing.BalanceChangeUnspecified)
 
-	if err := fixture.pool.Add([]*types.Transaction{firstTx}, false)[0]; err != nil {
-		t.Fatalf("initial non-canonical payer transaction rejected: %v", err)
-	}
-	verifyBefore := verifyRunMeter.Snapshot().Count()
-	runBefore := preflightRunMeter.Snapshot().Count()
-	passBefore := preflightPassMeter.Snapshot().Count()
-	rejectBefore := preflightRejectMeter.Snapshot().Count()
-	err := fixture.pool.Add([]*types.Transaction{secondTx}, false)[0]
-	if !errors.Is(err, txpool.ErrAccountLimitExceeded) {
-		t.Fatalf("second admission error: have %v want %v", err, txpool.ErrAccountLimitExceeded)
-	}
-	if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != 1 {
-		t.Fatalf("preflight runs: have %d want 1", delta)
-	}
-	if delta := preflightPassMeter.Snapshot().Count() - passBefore; delta != 1 {
-		t.Fatalf("solvency-only preflight passes: have %d want 1", delta)
-	}
-	if delta := preflightRejectMeter.Snapshot().Count() - rejectBefore; delta != 0 {
-		t.Fatalf("solvency-only preflight rejects: have %d want 0", delta)
-	}
-	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 1 {
-		t.Fatalf("VERIFY runs before post-simulation cap rejection: have %d want 1", delta)
+			if err := fixture.pool.Add([]*types.Transaction{firstTx}, false)[0]; err != nil {
+				t.Fatalf("initial non-canonical payer transaction rejected: %v", err)
+			}
+			verifyBefore := verifyRunMeter.Snapshot().Count()
+			signatureBefore := signatureRunMeter.Snapshot().Count()
+			runBefore := preflightRunMeter.Snapshot().Count()
+			err := fixture.pool.Add([]*types.Transaction{secondTx}, false)[0]
+			if !errors.Is(err, txpool.ErrAccountLimitExceeded) {
+				t.Fatalf("second admission error: have %v want %v", err, txpool.ErrAccountLimitExceeded)
+			}
+			if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != 0 {
+				t.Fatalf("solvency preflight runs before cap rejection: have %d want 0", delta)
+			}
+			if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+				t.Fatalf("signature validations before cap rejection: have %d want 0", delta)
+			}
+			if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+				t.Fatalf("VERIFY runs before cap rejection: have %d want 0", delta)
+			}
+		})
 	}
 }
 
@@ -461,6 +462,68 @@ func TestPayerSolvencyPreflightReplacementExcludesOldReservation(t *testing.T) {
 	}
 	if fixture.pool.Has(oldTx.Hash()) || !fixture.pool.Has(newTx.Hash()) {
 		t.Fatal("replacement did not atomically replace the old transaction")
+	}
+}
+
+func TestNonCanonicalPendingCapPreflightAllowsReplacement(t *testing.T) {
+	fixture := newPayerPreflightFixture(t, true, false)
+	oldTx := fixture.tx(0x04)
+	replacementFrameTx := baseFTX(fixture.sender, 0, fixture.config)
+	replacementFrameTx.GasTipCap = uint256.NewInt(2)
+	replacementFrameTx.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 11 / 10)
+	replacementFrameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000, Data: []byte{0x05}},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &fixture.payer, GasLimit: 40_000},
+	}
+	addFramePoolEOASignature(replacementFrameTx, fixture.config.ChainID, fixture.key)
+	replacement := makeFrameTx(replacementFrameTx)
+	fixture.state.SetBalance(fixture.payer, uint256.MustFromBig(replacement.Cost()), tracing.BalanceChangeUnspecified)
+
+	if err := fixture.pool.Add([]*types.Transaction{oldTx}, false)[0]; err != nil {
+		t.Fatalf("initial non-canonical payer transaction rejected: %v", err)
+	}
+	if err := fixture.pool.Add([]*types.Transaction{replacement}, false)[0]; err != nil {
+		t.Fatalf("non-canonical payer replacement rejected: %v", err)
+	}
+	if fixture.pool.Has(oldTx.Hash()) || !fixture.pool.Has(replacement.Hash()) {
+		t.Fatal("replacement did not atomically replace the old transaction")
+	}
+}
+
+func TestNonCanonicalPendingCapPreflightExcludesEviction(t *testing.T) {
+	fixture := newPayerPreflightFixture(t, true, false)
+	firstTx := fixture.tx(0x04)
+	secondSender := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	fixture.state.CreateAccount(secondSender)
+	fixture.state.SetCode(secondSender, approveExecCode, tracing.CodeChangeUnspecified)
+	candidateFrameTx := baseFTX(secondSender, 0, fixture.config)
+	candidateFrameTx.GasTipCap = uint256.NewInt(2)
+	candidateFrameTx.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 11 / 10)
+	candidateFrameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000, Data: []byte{0x05}},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &fixture.payer, GasLimit: 40_000},
+	}
+	addFramePoolEOASignature(candidateFrameTx, fixture.config.ChainID, fixture.key)
+	candidate := makeFrameTx(candidateFrameTx)
+	balance := new(big.Int).Add(firstTx.Cost(), candidate.Cost())
+	fixture.state.SetBalance(fixture.payer, uint256.MustFromBig(balance), tracing.BalanceChangeUnspecified)
+
+	if err := fixture.pool.Add([]*types.Transaction{firstTx}, false)[0]; err != nil {
+		t.Fatalf("initial non-canonical payer transaction rejected: %v", err)
+	}
+	for i := 1; i < maxFramePoolSize; i++ {
+		dummyFrameTx := baseFTX(common.BigToAddress(big.NewInt(int64(i+100))), uint64(i), fixture.config)
+		dummyFrameTx.GasTipCap = uint256.NewInt(10)
+		dummyFrameTx.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 10)
+		dummyFrameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution | types.FrameFlagApprovePayment, GasLimit: 40_000, Data: []byte{byte(i)}}}
+		dummy := makeFrameTx(dummyFrameTx)
+		fixture.pool.all[dummy.Hash()] = dummy
+	}
+	if err := fixture.pool.Add([]*types.Transaction{candidate}, false)[0]; err != nil {
+		t.Fatalf("candidate replacing the payer's evicted transaction rejected: %v", err)
+	}
+	if fixture.pool.Has(firstTx.Hash()) || !fixture.pool.Has(candidate.Hash()) {
+		t.Fatal("candidate did not replace the selected eviction")
 	}
 }
 
