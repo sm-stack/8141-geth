@@ -53,8 +53,9 @@ const (
 	// non-canonical paymaster.
 	maxPendingTxsUsingNonCanonicalPaymaster = 1
 
-	// maxFramePoolSize limits total pooled frame transactions.
-	maxFramePoolSize = 256
+	// maxFramePoolSize limits total pooled frame transactions. The experimental
+	// capacity matches the legacy pool's default executable-slot count.
+	maxFramePoolSize = 5120
 
 	// PublicMaxVerifyGas is the fixed EIP-8141 public-mempool validation budget.
 	PublicMaxVerifyGas uint64 = 100_000
