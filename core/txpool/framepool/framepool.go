@@ -898,6 +898,10 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 			errs[i] = err
 			continue
 		}
+		if err := p.preflightBlobAdmission(tx); err != nil {
+			errs[i] = err
+			continue
+		}
 		cells, err := validateFrameBlobProofs(tx)
 		if err != nil {
 			errs[i] = err
@@ -915,6 +919,20 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 		p.insertFeed.Send(event)
 	}
 	return errs
+}
+
+// preflightBlobAdmission rejects blob transactions that are already invalid
+// against the current pool or state before computing cells and verifying KZG
+// proofs. The result is advisory: callers release p.mu during proof verification
+// and repeat every check in validateAndAdd before insertion.
+func (p *FramePool) preflightBlobAdmission(tx *types.Transaction) error {
+	if tx.BlobGas() == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, err := p.checkAdmissionCheap(tx, false)
+	return err
 }
 
 func validateFrameBlobProofs(tx *types.Transaction) ([]kzg4844.Cell, error) {

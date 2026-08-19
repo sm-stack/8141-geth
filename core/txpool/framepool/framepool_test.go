@@ -221,6 +221,9 @@ func TestBlobFrameNetworkEncoding(t *testing.T) {
 
 func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
 	pool, statedb, config := newTestEnv()
+	var zero uint64
+	pool.currentHead.ExcessBlobGas = &zero
+	pool.currentHead.BlobGasUsed = &zero
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
@@ -240,8 +243,35 @@ func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
 		[]kzg4844.Commitment{commitment},
 		proofs,
 	))
-	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err == nil {
-		t.Fatal("frame pool accepted invalid blob commitment/proofs")
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; !errors.Is(err, txpool.ErrKZGVerificationError) {
+		t.Fatalf("invalid blob proof error: have %v want %v", err, txpool.ErrKZGVerificationError)
+	}
+}
+
+func TestFramePoolRejectsMalformedBlobBeforeKZG(t *testing.T) {
+	pool, _, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	var (
+		blob       kzg4844.Blob
+		commitment kzg4844.Commitment
+		proofs     = make([]kzg4844.Proof, kzg4844.CellProofsPerBlob)
+	)
+	ftx := baseFTX(sender, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeSender, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		proofs,
+	))
+	err := pool.Add([]*types.Transaction{tx}, false)[0]
+	if err == nil || !strings.Contains(err.Error(), "SENDER frame before any VERIFY") {
+		t.Fatalf("malformed blob frame error: have %v", err)
+	}
+	if errors.Is(err, txpool.ErrKZGVerificationError) {
+		t.Fatalf("malformed blob frame reached KZG verification: %v", err)
 	}
 }
 
@@ -273,14 +303,27 @@ func TestFramePoolCachesBlobCells(t *testing.T) {
 		[]kzg4844.Commitment{commitment},
 		proofs,
 	))
+	preflightBefore := preflightRunMeter.Snapshot().Count()
 	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
 		t.Fatalf("add blob frame transaction: %v", err)
+	}
+	if delta := preflightRunMeter.Snapshot().Count() - preflightBefore; delta != 1 {
+		t.Fatalf("metered payer preflight runs: have %d want 1", delta)
 	}
 	mask := types.NewCustodyBitmap([]uint64{1})
 	indices := mask.Indices()
 	cells := pool.GetCells(tx.Hash(), mask)
 	if len(cells) != len(indices) {
 		t.Fatalf("cached cell count = %d, want %d", len(cells), len(indices))
+	}
+	knownWithInvalidProofs := tx.WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		make([]kzg4844.Proof, kzg4844.CellProofsPerBlob),
+	))
+	if err := pool.Add([]*types.Transaction{knownWithInvalidProofs}, false)[0]; !errors.Is(err, txpool.ErrAlreadyKnown) {
+		t.Fatalf("known blob frame error: have %v want %v", err, txpool.ErrAlreadyKnown)
 	}
 }
 
