@@ -127,15 +127,16 @@ type FramePool struct {
 
 	reserver txpool.Reserver
 
-	validationMu    sync.Mutex
-	mu              sync.RWMutex
-	pending         map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
-	all             map[common.Hash]*types.Transaction      // hash → tx
-	meta            map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
-	dependencyIndex *validationDependencyIndex              // mutable validation dependency → transaction hashes
-	stalePayerCode  map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
-	blobSidecars    map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
-	blobCells       map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
+	validationMu             sync.Mutex
+	admissionValidationState *state.StateDB // reusable current-head view, guarded by validationMu
+	mu                       sync.RWMutex
+	pending                  map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
+	all                      map[common.Hash]*types.Transaction      // hash → tx
+	meta                     map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
+	dependencyIndex          *validationDependencyIndex              // mutable validation dependency → transaction hashes
+	stalePayerCode           map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
+	blobSidecars             map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
+	blobCells                map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
 
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
@@ -302,6 +303,7 @@ func (p *FramePool) Init(gasTip uint64, head *types.Header, reserver txpool.Rese
 	}
 	p.currentHead = head
 	p.currentState = statedb
+	p.admissionValidationState = nil
 	return nil
 }
 
@@ -412,6 +414,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.currentHead = newHead
 	p.currentState = statedb
+	p.admissionValidationState = nil
 	for hash := range candidate.blobCells {
 		if candidate.all[hash] == nil {
 			if _, cached := p.blobSidecars[hash]; !cached {
@@ -1107,11 +1110,19 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) 
 		}
 		held = true
 	}
-	validationView := p.validationViewLocked()
+	validationView := p.admissionValidationViewLocked()
 	p.mu.Unlock()
 
 	// Simulate the validation prefix.
 	meta, err := validationView.simulateVerifyFramesWithSignatureGas(tx, signatureGas)
+	if stateErr := validationView.currentState.Error(); stateErr != nil {
+		// StateDB errors are sticky and are not reverted by a journal snapshot.
+		// Never let a poisoned validation view affect a later admission.
+		p.admissionValidationState = nil
+		if err == nil {
+			err = fmt.Errorf("frame validation state error: %w", stateErr)
+		}
+	}
 	if err != nil {
 		if held && p.reserver != nil {
 			p.reserver.Release(sender)
@@ -1215,6 +1226,22 @@ func (p *FramePool) removeTransaction(tx *types.Transaction) {
 // The caller holds p.mu for writing, excluding StateDB reads that may populate
 // internal caches while Copy iterates over them.
 func (p *FramePool) validationViewLocked() *FramePool {
+	return p.validationViewWithStateLocked(p.currentState.Copy())
+}
+
+// admissionValidationViewLocked returns the validation view serialized by
+// validationMu. The StateDB is copied once per canonical head and reused across
+// admissions; simulateVerifyFramesWithSignatureGasOutcome snapshots and reverts
+// the complete validation prefix before it returns. The caller holds p.mu while
+// lazily copying currentState.
+func (p *FramePool) admissionValidationViewLocked() *FramePool {
+	if p.admissionValidationState == nil {
+		p.admissionValidationState = p.currentState.Copy()
+	}
+	return p.validationViewWithStateLocked(p.admissionValidationState)
+}
+
+func (p *FramePool) validationViewWithStateLocked(statedb *state.StateDB) *FramePool {
 	canonicalPaymasters := make(map[common.Hash]common.Hash, len(p.canonicalPaymasters))
 	for codeHash, slot := range p.canonicalPaymasters {
 		canonicalPaymasters[codeHash] = slot
@@ -1224,7 +1251,7 @@ func (p *FramePool) validationViewLocked() *FramePool {
 		chainconfig:                p.chainconfig,
 		signer:                     p.signer,
 		currentHead:                types.CopyHeader(p.currentHead),
-		currentState:               p.currentState.Copy(),
+		currentState:               statedb,
 		slotProvider:               p.slotProvider,
 		verifyGasCap:               p.verifyGasCap,
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,

@@ -1332,6 +1332,107 @@ func TestFramePoolReusableValidationStateRevertsDeploy(t *testing.T) {
 	}
 }
 
+func TestFramePoolAdmissionReusesValidationState(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	factory := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	sender := crypto.CreateAddress(factory, 0)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(factory)
+	statedb.SetCode(factory, createFactoryCode(approveBothCode), tracing.CodeChangeUnspecified)
+	secondSender := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	statedb.CreateAccount(secondSender)
+	statedb.SetCode(secondSender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(secondSender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	frameTx := baseFTX(sender, 0, config)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeDefault, Target: &factory, GasLimit: 60_000},
+		{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000},
+	}
+	failed := *frameTx
+	failed.Frames = append([]types.Frame(nil), frameTx.Frames...)
+	failed.Frames[0].GasLimit = 1
+	if err := pool.Add([]*types.Transaction{makeFrameTx(&failed)}, false)[0]; err == nil {
+		t.Fatal("expected underfunded deploy admission to fail")
+	}
+	validationState := pool.admissionValidationState
+	if validationState == nil {
+		t.Fatal("failed admission did not initialize reusable validation state")
+	}
+	factoryNonce := validationState.GetNonce(factory)
+	assertReverted := func(phase string) {
+		t.Helper()
+		if code := validationState.GetCode(sender); len(code) != 0 {
+			t.Fatalf("%s left sender code in reusable admission state: %x", phase, code)
+		}
+		if nonce := validationState.GetNonce(factory); nonce != factoryNonce {
+			t.Fatalf("%s left factory nonce in reusable admission state: have %d want %d", phase, nonce, factoryNonce)
+		}
+	}
+	assertReverted("failed validation")
+
+	if err := pool.Add([]*types.Transaction{makeFrameTx(frameTx)}, false)[0]; err != nil {
+		t.Fatalf("valid deploy admission failed: %v", err)
+	}
+	if pool.admissionValidationState != validationState {
+		t.Fatal("valid admission replaced reusable validation state")
+	}
+	assertReverted("successful validation")
+
+	second := baseFTX(secondSender, 0, config)
+	second.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(second)}, false)[0]; err != nil {
+		t.Fatalf("second admission failed: %v", err)
+	}
+	if pool.admissionValidationState != validationState {
+		t.Fatal("second admission replaced reusable validation state")
+	}
+}
+
+func TestFramePoolResetInvalidatesAdmissionValidationState(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	firstSender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(firstSender)
+	statedb.SetCode(firstSender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(firstSender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	first := baseFTX(firstSender, 0, config)
+	first.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(first)}, false)[0]; err != nil {
+		t.Fatalf("first admission failed: %v", err)
+	}
+	oldValidationState := pool.admissionValidationState
+	if oldValidationState == nil {
+		t.Fatal("first admission did not initialize reusable validation state")
+	}
+
+	secondSender := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	nextState := pool.currentState.Copy()
+	nextState.CreateAccount(secondSender)
+	nextState.SetCode(secondSender, approveBothCode, tracing.CodeChangeUnspecified)
+	nextState.SetBalance(secondSender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	chain := pool.chain.(*testChain)
+	oldHead := chain.head
+	newHead := types.CopyHeader(oldHead)
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	newHead.Time = oldHead.Time + params.SecondsPerSlot
+	chain.statedb = nextState
+	chain.head = newHead
+	pool.Reset(oldHead, newHead)
+	if pool.admissionValidationState != nil {
+		t.Fatal("reset retained the previous head's admission validation state")
+	}
+
+	second := baseFTX(secondSender, 0, config)
+	second.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(second)}, false)[0]; err != nil {
+		t.Fatalf("post-reset admission failed: %v", err)
+	}
+	if pool.admissionValidationState == nil || pool.admissionValidationState == oldValidationState {
+		t.Fatal("post-reset admission did not create a new validation state")
+	}
+}
+
 func TestFramePoolRejectsVerifyAfterValidationPrefix(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
