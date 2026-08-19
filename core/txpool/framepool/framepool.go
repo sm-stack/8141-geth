@@ -69,6 +69,10 @@ const (
 	// maxResetValidationWorkers bounds the StateDB copies and EVMs used to
 	// prepare reset validation. Pool accounting is committed separately.
 	maxResetValidationWorkers = 4
+
+	// maxSignatureValidationWorkers bounds admission-time cryptographic work
+	// performed concurrently outside the serialized state-validation path.
+	maxSignatureValidationWorkers = 4
 )
 
 // Config configures frame transaction validation policy. Values above
@@ -129,6 +133,7 @@ type FramePool struct {
 
 	validationMu             sync.Mutex
 	admissionValidationState *state.StateDB // reusable current-head view, guarded by validationMu
+	signatureValidationSlots chan struct{}
 	mu                       sync.RWMutex
 	pending                  map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
 	all                      map[common.Hash]*types.Transaction      // hash → tx
@@ -260,6 +265,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		payerCodeIdentityPreflight: config.PayerCodeIdentityPreflight,
 		selectiveRevalidation:      config.SelectiveRevalidation,
 		resetValidationWorkers:     defaultResetValidationWorkers(),
+		signatureValidationSlots:   make(chan struct{}, defaultSignatureValidationWorkers()),
 		canonicalPaymasters:        make(map[common.Hash]common.Hash),
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
@@ -595,6 +601,10 @@ func defaultResetValidationWorkers() int {
 	return min(max(runtime.GOMAXPROCS(0), 1), maxResetValidationWorkers)
 }
 
+func defaultSignatureValidationWorkers() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), maxSignatureValidationWorkers)
+}
+
 // prepareResetValidations runs only the state-dependent EVM work in parallel.
 // Each worker owns a StateDB snapshot; results are written to their original
 // positions and committed later in deterministic reset priority order.
@@ -899,7 +909,8 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 			errs[i] = err
 			continue
 		}
-		if err := p.preflightBlobAdmission(tx); err != nil {
+		if err := p.preflightAdmission(tx); err != nil {
+			markInsufficientPayerRejection(err)
 			errs[i] = err
 			continue
 		}
@@ -908,7 +919,17 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 			errs[i] = err
 			continue
 		}
-		if err := p.validateAndAdd(tx, cells); err != nil {
+		frameTx := tx.GetFrameTx()
+		if frameTx == nil {
+			errs[i] = fmt.Errorf("not a frame transaction")
+			continue
+		}
+		signatureGas, err := p.validateFrameSignaturesBounded(frameTx)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		if err := p.validateAndAdd(tx, cells, signatureGas); err != nil {
 			errs[i] = err
 			continue
 		}
@@ -922,18 +943,22 @@ func (p *FramePool) Add(txs []*types.Transaction, sync bool) []error {
 	return errs
 }
 
-// preflightBlobAdmission rejects blob transactions that are already invalid
-// against the current pool or state before computing cells and verifying KZG
-// proofs. The result is advisory: callers release p.mu during proof verification
-// and repeat every check in validateAndAdd before insertion.
-func (p *FramePool) preflightBlobAdmission(tx *types.Transaction) error {
-	if tx.BlobGas() == 0 {
-		return nil
-	}
+// preflightAdmission rejects transactions that are already invalid against the
+// current pool or state before KZG or protocol-signature verification. The
+// result is advisory: callers release p.mu during cryptographic work and repeat
+// every check in validateAndAdd before insertion.
+func (p *FramePool) preflightAdmission(tx *types.Transaction) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, err := p.checkAdmissionCheap(tx, false)
+	_, err := p.checkAdmissionCheap(tx, true)
 	return err
+}
+
+func markInsufficientPayerRejection(err error) {
+	if errors.Is(err, core.ErrInsufficientFunds) {
+		accountingRejectMeter.Mark(1)
+		accountingInsufficientMeter.Mark(1)
+	}
 }
 
 func validateFrameBlobProofs(tx *types.Transaction) ([]kzg4844.Cell, error) {
@@ -1111,7 +1136,7 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 }
 
 // validateAndAdd performs stateful validation (nonce, VERIFY simulation) and inserts.
-func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) error {
+func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell, signatureGas uint64) error {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
 		return fmt.Errorf("not a frame transaction")
@@ -1123,28 +1148,9 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell) 
 	}
 
 	p.mu.Lock()
-	_, err := p.checkAdmissionCheap(tx, true)
-	p.mu.Unlock()
-	if err != nil {
-		if errors.Is(err, core.ErrInsufficientFunds) {
-			accountingRejectMeter.Mark(1)
-			accountingInsufficientMeter.Mark(1)
-		}
-		return err
-	}
-	signatureGas, err := p.validateFrameSignatures(frameTx)
-	if err != nil {
-		return err
-	}
-
-	p.mu.Lock()
-
 	check, err := p.checkAdmissionCheap(tx, false)
 	if err != nil {
-		if errors.Is(err, core.ErrInsufficientFunds) {
-			accountingRejectMeter.Mark(1)
-			accountingInsufficientMeter.Mark(1)
-		}
+		markInsufficientPayerRejection(err)
 		p.mu.Unlock()
 		return err
 	}
@@ -1365,6 +1371,15 @@ func (p *FramePool) validateFrameSignatures(frameTx *types.FrameTx) (signatureGa
 		return 0, err
 	}
 	return signatureGas, nil
+}
+
+func (p *FramePool) validateFrameSignaturesBounded(frameTx *types.FrameTx) (uint64, error) {
+	if p.signatureValidationSlots == nil {
+		return p.validateFrameSignatures(frameTx)
+	}
+	p.signatureValidationSlots <- struct{}{}
+	defer func() { <-p.signatureValidationSlots }()
+	return p.validateFrameSignatures(frameTx)
 }
 
 func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, signatureGas uint64) (frameTxMeta, error) {

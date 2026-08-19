@@ -243,8 +243,128 @@ func TestFramePoolRejectsInvalidBlobProofs(t *testing.T) {
 		[]kzg4844.Commitment{commitment},
 		proofs,
 	))
+	signatureBefore := signatureRunMeter.Snapshot().Count()
 	if err := pool.Add([]*types.Transaction{tx}, false)[0]; !errors.Is(err, txpool.ErrKZGVerificationError) {
 		t.Fatalf("invalid blob proof error: have %v want %v", err, txpool.ErrKZGVerificationError)
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("signature validations before KZG rejection: have %d want 0", delta)
+	}
+}
+
+func TestFramePoolValidatesSignaturesOutsideValidationLock(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	addFramePoolEOASignature(ftx, config.ChainID, key)
+	tx := makeFrameTx(ftx)
+
+	pool.validationMu.Lock()
+	validationLocked := true
+	defer func() {
+		if validationLocked {
+			pool.validationMu.Unlock()
+		}
+	}()
+
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	result := make(chan error, 1)
+	go func() {
+		result <- pool.Add([]*types.Transaction{tx}, false)[0]
+	}()
+
+	deadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for signatureRunMeter.Snapshot().Count() == signatureBefore {
+		select {
+		case err := <-result:
+			t.Fatalf("admission returned before acquiring validation lock: %v", err)
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("signature validation did not run outside validation lock")
+		}
+	}
+
+	// Change a cheap state dependency after the advisory preflight. Admission
+	// must repeat the check after acquiring validationMu and reject stale work.
+	pool.mu.Lock()
+	statedb.SetNonce(sender, 1, tracing.NonceChangeUnspecified)
+	pool.mu.Unlock()
+	pool.validationMu.Unlock()
+	validationLocked = false
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, core.ErrNonceTooLow) {
+			t.Fatalf("post-signature state recheck error: have %v want %v", err, core.ErrNonceTooLow)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission did not resume after validation lock release")
+	}
+}
+
+func TestFramePoolBoundsConcurrentSignatureValidation(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	addFramePoolEOASignature(ftx, config.ChainID, key)
+	tx := makeFrameTx(ftx)
+
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+	pool.signatureValidationSlots = slots
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			<-slots
+		}
+	}()
+
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	result := make(chan error, 1)
+	go func() {
+		result <- pool.Add([]*types.Transaction{tx}, false)[0]
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("admission bypassed occupied signature slot: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("signature validations with no available slot: have %d want 0", delta)
+	}
+
+	<-slots
+	slotHeld = false
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("admission after signature slot release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission did not resume after signature slot release")
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 1 {
+		t.Fatalf("signature validations after slot release: have %d want 1", delta)
 	}
 }
 
