@@ -1711,11 +1711,58 @@ func TestFramePoolRejectsInsufficientKeyedNonceSurchargeGas(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	ftx := baseFTX(sender, 0, config)
-	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
-	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 10_000}}
+	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1), uint256.NewInt(2)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 30_000}}
+	verifyBefore := verifyRunMeter.Snapshot().Count()
 	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
-	if err == nil || !strings.Contains(err.Error(), "need 20000") {
+	if err == nil || !strings.Contains(err.Error(), "need at least 40000") {
 		t.Fatalf("keyed nonce surcharge error = %v", err)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY runs before keyed nonce gas-limit rejection: have %d want 0", delta)
+	}
+}
+
+func TestFramePoolChecksKeyedNonceSurchargeAgainstPayFrame(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.NonceKeys = []*uint256.Int{uint256.NewInt(1)}
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &payer, GasLimit: 10_000},
+	}
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+	if err == nil || !strings.Contains(err.Error(), "payment VERIFY frame 1") {
+		t.Fatalf("keyed nonce pay-frame surcharge error = %v", err)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY runs before pay-frame surcharge rejection: have %d want 0", delta)
+	}
+}
+
+func TestFramePoolSkipsFirstUseSurchargeForInitializedKey(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	key := uint256.NewInt(1)
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.SetState(params.NonceManagerAddress, types.NonceManagerSlot(sender, key), common.BigToHash(big.NewInt(1)))
+
+	ftx := baseFTX(sender, 1, config)
+	ftx.NonceKeys = []*uint256.Int{key}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 10_000}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
+		t.Fatalf("initialized keyed nonce rejected: %v", err)
 	}
 }
 

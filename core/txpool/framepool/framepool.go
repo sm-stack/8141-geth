@@ -960,22 +960,32 @@ func validateFrameBlobProofs(tx *types.Transaction) ([]kzg4844.Cell, error) {
 }
 
 func validateFrameNonce(tx *types.FrameTx, statedb *state.StateDB) error {
+	_, err := validateFrameNonceAndCountFirstUse(tx, statedb)
+	return err
+}
+
+func validateFrameNonceAndCountFirstUse(tx *types.FrameTx, statedb *state.StateDB) (uint64, error) {
 	want := new(big.Int).SetUint64(tx.NonceSeq)
+	var firstUse uint64
 	for _, key := range tx.NonceKeys {
 		var have *big.Int
 		if key.IsZero() {
 			have = new(big.Int).SetUint64(statedb.GetNonce(tx.Sender))
 		} else {
-			have = statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(tx.Sender, key)).Big()
+			value := statedb.GetState(params.NonceManagerAddress, types.NonceManagerSlot(tx.Sender, key))
+			have = value.Big()
+			if value == (common.Hash{}) {
+				firstUse++
+			}
 		}
 		switch have.Cmp(want) {
 		case -1:
-			return fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooHigh, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
+			return 0, fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooHigh, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
 		case 1:
-			return fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooLow, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
+			return 0, fmt.Errorf("%w: sender %s nonce key %x tx sequence %d state sequence %s", core.ErrNonceTooLow, tx.Sender.Hex(), key.Bytes32(), tx.NonceSeq, have)
 		}
 	}
-	return nil
+	return firstUse, nil
 }
 
 func (p *FramePool) validateRecentRootReferences(tx *types.FrameTx, statedb *state.StateDB, head *types.Header) error {
@@ -1042,7 +1052,11 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 		}
 		return check, fmt.Errorf("%w: payer %s code hash changed since transaction admission", core.ErrFrameTxInvalid, staleCode.payer)
 	}
-	if err := validateFrameNonce(frameTx, p.currentState); err != nil {
+	firstUse, err := validateFrameNonceAndCountFirstUse(frameTx, p.currentState)
+	if err != nil {
+		return check, err
+	}
+	if err := validateNonceSurchargeGasLimit(frameTx, plan, firstUse); err != nil {
 		return check, err
 	}
 	if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
@@ -1764,6 +1778,21 @@ func (p *FramePool) validateNonceSurcharge(frameTx *types.FrameTx, gasRemaining 
 	required := firstUse * params.KeyedNonceFirstUseGas
 	if gasRemaining < required {
 		return fmt.Errorf("payment VERIFY frame has %d gas remaining, need %d for keyed nonce first use", gasRemaining, required)
+	}
+	return nil
+}
+
+func validateNonceSurchargeGasLimit(frameTx *types.FrameTx, plan validationPrefixPlan, firstUse uint64) error {
+	if frameTx.UsesLegacyNonce() || firstUse == 0 {
+		return nil
+	}
+	index := plan.senderVerifyIndex
+	if plan.payVerifyIndex >= 0 {
+		index = plan.payVerifyIndex
+	}
+	required := firstUse * params.KeyedNonceFirstUseGas
+	if gasLimit := frameTx.Frames[index].GasLimit; gasLimit < required {
+		return fmt.Errorf("payment VERIFY frame %d has gas limit %d, need at least %d for keyed nonce first use", index, gasLimit, required)
 	}
 	return nil
 }
