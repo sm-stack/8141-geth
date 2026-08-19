@@ -149,6 +149,40 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	}
 }
 
+func TestEOADefaultCodeDoesNotFollowEmptyDelegation(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	delegate := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, types.AddressToDelegation(delegate), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(delegate)
+
+	ftx := &types.FrameTx{
+		ChainID:    uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		Sender:     sender,
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 100000}},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	addEOADefaultSignature(ftx, config.ChainID, key)
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	if _, err := applyFrameTx(evm, config, msg); err == nil {
+		t.Fatal("delegation to empty code used EOA default code")
+	}
+	if got := statedb.GetNonce(sender); got != 0 {
+		t.Fatalf("failed delegated transaction changed sender nonce: got %d, want 0", got)
+	}
+}
+
 // TestEOADefaultCodeWrongSigner tests that an ECDSA signature from a different key fails.
 func TestEOADefaultCodeWrongSigner(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()

@@ -1804,6 +1804,36 @@ func TestFramePoolNonCanonicalPaymasterPendingLimit(t *testing.T) {
 	}
 }
 
+func TestFramePoolDefaultCodeDoesNotFollowEmptyPayerDelegation(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	payerKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := crypto.PubkeyToAddress(payerKey.PublicKey)
+	delegate := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, types.AddressToDelegation(delegate), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(payer, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(delegate)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &payer, GasLimit: 40_000},
+	}
+	addFramePoolDefaultCodeSponsorSignatures(ftx, config.ChainID, payerKey)
+	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err == nil {
+		t.Fatal("frame pool accepted default-code payment through an empty delegation target")
+	}
+	if pending, _ := pool.Stats(); pending != 0 {
+		t.Fatalf("pending transactions after rejected delegated payer: have %d want 0", pending)
+	}
+}
+
 func TestFramePoolDefaultCodeSponsorAllowsMultiplePending(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	key, err := crypto.GenerateKey()

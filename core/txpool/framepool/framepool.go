@@ -2175,17 +2175,10 @@ func sortResetTransactions(txs []*types.Transaction, oldMeta map[common.Hash]fra
 	})
 }
 
-// hasNoCode returns true if the given address has no code (is an EOA).
-// It follows EIP-7702 delegation designators to check the delegated code.
+// hasNoCode returns true if the address uses frame default code. An EIP-7702
+// delegation designator is code, even when its delegated target has no code.
 func hasNoCode(statedb *state.StateDB, addr common.Address) bool {
-	code := statedb.GetCode(addr)
-	if len(code) == 0 {
-		return true
-	}
-	if target, ok := types.ParseDelegation(code); ok {
-		return len(statedb.GetCode(target)) == 0
-	}
-	return false
+	return len(statedb.GetCode(addr)) == 0
 }
 
 // verifyFailureClass is a stable classification of post-execution VERIFY outcomes.

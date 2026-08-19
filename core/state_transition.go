@@ -1805,19 +1805,10 @@ func (st *stateTransition) consumeFrameNonce(remaining *vm.GasBudget) (uint64, *
 	return gas, nil, writes, nil
 }
 
-// hasNoCode returns true if the given address has no code (is an EOA).
-// It follows EIP-7702 delegation designators to check the delegated code.
+// hasNoCode returns true if the address uses frame default code. An EIP-7702
+// delegation designator is code, even when its delegated target has no code.
 func (st *stateTransition) hasNoCode(addr common.Address) bool {
-	code := st.state.GetCode(addr)
-	if len(code) == 0 {
-		return true
-	}
-	// Follow EIP-7702 delegation: if the code is a delegation designator,
-	// resolve the target and check if *that* has code.
-	if target, ok := types.ParseDelegation(code); ok {
-		return len(st.state.GetCode(target)) == 0
-	}
-	return false
+	return len(st.state.GetCode(addr)) == 0
 }
 
 // framePayerMaxCost calculates the amount collected when a frame approves
