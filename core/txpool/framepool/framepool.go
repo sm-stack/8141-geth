@@ -1001,6 +1001,20 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if frameTx == nil {
 		return check, fmt.Errorf("not a frame transaction")
 	}
+	if err := validateFrameOrdering(frameTx.Frames, frameTx.Sender); err != nil {
+		return check, err
+	}
+	plan, err := buildValidationPrefixPlan(frameTx)
+	if err != nil {
+		return check, err
+	}
+	signatureGas, err := frameTx.SignatureGas()
+	if err != nil {
+		return check, err
+	}
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
+		return check, err
+	}
 	if p.all[tx.Hash()] != nil {
 		return check, txpool.ErrAlreadyKnown
 	}
@@ -1040,12 +1054,8 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 			return check, fmt.Errorf("%w: frame pool full", txpool.ErrUnderpriced)
 		}
 	}
-	if err := validateFrameOrdering(frameTx.Frames, sender); err != nil {
-		return check, err
-	}
 	simulationTime := p.currentHead.Time + params.SecondsPerSlot
-	plan, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime)
-	if err != nil {
+	if err := validateValidationPrefixState(frameTx, plan, p.currentState, simulationTime); err != nil {
 		return check, err
 	}
 	accountingReplacement := check.replacement
@@ -1392,7 +1402,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if err != nil {
 		return frameTxMeta{}, verifyResult{}, err
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, false, p.verifyGasCap); err != nil {
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
 		return frameTxMeta{}, verifyResult{}, err
 	}
 	// Validation views are caller-owned. Reuse their StateDB read caches across
@@ -1482,9 +1492,6 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if plan.payVerifyIndex < 0 {
 		return frameTxMeta{}, senderResult, fmt.Errorf("execution-only validation prefix missing payment VERIFY frame")
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
-		return frameTxMeta{}, senderResult, err
-	}
 	payTarget := resolveFrameTarget(frameTx.Sender, frameTx.Frames[plan.payVerifyIndex])
 	meta := p.classifyPayer(frameTx.Sender, payTarget)
 	payResult, err := p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !meta.canonicalPaymaster)
@@ -1514,17 +1521,28 @@ type validationPrefixPlan struct {
 }
 
 func (p *FramePool) validationPrefixPlan(frameTx *types.FrameTx, statedb *state.StateDB, timestamp uint64) (validationPrefixPlan, error) {
+	plan, err := buildValidationPrefixPlan(frameTx)
+	if err != nil {
+		return plan, err
+	}
+	if err := validateValidationPrefixState(frameTx, plan, statedb, timestamp); err != nil {
+		return plan, err
+	}
+	return plan, nil
+}
+
+func buildValidationPrefixPlan(frameTx *types.FrameTx) (validationPrefixPlan, error) {
 	plan := validationPrefixPlan{
 		expiryIndex:       -1,
 		deployIndex:       -1,
 		senderVerifyIndex: -1,
 		payVerifyIndex:    -1,
 	}
+	if len(frameTx.Frames) == 0 {
+		return plan, fmt.Errorf("no frames in transaction")
+	}
 	start := 0
 	if frame := frameTx.Frames[0]; types.IsFrameExpiryVerifier(frame, resolveFrameTarget(frameTx.Sender, frame)) {
-		if err := validateExpiryVerifierFrame(statedb, 0, frame, resolveFrameTarget(frameTx.Sender, frame), timestamp); err != nil {
-			return plan, err
-		}
 		plan.expiryIndex = 0
 		start = 1
 	}
@@ -1581,6 +1599,15 @@ func (p *FramePool) validationPrefixPlan(frameTx *types.FrameTx, statedb *state.
 		}
 	}
 	return plan, nil
+}
+
+func validateValidationPrefixState(frameTx *types.FrameTx, plan validationPrefixPlan, statedb *state.StateDB, timestamp uint64) error {
+	if plan.expiryIndex < 0 {
+		return nil
+	}
+	frame := frameTx.Frames[plan.expiryIndex]
+	target := resolveFrameTarget(frameTx.Sender, frame)
+	return validateExpiryVerifierFrame(statedb, plan.expiryIndex, frame, target, timestamp)
 }
 
 func validateExpiryVerifierFrame(statedb *state.StateDB, index int, frame types.Frame, target common.Address, timestamp uint64) error {

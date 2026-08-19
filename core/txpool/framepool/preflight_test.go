@@ -250,12 +250,13 @@ func TestPayerSolvencyPreflightSelfPayerAdmissionAB(t *testing.T) {
 	}
 }
 
-func TestPayerSolvencyPreflightDefersMalformedNoPayPrefix(t *testing.T) {
+func TestAdmissionRejectsMalformedPrefixBeforeStateChecks(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	pool.payerSolvencyPreflight = true
 	sender := common.HexToAddress("0x7777777777777777777777777777777777777777")
 	statedb.CreateAccount(sender)
 	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetNonce(sender, 1, tracing.NonceChangeUnspecified)
 
 	frameTx := baseFTX(sender, 0, config)
 	frameTx.Frames = []types.Frame{{
@@ -275,6 +276,9 @@ func TestPayerSolvencyPreflightDefersMalformedNoPayPrefix(t *testing.T) {
 	}
 	if errors.Is(err, core.ErrInsufficientFunds) {
 		t.Fatalf("malformed no-pay prefix was incorrectly rejected by solvency preflight: %v", err)
+	}
+	if errors.Is(err, core.ErrNonceTooLow) {
+		t.Fatalf("malformed no-pay prefix reached sender state validation: %v", err)
 	}
 	if delta := preflightRunMeter.Snapshot().Count() - runBefore; delta != 0 {
 		t.Fatalf("malformed no-pay preflight runs: have %d want 0", delta)

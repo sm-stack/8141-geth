@@ -1175,9 +1175,76 @@ func TestFramePoolSignatureGasCountsAgainstVerifyBudget(t *testing.T) {
 	}
 	addFramePoolEOASignature(ftx, config.ChainID, key)
 
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	verifyBefore := verifyRunMeter.Snapshot().Count()
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] == nil {
 		t.Fatal("expected rejection when signature gas pushes validation prefix above MAX_VERIFY_GAS")
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("protocol signature validations before prefix gas rejection: have %d want 0", delta)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY runs before prefix gas rejection: have %d want 0", delta)
+	}
+}
+
+func TestFramePoolRejectsVerifyStateGasBeforeCryptographicValidation(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Signatures = []types.TxSignature{{
+		Scheme:    types.SignatureSchemeSecp256k1,
+		Signer:    sender,
+		Signature: make([]byte, 65),
+	}}
+	ftx.Frames = []types.Frame{{
+		Mode:          types.FrameModeVerify,
+		Flags:         types.FrameFlagApproveExecution | types.FrameFlagApprovePayment,
+		GasLimit:      40_000,
+		StateGasLimit: params.FrameTxMaxVerifyStateGas + 1,
+	}}
+
+	signatureBefore := signatureRunMeter.Snapshot().Count()
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+	if err == nil || !strings.Contains(err.Error(), "validation prefix state gas") {
+		t.Fatalf("validation prefix state-gas error: have %v", err)
+	}
+	if delta := signatureRunMeter.Snapshot().Count() - signatureBefore; delta != 0 {
+		t.Fatalf("protocol signature validations before state-gas rejection: have %d want 0", delta)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY runs before state-gas rejection: have %d want 0", delta)
+	}
+}
+
+func TestFramePoolCountsPayFrameInUpfrontVerifyBudget(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveExecution, GasLimit: 40_000},
+		{Mode: types.FrameModeVerify, Flags: types.FrameFlagApprovePayment, Target: &payer, GasLimit: PublicMaxVerifyGas - 40_000 + 1},
+	}
+
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
+	if err == nil || !strings.Contains(err.Error(), "validation prefix gas") {
+		t.Fatalf("split validation prefix gas error: have %v", err)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("VERIFY runs before complete prefix gas rejection: have %d want 0", delta)
 	}
 }
 
