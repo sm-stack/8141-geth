@@ -69,7 +69,7 @@ const (
 
 	// maxResetValidationWorkers bounds the StateDB copies and EVMs used to
 	// prepare reset validation. Pool accounting is committed separately.
-	maxResetValidationWorkers = 4
+	maxResetValidationWorkers = 8
 
 	// maxSignatureValidationWorkers bounds admission-time cryptographic work
 	// performed concurrently outside the serialized state-validation path.
