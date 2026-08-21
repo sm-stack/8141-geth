@@ -46,16 +46,16 @@ import (
 )
 
 const (
-	// maxFrameTxsPerAccount is the EIP-8141 public-mempool sender limit.
-	maxFrameTxsPerAccount = 1
+	// PublicMaxPendingPerSender is the EIP-8141 public-mempool sender limit.
+	PublicMaxPendingPerSender = 1
 
-	// maxPendingTxsUsingNonCanonicalPaymaster limits pooled transactions per
-	// non-canonical paymaster.
-	maxPendingTxsUsingNonCanonicalPaymaster = 1
+	// PublicMaxPendingPerNonCanonicalPaymaster is the EIP-8141 public-mempool
+	// limit for transactions sharing a non-canonical paymaster.
+	PublicMaxPendingPerNonCanonicalPaymaster = 1
 
-	// maxFramePoolSize limits total pooled frame transactions. The experimental
+	// defaultMaxFramePoolSize limits total pooled frame transactions. The experimental
 	// capacity matches the legacy pool's default executable-slot count.
-	maxFramePoolSize = 5120
+	defaultMaxFramePoolSize = 5120
 
 	// PublicMaxVerifyGas is the fixed EIP-8141 public-mempool validation budget.
 	PublicMaxVerifyGas uint64 = 100_000
@@ -67,31 +67,61 @@ const (
 	// txMaxSize is the maximum frame transaction size.
 	txMaxSize uint64 = 512 * 1024
 
-	// maxResetValidationWorkers bounds the StateDB copies and EVMs used to
-	// prepare reset validation. Pool accounting is committed separately.
-	maxResetValidationWorkers = 8
+	// defaultResetValidationWorkerLimit bounds the StateDB copies and EVMs used
+	// by default to prepare reset validation. Pool accounting is committed separately.
+	defaultResetValidationWorkerLimit = 8
 
 	// maxSignatureValidationWorkers bounds admission-time cryptographic work
 	// performed concurrently outside the serialized state-validation path.
 	maxSignatureValidationWorkers = 4
 )
 
-// Config configures frame transaction validation policy. Values above
-// PublicMaxVerifyGas are only permitted on isolated nodes with no peers.
+// Config configures frame transaction validation and resource policy.
 type Config struct {
-	MaxVerifyGas               uint64
-	PayerSolvencyPreflight     bool
-	PayerCodeIdentityPreflight bool
-	SelectiveRevalidation      bool
+	MaxVerifyGas                       uint64
+	MaxPendingPerSender                int
+	MaxPendingPerNonCanonicalPaymaster int
+	MaxPoolSize                        int
+	ResetValidationWorkers             int
+	PayerSolvencyPreflight             bool
+	PayerCodeIdentityPreflight         bool
+	SelectiveRevalidation              bool
+	AllowUnsafeBenchmarkPolicy         bool `toml:"-"`
 }
 
 // DefaultConfig follows the EIP-8141 public-mempool constants. Cheap payer
 // checks run before protocol signatures and validation-prefix execution.
 var DefaultConfig = Config{
-	MaxVerifyGas:               maxVerifyGas,
-	PayerSolvencyPreflight:     true,
-	PayerCodeIdentityPreflight: true,
-	SelectiveRevalidation:      true,
+	MaxVerifyGas:                       maxVerifyGas,
+	MaxPendingPerSender:                PublicMaxPendingPerSender,
+	MaxPendingPerNonCanonicalPaymaster: PublicMaxPendingPerNonCanonicalPaymaster,
+	MaxPoolSize:                        defaultMaxFramePoolSize,
+	ResetValidationWorkers:             defaultResetValidationWorkers(),
+	PayerSolvencyPreflight:             true,
+	PayerCodeIdentityPreflight:         true,
+	SelectiveRevalidation:              true,
+}
+
+// Sanitized returns a configuration with non-positive numeric values replaced
+// by the package defaults. Zero values make partial programmatic configurations
+// retain the public-mempool policy.
+func (config Config) Sanitized() Config {
+	if config.MaxVerifyGas == 0 {
+		config.MaxVerifyGas = maxVerifyGas
+	}
+	if config.MaxPendingPerSender <= 0 {
+		config.MaxPendingPerSender = PublicMaxPendingPerSender
+	}
+	if config.MaxPendingPerNonCanonicalPaymaster <= 0 {
+		config.MaxPendingPerNonCanonicalPaymaster = PublicMaxPendingPerNonCanonicalPaymaster
+	}
+	if config.MaxPoolSize <= 0 {
+		config.MaxPoolSize = defaultMaxFramePoolSize
+	}
+	if config.ResetValidationWorkers <= 0 {
+		config.ResetValidationWorkers = defaultResetValidationWorkers()
+	}
+	return config
 }
 
 var (
@@ -111,6 +141,12 @@ type BlockChain interface {
 	StateAt(header *types.Header) (*state.StateDB, error)
 }
 
+type framePoolLimits struct {
+	maxPendingPerSender                int
+	maxPendingPerNonCanonicalPaymaster int
+	maxPoolSize                        int
+}
+
 // FramePool is a transaction pool for EIP-8141 frame transactions.
 // It validates VERIFY frames by simulating the EIP-8141 public-mempool
 // validation prefix before accepting transactions into the pool.
@@ -124,6 +160,7 @@ type FramePool struct {
 	currentState               *state.StateDB
 	slotProvider               func(*types.Header) vm.SlotProvider
 	verifyGasCap               uint64
+	limits                     framePoolLimits
 	payerSolvencyPreflight     bool
 	payerCodeIdentityPreflight bool
 	selectiveRevalidation      bool
@@ -136,7 +173,7 @@ type FramePool struct {
 	admissionValidationState *state.StateDB // reusable current-head view, guarded by validationMu
 	signatureValidationSlots chan struct{}
 	mu                       sync.RWMutex
-	pending                  map[common.Address][]*types.Transaction // sender → txs (up to maxFrameTxsPerAccount)
+	pending                  map[common.Address][]*types.Transaction // sender → txs
 	all                      map[common.Hash]*types.Transaction      // hash → tx
 	meta                     map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
 	dependencyIndex          *validationDependencyIndex              // mutable validation dependency → transaction hashes
@@ -254,18 +291,21 @@ func New(chain BlockChain) *FramePool {
 
 // NewWithConfig creates a frame transaction pool with explicit policy settings.
 func NewWithConfig(config Config, chain BlockChain) *FramePool {
-	if config.MaxVerifyGas == 0 {
-		config.MaxVerifyGas = maxVerifyGas
-	}
+	config = config.Sanitized()
 	return &FramePool{
-		chain:                      chain,
-		chainconfig:                chain.Config(),
-		signer:                     types.LatestSigner(chain.Config()),
-		verifyGasCap:               config.MaxVerifyGas,
+		chain:        chain,
+		chainconfig:  chain.Config(),
+		signer:       types.LatestSigner(chain.Config()),
+		verifyGasCap: config.MaxVerifyGas,
+		limits: framePoolLimits{
+			maxPendingPerSender:                config.MaxPendingPerSender,
+			maxPendingPerNonCanonicalPaymaster: config.MaxPendingPerNonCanonicalPaymaster,
+			maxPoolSize:                        config.MaxPoolSize,
+		},
 		payerSolvencyPreflight:     config.PayerSolvencyPreflight,
 		payerCodeIdentityPreflight: config.PayerCodeIdentityPreflight,
 		selectiveRevalidation:      config.SelectiveRevalidation,
-		resetValidationWorkers:     defaultResetValidationWorkers(),
+		resetValidationWorkers:     config.ResetValidationWorkers,
 		signatureValidationSlots:   make(chan struct{}, defaultSignatureValidationWorkers()),
 		canonicalPaymasters:        make(map[common.Hash]common.Hash),
 		pending:                    make(map[common.Address][]*types.Transaction),
@@ -394,6 +434,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		currentState:               statedb,
 		slotProvider:               p.slotProvider,
 		verifyGasCap:               p.verifyGasCap,
+		limits:                     p.limits,
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
 		selectiveRevalidation:      p.selectiveRevalidation,
@@ -570,7 +611,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 	for _, validation := range validations {
 		tx := validation.tx
 		sender := tx.GetFrameTx().Sender
-		if validation.err != nil || len(p.pending[sender]) >= maxFrameTxsPerAccount {
+		if validation.err != nil || len(p.pending[sender]) >= p.limits.maxPendingPerSender || len(p.all) >= p.limits.maxPoolSize {
 			continue
 		}
 		if validation.class == resetAccountingOnly {
@@ -599,7 +640,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 }
 
 func defaultResetValidationWorkers() int {
-	return min(max(runtime.GOMAXPROCS(0), 1), maxResetValidationWorkers)
+	return min(max(runtime.GOMAXPROCS(0), 1), defaultResetValidationWorkerLimit)
 }
 
 func defaultSignatureValidationWorkers() int {
@@ -1103,11 +1144,11 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 			if !isFrameTxPriceBumped(tx, check.replacement) {
 				return check, txpool.ErrReplaceUnderpriced
 			}
-		} else if len(txs) >= maxFrameTxsPerAccount {
+		} else if len(txs) >= p.limits.maxPendingPerSender {
 			return check, fmt.Errorf("%w: sender %s has %d pending frame transactions", txpool.ErrAccountLimitExceeded, sender.Hex(), len(txs))
 		}
 	}
-	if check.replacement == nil && len(p.all) >= maxFramePoolSize {
+	if check.replacement == nil && len(p.all) >= p.limits.maxPoolSize {
 		check.eviction = p.lowestPricedTransaction()
 		if check.eviction == nil || !isFrameTxPriceBumped(tx, check.eviction) {
 			return check, fmt.Errorf("%w: frame pool full", txpool.ErrUnderpriced)
@@ -1315,6 +1356,7 @@ func (p *FramePool) validationViewWithStateLocked(statedb *state.StateDB) *Frame
 		currentState:               statedb,
 		slotProvider:               p.slotProvider,
 		verifyGasCap:               p.verifyGasCap,
+		limits:                     p.limits,
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
 		selectiveRevalidation:      p.selectiveRevalidation,
@@ -2263,7 +2305,7 @@ func (p *FramePool) rejectChangedPayerCode(hash common.Hash, meta frameTxMeta) b
 		return false
 	}
 	payerCodeIdentityRejectMeter.Mark(1)
-	if len(p.stalePayerCode) >= maxFramePoolSize {
+	if len(p.stalePayerCode) >= p.limits.maxPoolSize {
 		for staleHash := range p.stalePayerCode {
 			delete(p.stalePayerCode, staleHash)
 			break
@@ -2480,7 +2522,7 @@ func (p *FramePool) validateNonCanonicalPaymasterLimit(meta frameTxMeta, replace
 		return nil
 	}
 	pending := p.nonCanonicalPendingExcluding(meta.payer, replacement)
-	if pending >= maxPendingTxsUsingNonCanonicalPaymaster {
+	if pending >= p.limits.maxPendingPerNonCanonicalPaymaster {
 		return fmt.Errorf("%w: non-canonical paymaster %s has %d pending frame txs", txpool.ErrAccountLimitExceeded, meta.payer.Hex(), pending)
 	}
 	return nil

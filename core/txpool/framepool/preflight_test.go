@@ -519,7 +519,7 @@ func TestNonCanonicalPendingCapPreflightExcludesEviction(t *testing.T) {
 	if err := fixture.pool.Add([]*types.Transaction{firstTx}, false)[0]; err != nil {
 		t.Fatalf("initial non-canonical payer transaction rejected: %v", err)
 	}
-	for i := 1; i < maxFramePoolSize; i++ {
+	for i := 1; i < fixture.pool.limits.maxPoolSize; i++ {
 		dummyFrameTx := baseFTX(common.BigToAddress(big.NewInt(int64(i+100))), uint64(i), fixture.config)
 		dummyFrameTx.GasTipCap = uint256.NewInt(10)
 		dummyFrameTx.GasFeeCap = uint256.NewInt(uint64(params.InitialBaseFee) * 10)

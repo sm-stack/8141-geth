@@ -11,26 +11,50 @@ package eth
 import (
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/txpool/framepool"
 	"github.com/ethereum/go-ethereum/p2p"
-	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 func TestValidateFramePoolNetworkPolicy(t *testing.T) {
 	networked := p2p.Config{MaxPeers: 50, ListenAddr: ":30303", DiscoveryV4: true}
-	if err := validateFramePoolNetworkPolicy(framepool.PublicMaxVerifyGas, networked); err != nil {
+	if err := validateFramePoolNetworkPolicy(framepool.DefaultConfig, 1, params.MainnetGenesisHash, networked, []string{"enrtree://mainnet"}, nil); err != nil {
 		t.Fatalf("public validation limit must be accepted on networked nodes: %v", err)
 	}
-	if err := validateFramePoolNetworkPolicy(framepool.PublicMaxVerifyGas+1, networked); err == nil {
-		t.Fatal("networked node accepted a private validation override")
+	for _, mutate := range []func(*framepool.Config){
+		func(config *framepool.Config) { config.MaxVerifyGas++ },
+		func(config *framepool.Config) { config.MaxPendingPerSender++ },
+		func(config *framepool.Config) { config.MaxPendingPerNonCanonicalPaymaster++ },
+	} {
+		config := framepool.DefaultConfig
+		mutate(&config)
+		if err := validateFramePoolNetworkPolicy(config, 1337, common.Hash{}, p2p.Config{NoDiscovery: true}, nil, nil); err == nil {
+			t.Fatal("raised policy was accepted without the benchmark override")
+		}
 	}
-	isolated := p2p.Config{MaxPeers: 0, NoDial: true, NoDiscovery: true}
-	if err := validateFramePoolNetworkPolicy(500_000, isolated); err != nil {
-		t.Fatalf("isolated private node must allow an explicit PoC validation limit: %v", err)
+
+	unsafe := framepool.DefaultConfig
+	unsafe.MaxVerifyGas = 500_000
+	unsafe.MaxPendingPerSender = 8
+	unsafe.MaxPendingPerNonCanonicalPaymaster = 16
+	unsafe.AllowUnsafeBenchmarkPolicy = true
+	// NoDiscovery is authoritative even though the protocol-specific defaults
+	// remain true when --nodiscover is applied.
+	private := p2p.Config{MaxPeers: 50, ListenAddr: ":30303", NoDiscovery: true, DiscoveryV4: true, DiscoveryV5: true}
+	if err := validateFramePoolNetworkPolicy(unsafe, 1337, common.Hash{}, private, nil, nil); err != nil {
+		t.Fatalf("private no-discovery benchmark network rejected: %v", err)
 	}
-	trusted := isolated
-	trusted.TrustedNodes = []*enode.Node{new(enode.Node)}
-	if err := validateFramePoolNetworkPolicy(1_000_001, trusted); err == nil {
-		t.Fatal("a node with trusted peers must not use the private validation override")
+	if err := validateFramePoolNetworkPolicy(unsafe, 1, common.Hash{}, private, nil, nil); err == nil {
+		t.Fatal("mainnet network ID accepted an unsafe benchmark policy")
+	}
+	if err := validateFramePoolNetworkPolicy(unsafe, 1337, params.MainnetGenesisHash, private, nil, nil); err == nil {
+		t.Fatal("mainnet genesis accepted an unsafe benchmark policy")
+	}
+	if err := validateFramePoolNetworkPolicy(unsafe, 1337, common.Hash{}, networked, nil, nil); err == nil {
+		t.Fatal("discovery-enabled P2P accepted an unsafe benchmark policy")
+	}
+	if err := validateFramePoolNetworkPolicy(unsafe, 1337, common.Hash{}, private, []string{"enrtree://benchmark"}, nil); err == nil {
+		t.Fatal("DNS discovery accepted an unsafe benchmark policy")
 	}
 }

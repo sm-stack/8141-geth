@@ -480,8 +480,37 @@ var (
 	}
 	FramePoolMaxVerifyGasFlag = &cli.Uint64Flag{
 		Name:     "framepool.maxverifygas",
-		Usage:    "Maximum frame transaction validation gas (values above 100000 require fully disabled P2P, as in --dev)",
+		Usage:    "Maximum frame transaction validation gas",
 		Value:    ethconfig.Defaults.FramePool.MaxVerifyGas,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolMaxPendingPerSenderFlag = &cli.IntFlag{
+		Name:     "framepool.maxpendingpersender",
+		Usage:    "Maximum number of pending frame transactions per sender (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.MaxPendingPerSender,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolMaxPendingPerNonCanonicalPaymasterFlag = &cli.IntFlag{
+		Name:     "framepool.maxpendingpernoncanonicalpaymaster",
+		Usage:    "Maximum number of pending frame transactions per non-canonical paymaster (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.MaxPendingPerNonCanonicalPaymaster,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolMaxSizeFlag = &cli.IntFlag{
+		Name:     "framepool.maxsize",
+		Usage:    "Maximum number of transactions in the frame pool (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.MaxPoolSize,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolResetWorkersFlag = &cli.IntFlag{
+		Name:     "framepool.resetworkers",
+		Usage:    "Maximum number of concurrent frame validation workers during reset (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.ResetValidationWorkers,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolAllowUnsafeBenchmarkPolicyFlag = &cli.BoolFlag{
+		Name:     "framepool.allow-unsafe-benchmark-policy",
+		Usage:    "Allow raised framepool public-policy limits on an isolated non-mainnet benchmark network",
 		Category: flags.TxPoolCategory,
 	}
 	FramePoolPayerSolvencyPreflightFlag = &cli.BoolFlag{
@@ -1785,6 +1814,37 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setTxPool(ctx, &cfg.TxPool)
 	if ctx.IsSet(FramePoolMaxVerifyGasFlag.Name) {
 		cfg.FramePool.MaxVerifyGas = ctx.Uint64(FramePoolMaxVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolMaxPendingPerSenderFlag.Name) {
+		value := ctx.Int(FramePoolMaxPendingPerSenderFlag.Name)
+		if value < 0 {
+			Fatalf("--%s must not be negative", FramePoolMaxPendingPerSenderFlag.Name)
+		}
+		cfg.FramePool.MaxPendingPerSender = value
+	}
+	if ctx.IsSet(FramePoolMaxPendingPerNonCanonicalPaymasterFlag.Name) {
+		value := ctx.Int(FramePoolMaxPendingPerNonCanonicalPaymasterFlag.Name)
+		if value < 0 {
+			Fatalf("--%s must not be negative", FramePoolMaxPendingPerNonCanonicalPaymasterFlag.Name)
+		}
+		cfg.FramePool.MaxPendingPerNonCanonicalPaymaster = value
+	}
+	if ctx.IsSet(FramePoolMaxSizeFlag.Name) {
+		value := ctx.Int(FramePoolMaxSizeFlag.Name)
+		if value < 0 {
+			Fatalf("--%s must not be negative", FramePoolMaxSizeFlag.Name)
+		}
+		cfg.FramePool.MaxPoolSize = value
+	}
+	if ctx.IsSet(FramePoolResetWorkersFlag.Name) {
+		value := ctx.Int(FramePoolResetWorkersFlag.Name)
+		if value < 0 {
+			Fatalf("--%s must not be negative", FramePoolResetWorkersFlag.Name)
+		}
+		cfg.FramePool.ResetValidationWorkers = value
+	}
+	if ctx.IsSet(FramePoolAllowUnsafeBenchmarkPolicyFlag.Name) {
+		cfg.FramePool.AllowUnsafeBenchmarkPolicy = ctx.Bool(FramePoolAllowUnsafeBenchmarkPolicyFlag.Name)
 	}
 	if ctx.IsSet(FramePoolPayerSolvencyPreflightFlag.Name) {
 		cfg.FramePool.PayerSolvencyPreflight = ctx.Bool(FramePoolPayerSolvencyPreflightFlag.Name)

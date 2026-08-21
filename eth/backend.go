@@ -140,14 +140,12 @@ type Ethereum struct {
 // whose lifecycle will be managed by the provided node.
 func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	// Ensure configuration values are compatible and sane
+	config.FramePool = config.FramePool.Sanitized()
 	if !config.SyncMode.IsValid() {
 		return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
 	}
 	if !config.HistoryMode.IsValid() {
 		return nil, fmt.Errorf("invalid history mode %d", config.HistoryMode)
-	}
-	if err := validateFramePoolNetworkPolicy(config.FramePool.MaxVerifyGas, stack.Config().P2P); err != nil {
-		return nil, err
 	}
 	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Sign() <= 0 {
 		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
@@ -200,6 +198,20 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	networkID := config.NetworkId
 	if networkID == 0 {
 		networkID = chainConfig.ChainID.Uint64()
+	}
+	if err := validateFramePoolNetworkPolicy(config.FramePool, networkID, genesisHash, stack.Config().P2P, config.EthDiscoveryURLs, config.SnapDiscoveryURLs); err != nil {
+		return nil, err
+	}
+	if raised := raisedFramePoolPolicy(config.FramePool); len(raised) > 0 {
+		log.Warn("Enabling unsafe framepool benchmark policy",
+			"network", networkID,
+			"raised", raised,
+			"maxVerifyGas", config.FramePool.MaxVerifyGas,
+			"maxPendingPerSender", config.FramePool.MaxPendingPerSender,
+			"maxPendingPerNonCanonicalPaymaster", config.FramePool.MaxPendingPerNonCanonicalPaymaster,
+			"maxPoolSize", config.FramePool.MaxPoolSize,
+			"resetValidationWorkers", config.FramePool.ResetValidationWorkers,
+		)
 	}
 
 	// Assemble the Ethereum object.
@@ -397,17 +409,36 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	return eth, nil
 }
 
-func validateFramePoolNetworkPolicy(maxVerifyGas uint64, p2pConfig p2p.Config) error {
-	if maxVerifyGas <= framepool.PublicMaxVerifyGas {
+func validateFramePoolNetworkPolicy(config framepool.Config, networkID uint64, genesisHash common.Hash, p2pConfig p2p.Config, ethDiscoveryURLs, snapDiscoveryURLs []string) error {
+	raised := raisedFramePoolPolicy(config)
+	if len(raised) == 0 {
 		return nil
 	}
-	isolated := p2pConfig.MaxPeers == 0 && p2pConfig.NoDial && p2pConfig.NoDiscovery &&
-		p2pConfig.ListenAddr == "" && !p2pConfig.DiscoveryV4 && !p2pConfig.DiscoveryV5 &&
-		len(p2pConfig.StaticNodes) == 0 && len(p2pConfig.TrustedNodes) == 0
-	if !isolated {
-		return fmt.Errorf("framepool validation gas %d exceeds public limit %d without fully isolated P2P", maxVerifyGas, framepool.PublicMaxVerifyGas)
+	if !config.AllowUnsafeBenchmarkPolicy {
+		return fmt.Errorf("unsafe framepool benchmark policy %v requires --framepool.allow-unsafe-benchmark-policy", raised)
+	}
+	if networkID == 1 || genesisHash == params.MainnetGenesisHash {
+		return fmt.Errorf("unsafe framepool benchmark policy %v is not permitted on mainnet", raised)
+	}
+	discoveryEnabled := !p2pConfig.NoDiscovery || len(ethDiscoveryURLs) > 0 || len(snapDiscoveryURLs) > 0
+	if discoveryEnabled {
+		return fmt.Errorf("unsafe framepool benchmark policy %v requires all peer discovery to be disabled", raised)
 	}
 	return nil
+}
+
+func raisedFramePoolPolicy(config framepool.Config) []string {
+	var raised []string
+	if config.MaxVerifyGas > framepool.PublicMaxVerifyGas {
+		raised = append(raised, fmt.Sprintf("G=%d", config.MaxVerifyGas))
+	}
+	if config.MaxPendingPerSender > framepool.PublicMaxPendingPerSender {
+		raised = append(raised, fmt.Sprintf("S=%d", config.MaxPendingPerSender))
+	}
+	if config.MaxPendingPerNonCanonicalPaymaster > framepool.PublicMaxPendingPerNonCanonicalPaymaster {
+		raised = append(raised, fmt.Sprintf("P=%d", config.MaxPendingPerNonCanonicalPaymaster))
+	}
+	return raised
 }
 
 func makeExtraData(extra []byte) []byte {

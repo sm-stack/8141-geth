@@ -33,7 +33,7 @@ type payerCodeToggleFixture struct {
 
 func newPayerCodeToggleFixture(tb testing.TB, count int, codeIdentityPreflight bool) *payerCodeToggleFixture {
 	tb.Helper()
-	if count <= 0 || count > maxFramePoolSize {
+	if count <= 0 || count > DefaultConfig.MaxPoolSize {
 		tb.Fatalf("invalid fixture size %d", count)
 	}
 	pool, statedb, config := newTestEnv()

@@ -96,7 +96,7 @@ func massInvalidationCorpus(tb testing.TB, corpus string) ([]byte, []byte, uint6
 
 func newMassInvalidationFixture(tb testing.TB, corpus string, count int) *massInvalidationFixture {
 	tb.Helper()
-	if count <= 0 || count > maxFramePoolSize {
+	if count <= 0 || count > DefaultConfig.MaxPoolSize {
 		tb.Fatalf("invalid fixture size %d", count)
 	}
 	pool, statedb, config := newTestEnv()

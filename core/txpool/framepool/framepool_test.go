@@ -449,7 +449,7 @@ func TestFramePoolCachesBlobCells(t *testing.T) {
 
 func TestFramePoolFullSelectsLowestPricedEviction(t *testing.T) {
 	pool, statedb, config := newTestEnv()
-	for i := 0; i < maxFramePoolSize; i++ {
+	for i := 0; i < pool.limits.maxPoolSize; i++ {
 		sender := common.BigToAddress(big.NewInt(int64(i + 1)))
 		ftx := baseFTX(sender, 0, config)
 		ftx.GasTipCap = uint256.NewInt(uint64(i + 1))
@@ -494,7 +494,7 @@ func TestFramePoolFullSelectsLowestPricedEviction(t *testing.T) {
 	if pool.Has(evictedHash) || !pool.Has(candidateTx.Hash()) {
 		t.Fatal("full-pool admission did not atomically replace the lowest-priced entry")
 	}
-	if pending, _ := pool.Stats(); pending != 1 || len(pool.all) != maxFramePoolSize {
+	if pending, _ := pool.Stats(); pending != 1 || len(pool.all) != pool.limits.maxPoolSize {
 		t.Fatalf("pool sizes after eviction: pending=%d all=%d", pending, len(pool.all))
 	}
 }
@@ -1795,8 +1795,8 @@ func TestFramePoolSenderLimit(t *testing.T) {
 	}
 	t.Logf("correctly rejected: %v", errs[0])
 
-	if pending, _ := pool.Stats(); pending != maxFrameTxsPerAccount {
-		t.Fatalf("expected %d pending, got %d", maxFrameTxsPerAccount, pending)
+	if pending, _ := pool.Stats(); pending != pool.limits.maxPendingPerSender {
+		t.Fatalf("expected %d pending, got %d", pool.limits.maxPendingPerSender, pending)
 	}
 }
 
