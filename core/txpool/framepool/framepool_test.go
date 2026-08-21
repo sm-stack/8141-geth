@@ -136,6 +136,10 @@ var (
 )
 
 func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
+	return newTestEnvWithConfig(DefaultConfig)
+}
+
+func newTestEnvWithConfig(poolConfig Config) (*FramePool, *state.StateDB, *params.ChainConfig) {
 	configCopy := *params.MergedTestChainConfig
 	zero := uint64(0)
 	configCopy.AmsterdamTime = &zero
@@ -158,7 +162,7 @@ func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
 		blocks:  make(map[common.Hash]*types.Block),
 	}
 
-	pool := New(chain)
+	pool := NewWithConfig(poolConfig, chain)
 	pool.canonicalPaymasters[benchmarkPaymasterAuthShimCodeHash] = benchmarkPaymasterPendingWithdrawalSlot
 	pool.Init(0, head, newReserver())
 	return pool, statedb, config

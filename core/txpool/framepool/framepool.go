@@ -147,6 +147,8 @@ type framePoolLimits struct {
 	maxPoolSize                        int
 }
 
+type nonceKeyOwnerIndex map[common.Address]map[common.Hash]common.Hash
+
 // FramePool is a transaction pool for EIP-8141 frame transactions.
 // It validates VERIFY frames by simulating the EIP-8141 public-mempool
 // validation prefix before accepting transactions into the pool.
@@ -175,6 +177,7 @@ type FramePool struct {
 	mu                       sync.RWMutex
 	pending                  map[common.Address][]*types.Transaction // sender → txs
 	all                      map[common.Hash]*types.Transaction      // hash → tx
+	nonceKeyOwner            nonceKeyOwnerIndex                      // sender and nonce key → transaction hash
 	meta                     map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
 	dependencyIndex          *validationDependencyIndex              // mutable validation dependency → transaction hashes
 	stalePayerCode           map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
@@ -310,6 +313,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		canonicalPaymasters:        make(map[common.Hash]common.Hash),
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
+		nonceKeyOwner:              make(nonceKeyOwnerIndex),
 		meta:                       make(map[common.Hash]frameTxMeta),
 		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
@@ -443,6 +447,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		reserver:                   reserver,
 		pending:                    make(map[common.Address][]*types.Transaction),
 		all:                        make(map[common.Hash]*types.Transaction),
+		nonceKeyOwner:              make(nonceKeyOwnerIndex),
 		meta:                       make(map[common.Hash]frameTxMeta),
 		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             stalePayerCode,
@@ -473,6 +478,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	}
 	p.pending = candidate.pending
 	p.all = candidate.all
+	p.nonceKeyOwner = candidate.nonceKeyOwner
 	p.meta = candidate.meta
 	p.dependencyIndex = candidate.dependencyIndex
 	p.stalePayerCode = candidate.stalePayerCode
@@ -610,10 +616,15 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 	// and reserver ownership are deliberately never mutated by workers.
 	for _, validation := range validations {
 		tx := validation.tx
-		sender := tx.GetFrameTx().Sender
-		if validation.err != nil || len(p.pending[sender]) >= p.limits.maxPendingPerSender || len(p.all) >= p.limits.maxPoolSize {
+		if validation.err != nil || len(p.all) >= p.limits.maxPoolSize {
 			continue
 		}
+		frameTx := tx.GetFrameTx()
+		replacement, _, err := p.checkNonceKeyAdmission(frameTx)
+		if err != nil || replacement != nil {
+			continue
+		}
+		sender := frameTx.Sender
 		if validation.class == resetAccountingOnly {
 			if err := p.validatePayerSolvency(tx, validation.meta, nil); err != nil {
 				continue
@@ -631,6 +642,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		}
 		p.pending[sender] = append(p.pending[sender], tx)
 		p.all[tx.Hash()] = tx
+		p.reserveNonceKeys(tx)
 		p.reserveTxAccounting(tx, validation.meta)
 		if validation.class != resetFullValidation {
 			reused++
@@ -831,6 +843,7 @@ func (p *FramePool) SetGasTip(tip *big.Int) {
 			} else {
 				delete(p.all, tx.Hash())
 				delete(p.blobCells, tx.Hash())
+				p.releaseNonceKeys(tx)
 				p.releaseTxAccounting(tx.Hash())
 			}
 		}
@@ -1130,23 +1143,12 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if err := p.validateRecentRootReferences(frameTx, p.currentState, p.currentHead); err != nil {
 		return check, err
 	}
-	sender := frameTx.Sender
-	if txs := p.pending[sender]; len(txs) > 0 {
-		for index, pendingTx := range txs {
-			oldFrameTx := pendingTx.GetFrameTx()
-			if frameTx.NonceSeq == oldFrameTx.NonceSeq && frameTx.NonceKeySetEqual(oldFrameTx) {
-				check.replacement = pendingTx
-				check.replacementIndex = index
-				break
-			}
-		}
-		if check.replacement != nil {
-			if !isFrameTxPriceBumped(tx, check.replacement) {
-				return check, txpool.ErrReplaceUnderpriced
-			}
-		} else if len(txs) >= p.limits.maxPendingPerSender {
-			return check, fmt.Errorf("%w: sender %s has %d pending frame transactions", txpool.ErrAccountLimitExceeded, sender.Hex(), len(txs))
-		}
+	check.replacement, check.replacementIndex, err = p.checkNonceKeyAdmission(frameTx)
+	if err != nil {
+		return check, err
+	}
+	if check.replacement != nil && !isFrameTxPriceBumped(tx, check.replacement) {
+		return check, txpool.ErrReplaceUnderpriced
 	}
 	if check.replacement == nil && len(p.all) >= p.limits.maxPoolSize {
 		check.eviction = p.lowestPricedTransaction()
@@ -1253,6 +1255,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell, 
 	// Insert into pool.
 	if replacement != nil {
 		p.releaseTxAccounting(replacement.Hash())
+		p.releaseNonceKeys(replacement)
 		delete(p.all, replacement.Hash())
 		delete(p.blobCells, replacement.Hash())
 		p.pending[sender][replacementIndex] = tx
@@ -1263,6 +1266,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell, 
 		p.pending[sender] = append(p.pending[sender], tx)
 	}
 	p.all[tx.Hash()] = tx
+	p.reserveNonceKeys(tx)
 	if len(cells) > 0 {
 		p.blobCells[tx.Hash()] = cells
 	}
@@ -1304,6 +1308,7 @@ func (p *FramePool) removeTransaction(tx *types.Transaction) {
 		return
 	}
 	p.releaseTxAccounting(hash)
+	p.releaseNonceKeys(tx)
 	delete(p.all, hash)
 	delete(p.blobCells, hash)
 	sender := frameTx.Sender
@@ -2768,6 +2773,7 @@ func (p *FramePool) Clear() {
 	}
 	p.pending = make(map[common.Address][]*types.Transaction)
 	p.all = make(map[common.Hash]*types.Transaction)
+	p.nonceKeyOwner = make(nonceKeyOwnerIndex)
 	p.meta = make(map[common.Hash]frameTxMeta)
 	p.paymasterReserved = make(map[common.Address]*big.Int)
 	p.paymasterPending = make(map[common.Address]int)
