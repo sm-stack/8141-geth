@@ -558,6 +558,10 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 		if err := p.ValidateTxBasics(tx); err != nil {
 			continue
 		}
+		simulationTime := p.currentHead.Time + params.SecondsPerSlot
+		if _, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime); err != nil {
+			continue
+		}
 		if tx.BlobGas() > 0 {
 			if _, ok := p.blobCells[tx.Hash()]; !ok {
 				cells, err := validateFrameBlobProofs(tx)
@@ -578,10 +582,6 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			continue
 		}
 		if p.selectiveRevalidation {
-			simulationTime := p.currentHead.Time + params.SecondsPerSlot
-			if _, err := p.validationPrefixPlan(frameTx, p.currentState, simulationTime); err != nil {
-				continue
-			}
 			if metaOK && p.validationDependenciesUnchangedIndexed(tx.Hash(), frameTx, meta, dependencyChanges) {
 				class := resetReuse
 				checkAccounting := true
@@ -1715,6 +1715,13 @@ func buildValidationPrefixPlan(frameTx *types.FrameTx) (validationPrefixPlan, er
 }
 
 func validateValidationPrefixState(frameTx *types.FrameTx, plan validationPrefixPlan, statedb *state.StateDB, timestamp uint64) error {
+	if plan.deployIndex >= 0 {
+		frame := frameTx.Frames[plan.deployIndex]
+		target := resolveFrameTarget(frameTx.Sender, frame)
+		if delegate, ok := types.ParseDelegation(statedb.GetCode(target)); ok {
+			return fmt.Errorf("%w: deploy frame target %s is EIP-7702 delegated to %s", core.ErrFrameTxInvalid, target, delegate)
+		}
+	}
 	if plan.expiryIndex < 0 {
 		return nil
 	}
