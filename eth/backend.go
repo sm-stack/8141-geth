@@ -206,6 +206,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		"maxVerifyGas", config.FramePool.MaxVerifyGas,
 		"maxStateDependentVerifyGas", config.FramePool.MaxStateDependentVerifyGas,
 		"cacheValidationPrecompiles", config.FramePool.CacheValidationPrecompiles,
+		"rejectIncompleteValidationMemo", config.FramePool.RejectIncompleteValidationMemo,
 		"validationMemoMaxEntries", config.FramePool.ValidationMemoMaxEntries,
 		"validationMemoMaxBytes", config.FramePool.ValidationMemoMaxBytes,
 	)

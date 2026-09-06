@@ -411,6 +411,9 @@ func TestFrameValidationExtCodePrecompile(t *testing.T) {
 	if v := tracer.Violation(); v != nil {
 		t.Fatalf("unexpected violation for precompile: %s", v)
 	}
+	if reads := tracer.CodeReads(); len(reads) != 0 {
+		t.Fatalf("precompile call recorded mutable code identity: %v", reads)
+	}
 }
 
 // TestFrameValidationExtCodeWithCode verifies address with code passes OP-041.
@@ -541,11 +544,11 @@ func TestFrameValidationTracerRecordsDependencies(t *testing.T) {
 		}
 	})
 
-	t.Run("precompile excluded", func(t *testing.T) {
+	t.Run("precompile extcode identity", func(t *testing.T) {
 		tracer := newTestTracer()
 		tracer.OnOpcode(0, byte(EXTCODEHASH), 100000, 200, scopeForExt(testPrecompile1), nil, 1, nil)
-		if reads := tracer.CodeReads(); len(reads) != 0 {
-			t.Fatalf("precompile code reads: have %v want none", reads)
+		if reads := tracer.CodeReads(); len(reads) != 1 || reads[0] != testPrecompile1 {
+			t.Fatalf("precompile code reads: have %v want [%s]", reads, testPrecompile1)
 		}
 	})
 
@@ -603,6 +606,40 @@ func TestFrameValidationWorkProfile(t *testing.T) {
 		profile := tracer.WorkProfile()
 		if profile.HasMutableRead || profile.StateDependentGasLimit != 0 {
 			t.Fatalf("pure profile: %+v", profile)
+		}
+	})
+	t.Run("prior frame mutable", func(t *testing.T) {
+		state := &mockStateDB{}
+		tracer := NewFrameValidationTracerWithOptions(state, testSender, testSender, nil, FrameValidationTracerOptions{
+			FrameGasLimit:     gasLimit,
+			PriorFrameMutable: true,
+		})
+		tracer.OnEnter(0, byte(STATICCALL), common.Address{}, testSender, nil, gasLimit, nil)
+		profile := tracer.WorkProfile()
+		if profile.FirstMutableReadKind != ValidationMutableReadPriorFrame || profile.StateDependentGasLimit != gasLimit {
+			t.Fatalf("prior-frame profile: %+v", profile)
+		}
+	})
+	t.Run("blob max cost", func(t *testing.T) {
+		state := &mockStateDB{}
+		tracer := NewFrameValidationTracerWithOptions(state, testSender, testSender, nil, FrameValidationTracerOptions{
+			FrameGasLimit:             gasLimit,
+			BlobBaseFeeAffectsMaxCost: true,
+		})
+		tracer.OnEnter(0, byte(STATICCALL), common.Address{}, testSender, nil, gasLimit, nil)
+		selector := *uint256.NewInt(txParamMaxCost)
+		tracer.OnOpcode(3, byte(TXPARAM), 99_000, 2, &mockScope{stackData: []uint256.Int{selector}}, nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if !tracer.ReadsBlobBaseFee() || profile.FirstMutableReadKind != ValidationMutableReadEnvironment {
+			t.Fatalf("blob max-cost profile: %+v", profile)
+		}
+	})
+	t.Run("precompile extcode", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(4, byte(EXTCODEHASH), 99_000, 100, scopeForExt(testPrecompile1), nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if profile.FirstMutableReadKind != ValidationMutableReadCode || profile.StateDependentGasLimit != 99_000 {
+			t.Fatalf("precompile extcode profile: %+v", profile)
 		}
 	})
 	t.Run("first sload", func(t *testing.T) {

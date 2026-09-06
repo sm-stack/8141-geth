@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/framecorpus"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
 
@@ -124,14 +125,281 @@ func TestStateDependentValidationShapes(t *testing.T) {
 
 func TestValidationWorkSummaryOverflowFailsClosed(t *testing.T) {
 	var summary validationWorkSummary
-	if err := summary.addFrame(0, vm.ValidationWorkProfile{StateDependentGasLimit: ^uint64(0)}); err != nil {
+	if err := summary.addFrame(0, vm.ValidationWorkProfile{HasMutableRead: true, StateDependentGasLimit: ^uint64(0)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := summary.addFrame(1, vm.ValidationWorkProfile{StateDependentGasLimit: 1}); err == nil {
+	if err := summary.addFrame(1, vm.ValidationWorkProfile{FrameGasLimit: 1}); err == nil {
 		t.Fatal("state-dependent gas overflow was accepted")
 	}
 	if summary.StateDependentGasLimit != ^uint64(0) {
 		t.Fatalf("overflow did not fail closed: %+v", summary)
+	}
+}
+
+func TestValidationWorkSummaryChargesLaterFramesAfterGlobalWatershed(t *testing.T) {
+	var summary validationWorkSummary
+	if err := summary.addFrame(0, vm.ValidationWorkProfile{
+		HasMutableRead:         true,
+		FrameGasLimit:          10,
+		StateDependentGasLimit: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := summary.addFrame(1, vm.ValidationWorkProfile{FrameGasLimit: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if summary.StateDependentGasLimit != 105 {
+		t.Fatalf("transaction-global bound = %d, want 105", summary.StateDependentGasLimit)
+	}
+}
+
+func TestValidationWorkInvariantIgnoresPostWatershedFrameProfiles(t *testing.T) {
+	first := vm.ValidationWorkProfile{
+		HasMutableRead:         true,
+		FirstMutableReadKind:   vm.ValidationMutableReadStorage,
+		FirstMutableReadPC:     7,
+		FrameGasLimit:          10,
+		StateDependentGasLimit: 5,
+	}
+	left := validationWorkSummary{StateDependentGasLimit: 105, FrameProfiles: map[int]vm.ValidationWorkProfile{
+		0: first,
+		1: {HasMutableRead: true, FirstMutableReadKind: vm.ValidationMutableReadPriorFrame, FrameGasLimit: 100, StateDependentGasLimit: 100},
+	}}
+	right := validationWorkSummary{StateDependentGasLimit: 105, FrameProfiles: map[int]vm.ValidationWorkProfile{
+		0: first,
+		1: {HasMutableRead: true, FirstMutableReadKind: vm.ValidationMutableReadCode, FirstMutableReadPC: 12, FrameGasLimit: 100, StateDependentGasLimit: 100},
+	}}
+	if validationWorkEqual(left, right) {
+		t.Fatal("full profiles unexpectedly equal")
+	}
+	if !validationWorkInvariantEqual(left, right) {
+		t.Fatal("post-watershed frame change broke the global invariant")
+	}
+	changed := right
+	changed.FrameProfiles = map[int]vm.ValidationWorkProfile{0: first, 1: right.FrameProfiles[1]}
+	changedFirst := first
+	changedFirst.FirstMutableReadPC++
+	changed.FrameProfiles[0] = changedFirst
+	if validationWorkInvariantEqual(left, changed) {
+		t.Fatal("changed transaction-global watershed was accepted")
+	}
+}
+
+func frameParamPayApprovalCode() []byte {
+	// Approve payment only when frame 0 completed successfully and consumed
+	// non-zero execution gas. This exercises both prior-frame FRAMEPARAM fields.
+	return []byte{
+		byte(vm.PUSH1), 0x05, byte(vm.PUSH0), byte(vm.FRAMEPARAM),
+		byte(vm.PUSH1), 0x0a, byte(vm.PUSH0), byte(vm.FRAMEPARAM),
+		byte(vm.ISZERO), byte(vm.ISZERO), byte(vm.AND),
+		byte(vm.PUSH0), byte(vm.PUSH0), byte(vm.APPROVE),
+	}
+}
+
+func approveScopeCode(scope byte) []byte {
+	return []byte{byte(vm.PUSH1), scope, byte(vm.PUSH0), byte(vm.PUSH0), byte(vm.APPROVE)}
+}
+
+func callThenApproveScopeCode(target common.Address, scope byte) []byte {
+	code := []byte{byte(vm.PUSH0), byte(vm.PUSH0), byte(vm.PUSH0), byte(vm.PUSH0), byte(vm.PUSH20)}
+	code = append(code, target.Bytes()...)
+	code = append(code, byte(vm.GAS), byte(vm.STATICCALL), byte(vm.POP))
+	return append(code, approveScopeCode(scope)...)
+}
+
+func TestValidationSimulationCarriesPriorFrameResultsAndGas(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	for _, address := range []common.Address{sender, payer} {
+		statedb.CreateAccount(address)
+		statedb.SetBalance(address, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	statedb.SetCode(sender, approveScopeCode(vm.ApproveExecution), tracing.CodeChangeUnspecified)
+	statedb.SetCode(payer, frameParamPayApprovalCode(), tracing.CodeChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 20_000},
+		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 20_000},
+	}
+	if _, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0); err != nil {
+		t.Fatalf("prior-frame runtime bridge failed in simulation: %v", err)
+	}
+}
+
+func TestValidationSimulationSharesWarmSetAcrossFrames(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	library := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	for _, address := range []common.Address{sender, payer, library} {
+		statedb.CreateAccount(address)
+		statedb.SetBalance(address, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	statedb.SetCode(library, []byte{byte(vm.STOP)}, tracing.CodeChangeUnspecified)
+	statedb.SetCode(sender, callThenApproveScopeCode(library, vm.ApproveExecution), tracing.CodeChangeUnspecified)
+	statedb.SetCode(payer, callThenApproveScopeCode(library, vm.ApprovePayment), tracing.CodeChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 20_000},
+		// A cold library access costs more than this entire frame; the warm
+		// access left by frame 0 must make the second validation call succeed.
+		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 2_000},
+	}
+	if _, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0); err != nil {
+		t.Fatalf("cross-frame warm access was not retained: %v", err)
+	}
+	statedb.SetCode(sender, approveScopeCode(vm.ApproveExecution), tracing.CodeChangeUnspecified)
+	if _, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0); err == nil {
+		t.Fatal("cold pay-frame access unexpectedly fit the warm-only gas budget")
+	}
+}
+
+func txMaxCostThenApproveCode() []byte {
+	return append([]byte{byte(vm.PUSH1), 0x06, byte(vm.TXPARAM), byte(vm.POP)}, approveBothCode...)
+}
+
+func extCodeHashThenApproveCode(target common.Address) []byte {
+	code := append([]byte{byte(vm.PUSH20)}, target.Bytes()...)
+	code = append(code, byte(vm.EXTCODEHASH), byte(vm.POP))
+	return append(code, approveBothCode...)
+}
+
+func TestBlobMaxCostIsMutableAndInvalidatesOnBlobBaseFeeChange(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	zero := uint64(0)
+	pool.currentHead.ExcessBlobGas = &zero
+	pool.chain.(*testChain).head.ExcessBlobGas = &zero
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, txMaxCostThenApproveCode(), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.BlobFeeCap = uint256.NewInt(1)
+	frameTx.BlobHashes = []common.Hash{{31: 1}}
+	frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 20_000}}
+	tx := makeFrameTx(frameTx)
+	meta, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(tx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := meta.validationWork.FrameProfiles[0]
+	if profile.FirstMutableReadKind != vm.ValidationMutableReadEnvironment || meta.validationDeps.blobBaseFee == nil {
+		t.Fatalf("blob max-cost dependency missing: profile=%+v deps=%+v", profile, meta.validationDeps)
+	}
+	nextHead := types.CopyHeader(pool.currentHead)
+	excess := uint64(100_000_000)
+	nextHead.ExcessBlobGas = &excess
+	pool.currentHead = nextHead
+	if pool.validationDependenciesUnchanged(frameTx, meta) {
+		t.Fatal("changed blob base fee reused validation")
+	}
+	indexed := &validationDependencyChanges{
+		affected: make(map[common.Hash]struct{}),
+		indexed:  map[common.Hash]struct{}{tx.Hash(): {}},
+	}
+	if pool.validationDependenciesUnchangedIndexed(tx.Hash(), frameTx, meta, indexed) {
+		t.Fatal("indexed dependency fast path reused a changed blob base fee")
+	}
+}
+
+func TestPrecompileExtCodeHashDustDropsBeforeResetExecution(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	precompile := common.BytesToAddress([]byte{1})
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, extCodeHashThenApproveCode(precompile), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 20_000}}
+	tx := makeFrameTx(frameTx)
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatal(err)
+	}
+	profile := pool.meta[tx.Hash()].validationWork.FrameProfiles[0]
+	if profile.FirstMutableReadKind != vm.ValidationMutableReadCode {
+		t.Fatalf("precompile EXTCODEHASH profile = %+v", profile)
+	}
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	resetWithStateChange(pool, pool.chain.(*testChain), func(next *state.StateDB) {
+		next.CreateAccount(precompile)
+		next.SetBalance(precompile, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	})
+	if pending, _ := pool.Stats(); pending != 0 {
+		t.Fatalf("dusted precompile identity retained %d transactions", pending)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("dusted precompile ran %d validation simulations", delta)
+	}
+}
+
+func TestStrictMemoRejectsOnlyIncompletePurePrefix(t *testing.T) {
+	config := validationSplitConfig(250_000, true)
+	config.RejectIncompleteValidationMemo = true
+	pool, _, _ := newTestEnvWithConfig(config)
+	rules := params.Rules{IsBerlin: true}
+	address := common.BytesToAddress([]byte{2})
+	precompile := vm.PrecompiledContractsBerlin[address]
+
+	testMemo := func(afterMutable bool) error {
+		memo := vm.NewValidationPrecompileMemo(vm.ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+		view := memo.ValidationFrameView()
+		if afterMutable {
+			view.MarkValidationMutable()
+		}
+		for _, input := range [][]byte{{1}, {2}} {
+			if _, _, err := vm.RunPrecompiledContract(nil, precompile, address, input, vm.NewGasBudget(1_000, 0), nil, rules, view); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return pool.finalizeValidationArtifacts(&frameTxMeta{}, validationWorkSummary{}, validationArtifacts{precompileMemo: memo})
+	}
+	if err := testMemo(false); err == nil || !strings.Contains(err.Error(), "memo incomplete") {
+		t.Fatalf("incomplete pure prefix error = %v", err)
+	}
+	if err := testMemo(true); err != nil {
+		t.Fatalf("after-watershed saturation rejected: %v", err)
+	}
+	if err := pool.finalizeValidationArtifacts(&frameTxMeta{}, validationWorkSummary{}, validationArtifacts{}); err == nil {
+		t.Fatal("strict policy accepted a missing validation memo")
+	}
+}
+
+func TestCrossFrameMemoSaturationAfterMutableIsBounded(t *testing.T) {
+	config := validationSplitConfig(250_000, true)
+	config.RejectIncompleteValidationMemo = true
+	config.ValidationMemoMaxEntries = 1
+	pool, statedb, chainConfig := newTestEnvWithConfig(config)
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	for _, address := range []common.Address{sender, payer} {
+		statedb.CreateAccount(address)
+		statedb.SetBalance(address, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	senderCode := append([]byte{byte(vm.PUSH0), byte(vm.SLOAD), byte(vm.POP)}, approveScopeCode(vm.ApproveExecution)...)
+	firstCall := fixedPrecompileNoApproveCode(1, 2, 1)
+	secondCall := fixedPrecompileNoApproveCode(1, 3, 1)
+	payerCode := append([]byte{}, firstCall[:len(firstCall)-1]...)
+	payerCode = append(payerCode, secondCall[:len(secondCall)-1]...)
+	payerCode = append(payerCode, approveScopeCode(vm.ApprovePayment)...)
+	statedb.SetCode(sender, senderCode, tracing.CodeChangeUnspecified)
+	statedb.SetCode(payer, payerCode, tracing.CodeChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 20_000},
+		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 20_000, Data: []byte{1}},
+	}
+	tx := makeFrameTx(frameTx)
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatal(err)
+	}
+	meta := pool.meta[tx.Hash()]
+	if meta.validationMemo.Complete() || !meta.validationMemo.CompleteBeforeFirstMutable() {
+		t.Fatalf("cross-frame saturation phase: stats=%+v", meta.validationMemo.Stats())
+	}
+	payProfile := meta.validationWork.FrameProfiles[1]
+	if payProfile.FirstMutableReadKind != vm.ValidationMutableReadPriorFrame || payProfile.StateDependentGasLimit != frameTx.Frames[1].GasLimit {
+		t.Fatalf("pay frame was not globally bounded: %+v", payProfile)
 	}
 }
 

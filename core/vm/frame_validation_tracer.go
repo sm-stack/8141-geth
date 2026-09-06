@@ -45,6 +45,7 @@ const (
 	ValidationMutableReadCode
 	ValidationMutableReadEnvironment
 	ValidationMutableReadDeployment
+	ValidationMutableReadPriorFrame
 )
 
 // ValidationWorkProfile describes the maximum execution gas that may be spent
@@ -102,6 +103,7 @@ type FrameValidationTracer struct {
 	storageReads map[common.Hash]struct{}
 	codeReads    map[common.Address]struct{}
 	legacyNonce  bool
+	blobBaseFee  bool
 
 	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
 	lastOpValid    bool   // Whether lastOp is meaningful
@@ -130,6 +132,15 @@ type FrameValidationTracerOptions struct {
 
 	// Deployment charges the full declared frame execution gas as mutable work.
 	Deployment bool
+
+	// PriorFrameMutable marks the whole frame state-dependent because an earlier
+	// validation frame observed mutable input. Frame results, gas usage, and the
+	// shared access journal can carry that influence across the frame boundary.
+	PriorFrameMutable bool
+
+	// BlobBaseFeeAffectsMaxCost marks TXPARAM(max_cost) mutable for blob frame
+	// transactions, where the returned value includes the current blob base fee.
+	BlobBaseFeeAffectsMaxCost bool
 
 	// FrameGasLimit is the declared execution gas of the validation frame.
 	FrameGasLimit uint64
@@ -183,7 +194,9 @@ func (t *FrameValidationTracer) StorageReads() []common.Hash {
 	return reads
 }
 
-// CodeReads returns non-precompile addresses reached through CALL*/EXTCODE*.
+// CodeReads returns addresses whose code identity was observed through CALL*
+// or EXTCODE*. EXTCODE* remains an identity read at precompile addresses even
+// though calling the active precompile itself is pure.
 // Callers can snapshot their code hashes to decide whether a pending validation
 // result remains reusable at a later head.
 func (t *FrameValidationTracer) CodeReads() []common.Address {
@@ -198,6 +211,12 @@ func (t *FrameValidationTracer) CodeReads() []common.Address {
 // pre-state legacy account nonce through TXPARAM.
 func (t *FrameValidationTracer) ReadsLegacyNonce() bool {
 	return t.legacyNonce
+}
+
+// ReadsBlobBaseFee reports whether validation read TXPARAM(max_cost) for a blob
+// transaction, whose result changes with the block's blob base fee.
+func (t *FrameValidationTracer) ReadsBlobBaseFee() bool {
+	return t.blobBaseFee
 }
 
 // Violation returns the first detected rule violation, or nil.
@@ -227,9 +246,17 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		stackData := scope.StackData()
 		if len(stackData) > 0 {
 			selector, overflow := stackData[len(stackData)-1].Uint64WithOverflow()
-			if !overflow && selector == txParamLegacyNonce {
-				t.legacyNonce = true
-				t.recordMutableRead(ValidationMutableReadLegacyNonce, pc, depth, gas)
+			if !overflow {
+				switch selector {
+				case txParamLegacyNonce:
+					t.legacyNonce = true
+					t.recordMutableRead(ValidationMutableReadLegacyNonce, pc, depth, gas)
+				case txParamMaxCost:
+					if t.options.BlobBaseFeeAffectsMaxCost {
+						t.blobBaseFee = true
+						t.recordMutableRead(ValidationMutableReadEnvironment, pc, depth, gas)
+					}
+				}
 			}
 		}
 	}
@@ -240,8 +267,11 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		t.recordMutableRead(ValidationMutableReadEnvironment, pc, depth, gas)
 	}
 	if isExtOrCallOp(opcode) && scope != nil {
-		if addr, ok := validationCodeTarget(opcode, scope); ok && !t.precompiles[addr] && addr != t.sender && addr != t.frameTarget {
-			t.recordMutableRead(ValidationMutableReadCode, pc, depth, gas)
+		if addr, ok := validationCodeTarget(opcode, scope); ok {
+			mutableIdentity := isExtOp(opcode) || !t.precompiles[addr]
+			if mutableIdentity && addr != t.sender && addr != t.frameTarget {
+				t.recordMutableRead(ValidationMutableReadCode, pc, depth, gas)
+			}
 		}
 	}
 	if isCallOp(opcode) {
@@ -288,7 +318,7 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 	// [OP-041] EXTCODE/CALL targets must have deployed code.
 	if isExtOrCallOp(opcode) && scope != nil {
 		if addr, ok := validationCodeTarget(opcode, scope); ok {
-			if !t.precompiles[addr] {
+			if isExtOp(opcode) || !t.precompiles[addr] {
 				t.codeReads[addr] = struct{}{}
 			}
 			// Skip precompiles and sender (OP-042 exception).
@@ -348,6 +378,8 @@ func (t *FrameValidationTracer) OnEnter(depth int, typ byte, from common.Address
 			}
 			if t.options.Deployment {
 				t.recordMutableRead(ValidationMutableReadDeployment, 0, 0, gas)
+			} else if t.options.PriorFrameMutable {
+				t.recordMutableRead(ValidationMutableReadPriorFrame, 0, 0, gas)
 			}
 		}
 	} else if depth > 0 {

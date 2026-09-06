@@ -65,21 +65,25 @@ type ValidationPrecompileMemoLimits struct {
 // CachedGas is gas that was still charged on cache hits while CPU recomputation
 // was skipped; it is not gas saved by the transaction.
 type PrecompileCacheStats struct {
-	Hits                    uint64
-	Misses                  uint64
-	ActualRuns              uint64
-	BeforeMutableHits       uint64
-	BeforeMutableMisses     uint64
-	BeforeMutableActualRuns uint64
-	AfterMutableHits        uint64
-	AfterMutableMisses      uint64
-	AfterMutableActualRuns  uint64
-	Stores                  uint64
-	Uncacheable             uint64
-	Saturated               uint64
-	Entries                 uint64
-	AccountedBytes          uint64
-	CachedGas               uint64
+	Hits                     uint64
+	Misses                   uint64
+	ActualRuns               uint64
+	BeforeMutableHits        uint64
+	BeforeMutableMisses      uint64
+	BeforeMutableActualRuns  uint64
+	AfterMutableHits         uint64
+	AfterMutableMisses       uint64
+	AfterMutableActualRuns   uint64
+	Stores                   uint64
+	Uncacheable              uint64
+	BeforeMutableUncacheable uint64
+	AfterMutableUncacheable  uint64
+	Saturated                uint64
+	BeforeMutableSaturated   uint64
+	AfterMutableSaturated    uint64
+	Entries                  uint64
+	AccountedBytes           uint64
+	CachedGas                uint64
 }
 
 // PrecompileCache is a thread-safe cache of precompile outputs, shared between
@@ -106,11 +110,17 @@ type PrecompileCache struct {
 }
 
 type validationPrecompileMemo struct {
-	mu       sync.RWMutex
-	limits   ValidationPrecompileMemoLimits
-	entries  map[precompileCacheScope]map[string][]byte
-	stats    PrecompileCacheStats
-	complete bool
+	mu                    sync.RWMutex
+	limits                ValidationPrecompileMemoLimits
+	entries               map[precompileCacheScope]map[string]validationPrecompileResult
+	stats                 PrecompileCacheStats
+	complete              bool
+	completeBeforeMutable bool
+}
+
+type validationPrecompileResult struct {
+	output []byte
+	err    error
 }
 
 // precompileCacheData is the storage shared by the two cache handles.
@@ -159,9 +169,10 @@ func NewPrecompileCache() *PrecompileCache {
 // not fit execute normally and make Complete report false.
 func NewValidationPrecompileMemo(limits ValidationPrecompileMemoLimits) *PrecompileCache {
 	return &PrecompileCache{validation: &validationPrecompileMemo{
-		limits:   limits,
-		entries:  make(map[precompileCacheScope]map[string][]byte),
-		complete: true,
+		limits:                limits,
+		entries:               make(map[precompileCacheScope]map[string]validationPrecompileResult),
+		complete:              true,
+		completeBeforeMutable: true,
 	}}
 }
 
@@ -175,8 +186,8 @@ func (c *PrecompileCache) PrefetchView() *PrecompileCache {
 }
 
 // ValidationFrameView returns a frame-local handle over the transaction memo.
-// Each frame starts before its first mutable read while sharing exact cached
-// values and aggregate counters with the transaction handle.
+// The caller marks a later frame mutable at entry when a prior frame crossed
+// the transaction watershed. Exact cached values and counters remain shared.
 func (c *PrecompileCache) ValidationFrameView() *PrecompileCache {
 	if c == nil || c.validation == nil {
 		return c
@@ -213,11 +224,34 @@ func (c *PrecompileCache) Complete() bool {
 	return c.validation.complete
 }
 
+// CompleteBeforeFirstMutable reports whether every eligible invocation before
+// the transaction-global mutable watershed was retained. Later incompleteness
+// weakens acceleration but cannot hide uncached pure-prefix replay.
+func (c *PrecompileCache) CompleteBeforeFirstMutable() bool {
+	if c == nil || c.validation == nil {
+		return false
+	}
+	c.validation.mu.RLock()
+	defer c.validation.mu.RUnlock()
+	return c.validation.completeBeforeMutable
+}
+
+// loadResult retrieves a cached validation result, including deterministic
+// failures. The chain cache stores successful outputs only.
+func (c *PrecompileCache) loadResult(scope precompileCacheScope, key []byte) ([]byte, error, bool) {
+	if c.validation != nil {
+		return c.validationLoadResult(scope, key)
+	}
+	output, ok := c.load(scope, key)
+	return output, nil, ok
+}
+
 // load retrieves the cached output for the given key. The returned slice is
 // a private copy owned by the caller, entries cross goroutine boundaries.
 func (c *PrecompileCache) load(scope precompileCacheScope, key []byte) ([]byte, bool) {
 	if c.validation != nil {
-		return c.validationLoad(scope, key)
+		output, _, ok := c.validationLoadResult(scope, key)
+		return output, ok
 	}
 	c.data.mu.RLock()
 	results := c.data.caches[scope]
@@ -242,7 +276,7 @@ func (c *PrecompileCache) load(scope precompileCacheScope, key []byte) ([]byte, 
 // on to overwrite.
 func (c *PrecompileCache) store(scope precompileCacheScope, key []byte, output []byte) {
 	if c.validation != nil {
-		c.validationStore(scope, key, output)
+		c.validationStoreResult(scope, key, output, nil)
 		return
 	}
 	c.data.mu.RLock()
@@ -260,19 +294,31 @@ func (c *PrecompileCache) store(scope precompileCacheScope, key []byte, output [
 	results.Add(string(key), common.CopyBytes(output))
 }
 
-func (c *PrecompileCache) validationLoad(scope precompileCacheScope, key []byte) ([]byte, bool) {
+// storeResult retains a validation result. Deterministic failures are scoped
+// by the same fork, address, and exact normalized input as successful outputs.
+func (c *PrecompileCache) storeResult(scope precompileCacheScope, key []byte, output []byte, err error) {
+	if c.validation != nil {
+		c.validationStoreResult(scope, key, output, err)
+		return
+	}
+	if err == nil {
+		c.store(scope, key, output)
+	}
+}
+
+func (c *PrecompileCache) validationLoadResult(scope precompileCacheScope, key []byte) ([]byte, error, bool) {
 	memo := c.validation
 	memo.mu.Lock()
 	defer memo.mu.Unlock()
 	if scoped := memo.entries[scope]; scoped != nil {
-		if output, ok := scoped[string(key)]; ok {
+		if result, ok := scoped[string(key)]; ok {
 			memo.stats.Hits++
 			if c.validationMutable.Load() {
 				memo.stats.AfterMutableHits++
 			} else {
 				memo.stats.BeforeMutableHits++
 			}
-			return common.CopyBytes(output), true
+			return common.CopyBytes(result.output), result.err, true
 		}
 	}
 	memo.stats.Misses++
@@ -281,10 +327,10 @@ func (c *PrecompileCache) validationLoad(scope precompileCacheScope, key []byte)
 	} else {
 		memo.stats.BeforeMutableMisses++
 	}
-	return nil, false
+	return nil, nil, false
 }
 
-func (c *PrecompileCache) validationStore(scope precompileCacheScope, key []byte, output []byte) {
+func (c *PrecompileCache) validationStoreResult(scope precompileCacheScope, key []byte, output []byte, err error) {
 	memo := c.validation
 	memo.mu.Lock()
 	defer memo.mu.Unlock()
@@ -296,33 +342,47 @@ func (c *PrecompileCache) validationStore(scope precompileCacheScope, key []byte
 	}
 	entryBytes := validationMemoEntryOverhead + common.AddressLength
 	if ^uint64(0)-entryBytes < uint64(len(key)) {
-		memoSaturated(memo)
+		c.memoSaturatedLocked(memo)
 		return
 	}
 	entryBytes += uint64(len(key))
 	if ^uint64(0)-entryBytes < uint64(len(output)) {
-		memoSaturated(memo)
+		c.memoSaturatedLocked(memo)
 		return
 	}
 	entryBytes += uint64(len(output))
+	if err != nil {
+		errBytes := uint64(len(err.Error()))
+		if ^uint64(0)-entryBytes < errBytes {
+			c.memoSaturatedLocked(memo)
+			return
+		}
+		entryBytes += errBytes
+	}
 	if memo.limits.MaxEntries <= 0 || memo.stats.Entries >= uint64(memo.limits.MaxEntries) || memo.stats.AccountedBytes > memo.limits.MaxBytes || entryBytes > memo.limits.MaxBytes-memo.stats.AccountedBytes {
-		memoSaturated(memo)
+		c.memoSaturatedLocked(memo)
 		return
 	}
 	scoped := memo.entries[scope]
 	if scoped == nil {
-		scoped = make(map[string][]byte)
+		scoped = make(map[string]validationPrecompileResult)
 		memo.entries[scope] = scoped
 	}
-	scoped[keyString] = common.CopyBytes(output)
+	scoped[keyString] = validationPrecompileResult{output: common.CopyBytes(output), err: err}
 	memo.stats.Stores++
 	memo.stats.Entries++
 	memo.stats.AccountedBytes += entryBytes
 }
 
-func memoSaturated(memo *validationPrecompileMemo) {
+func (c *PrecompileCache) memoSaturatedLocked(memo *validationPrecompileMemo) {
 	memo.complete = false
 	memo.stats.Saturated++
+	if c.validationMutable.Load() {
+		memo.stats.AfterMutableSaturated++
+	} else {
+		memo.stats.BeforeMutableSaturated++
+		memo.completeBeforeMutable = false
+	}
 }
 
 func (c *PrecompileCache) recordActualRun() {
@@ -346,6 +406,12 @@ func (c *PrecompileCache) recordUncacheable() {
 	c.validation.mu.Lock()
 	c.validation.stats.Uncacheable++
 	c.validation.complete = false
+	if c.validationMutable.Load() {
+		c.validation.stats.AfterMutableUncacheable++
+	} else {
+		c.validation.stats.BeforeMutableUncacheable++
+		c.validation.completeBeforeMutable = false
+	}
 	c.validation.mu.Unlock()
 }
 

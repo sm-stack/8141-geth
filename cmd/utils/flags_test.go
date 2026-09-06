@@ -108,11 +108,13 @@ func TestFramePoolValidationFlags(t *testing.T) {
 	ctx := newTestContext(t, []string{
 		"--framepool.maxstatedependentverifygas=20000",
 		"--framepool.cachevalidationprecompiles",
+		"--framepool.rejectincompletevalidationmemo",
 		"--framepool.validationmemomaxentries=4",
 		"--framepool.validationmemomaxbytes=8192",
 	},
 		FramePoolMaxStateDependentVerifyGasFlag,
 		FramePoolCacheValidationPrecompilesFlag,
+		FramePoolRejectIncompleteValidationMemoFlag,
 		FramePoolValidationMemoMaxEntriesFlag,
 		FramePoolValidationMemoMaxBytesFlag,
 	)
@@ -121,6 +123,9 @@ func TestFramePoolValidationFlags(t *testing.T) {
 	}
 	if !ctx.Bool(FramePoolCacheValidationPrecompilesFlag.Name) {
 		t.Fatal("validation precompile memo flag was not enabled")
+	}
+	if !ctx.Bool(FramePoolRejectIncompleteValidationMemoFlag.Name) {
+		t.Fatal("strict validation memo flag was not enabled")
 	}
 	if got := ctx.Int(FramePoolValidationMemoMaxEntriesFlag.Name); got != 4 {
 		t.Fatalf("memo entries flag = %d", got)

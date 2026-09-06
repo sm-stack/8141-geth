@@ -31,6 +31,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -497,16 +498,62 @@ func TestValidationPrecompileMemoIsolationAndDisabledBehavior(t *testing.T) {
 	}
 }
 
-func TestValidationPrecompileMemoFailureIsIncomplete(t *testing.T) {
+func TestValidationPrecompileMemoCachesDeterministicFailure(t *testing.T) {
 	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 1024})
 	p := &countingCacheablePrecompile{gas: 1, err: errors.New("deterministic failure")}
-	_, _, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x01"), []byte{1}, NewGasBudget(1, 0), nil, params.Rules{}, memo)
-	if err == nil {
-		t.Fatal("expected precompile failure")
+	for range 2 {
+		_, remaining, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x01"), []byte{1}, NewGasBudget(2, 0), nil, params.Rules{}, memo)
+		if err == nil || err.Error() != "deterministic failure" || remaining.ExecutionGas != 1 {
+			t.Fatalf("cached failure outcome = %v, %v", remaining, err)
+		}
 	}
 	stats := memo.Stats()
-	if stats.ActualRuns != 1 || stats.Uncacheable != 1 || stats.Stores != 0 || memo.Complete() {
+	if stats.ActualRuns != 1 || stats.Hits != 1 || stats.Misses != 1 || stats.Stores != 1 || !memo.Complete() || !memo.CompleteBeforeFirstMutable() {
 		t.Fatalf("failure stats: %+v complete=%v", stats, memo.Complete())
+	}
+}
+
+func TestValidationPrecompileMemoCachesInvalidKZGProof(t *testing.T) {
+	address := common.BytesToAddress([]byte{10})
+	precompile := PrecompiledContractsCancun[address]
+	input := make([]byte, blobVerifyInputLength)
+	commitment := kzg4844.Commitment{}
+	copy(input, kZGToVersionedHash(commitment).Bytes())
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+	rules := params.Rules{IsCancun: true, IsBerlin: true, IsIstanbul: true, IsByzantium: true}
+	for range 2 {
+		_, remaining, err := RunPrecompiledContract(nil, precompile, address, input, NewGasBudget(params.BlobTxPointEvaluationPrecompileGas+1, 0), nil, rules, memo)
+		if err == nil || remaining.ExecutionGas != 1 {
+			t.Fatalf("invalid KZG outcome = %v, %v", remaining, err)
+		}
+	}
+	if stats := memo.Stats(); stats.ActualRuns != 1 || stats.Hits != 1 || stats.Stores != 1 || !memo.CompleteBeforeFirstMutable() {
+		t.Fatalf("invalid KZG memo stats: %+v", stats)
+	}
+}
+
+func TestValidationPrecompileMemoTracksIncompletePhase(t *testing.T) {
+	address := common.BytesToAddress([]byte{2})
+	precompile := PrecompiledContractsBerlin[address]
+	rules := params.Rules{IsBerlin: true}
+	input := make([]byte, maxCacheablePrecompileInput+1)
+
+	pure := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+	if _, _, err := RunPrecompiledContract(nil, precompile, address, input, NewGasBudget(precompile.RequiredGas(input), 0), nil, rules, pure); err != nil {
+		t.Fatal(err)
+	}
+	if pure.CompleteBeforeFirstMutable() || pure.Stats().BeforeMutableUncacheable != 1 {
+		t.Fatalf("pure-prefix incompleteness not tracked: %+v", pure.Stats())
+	}
+
+	after := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+	view := after.ValidationFrameView()
+	view.MarkValidationMutable()
+	if _, _, err := RunPrecompiledContract(nil, precompile, address, input, NewGasBudget(precompile.RequiredGas(input), 0), nil, rules, view); err != nil {
+		t.Fatal(err)
+	}
+	if !after.CompleteBeforeFirstMutable() || after.Complete() || after.Stats().AfterMutableUncacheable != 1 {
+		t.Fatalf("after-watershed incompleteness misclassified: %+v", after.Stats())
 	}
 }
 

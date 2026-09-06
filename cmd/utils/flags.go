@@ -496,6 +496,12 @@ var (
 		Value:    ethconfig.Defaults.FramePool.CacheValidationPrecompiles,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolRejectIncompleteValidationMemoFlag = &cli.BoolFlag{
+		Name:     "framepool.rejectincompletevalidationmemo",
+		Usage:    "Reject frame transactions whose pure-prefix precompile memo cannot be retained completely",
+		Value:    ethconfig.Defaults.FramePool.RejectIncompleteValidationMemo,
+		Category: flags.TxPoolCategory,
+	}
 	FramePoolValidationMemoMaxEntriesFlag = &cli.IntFlag{
 		Name:     "framepool.validationmemomaxentries",
 		Usage:    "Maximum precompile memo entries retained per frame transaction (0 = default)",
@@ -1844,6 +1850,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(FramePoolCacheValidationPrecompilesFlag.Name) {
 		cfg.FramePool.CacheValidationPrecompiles = ctx.Bool(FramePoolCacheValidationPrecompilesFlag.Name)
+	}
+	if ctx.IsSet(FramePoolRejectIncompleteValidationMemoFlag.Name) {
+		cfg.FramePool.RejectIncompleteValidationMemo = ctx.Bool(FramePoolRejectIncompleteValidationMemoFlag.Name)
+	}
+	if cfg.FramePool.RejectIncompleteValidationMemo {
+		cfg.FramePool.CacheValidationPrecompiles = true
 	}
 	if ctx.IsSet(FramePoolValidationMemoMaxEntriesFlag.Name) {
 		value := ctx.Int(FramePoolValidationMemoMaxEntriesFlag.Name)

@@ -33,6 +33,7 @@ func TestConfigSanitized(t *testing.T) {
 		MaxVerifyGas:                       200_000,
 		MaxStateDependentVerifyGas:         20_000,
 		CacheValidationPrecompiles:         true,
+		RejectIncompleteValidationMemo:     true,
 		ValidationMemoMaxEntries:           4,
 		ValidationMemoMaxBytes:             8192,
 		MaxPendingPerSender:                8,
@@ -61,6 +62,10 @@ func TestConfigSanitized(t *testing.T) {
 	if clamped.MaxStateDependentVerifyGas != clamped.MaxVerifyGas {
 		t.Fatalf("state-dependent gas was not clamped: %+v", clamped)
 	}
+	strict := (Config{RejectIncompleteValidationMemo: true}).Sanitized()
+	if !strict.CacheValidationPrecompiles {
+		t.Fatal("strict incomplete-memo policy did not enable the validation memo")
+	}
 }
 
 func TestConfigPropagatesToFramePool(t *testing.T) {
@@ -69,6 +74,7 @@ func TestConfigPropagatesToFramePool(t *testing.T) {
 		MaxVerifyGas:                       200_000,
 		MaxStateDependentVerifyGas:         20_000,
 		CacheValidationPrecompiles:         true,
+		RejectIncompleteValidationMemo:     true,
 		ValidationMemoMaxEntries:           4,
 		ValidationMemoMaxBytes:             8192,
 		MaxPendingPerSender:                8,
@@ -80,6 +86,7 @@ func TestConfigPropagatesToFramePool(t *testing.T) {
 	if pool.verifyGasCap != config.MaxVerifyGas ||
 		pool.stateDependentVerifyGasCap != config.MaxStateDependentVerifyGas ||
 		pool.cacheValidationPrecompiles != config.CacheValidationPrecompiles ||
+		pool.rejectIncompleteValidationMemo != config.RejectIncompleteValidationMemo ||
 		pool.validationMemoLimits.MaxEntries != config.ValidationMemoMaxEntries ||
 		pool.validationMemoLimits.MaxBytes != config.ValidationMemoMaxBytes ||
 		pool.limits.maxPendingPerSender != config.MaxPendingPerSender ||
