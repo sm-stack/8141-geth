@@ -34,13 +34,14 @@ var (
 
 const (
 	massInvalidationSignerKey  = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
-	massInvalidationPayerGas   = uint64(5_000)
+	massInvalidationPayerGas   = uint64(6_000)
 	massInvalidationSenderGas  = PublicMaxVerifyGas - params.SigGasSecp256k1 - massInvalidationPayerGas
 	massInvalidationApproveGas = uint64(9)
 	// Seven BLS calls fit the 92,200-gas sender frame. The authenticated
-	// benchmark payer consumes 2,202 gas on its successful payment path.
+	// benchmark payer consumes 5,202 gas on its successful payment path,
+	// including its cold frame-target access.
 	massInvalidationBLSIterations = uint64(7)
-	massInvalidationPayerGasUsed  = uint64(2_202)
+	massInvalidationPayerGasUsed  = uint64(5_202)
 	massInvalidationSignatureGas  = params.SigGasSecp256k1
 )
 
@@ -91,7 +92,7 @@ func massInvalidationCorpus(tb testing.TB, corpus string) ([]byte, []byte, uint6
 		tb.Fatalf("unknown mass-invalidation corpus %q", corpus)
 	}
 	code = append(code, approveExecCode...)
-	return code, data, gasUsed + massInvalidationApproveGas + massInvalidationPayerGasUsed
+	return code, data, gasUsed + massInvalidationApproveGas + params.WarmAccountAccessAmsterdam + massInvalidationPayerGasUsed
 }
 
 func newMassInvalidationFixture(tb testing.TB, corpus string, count int) *massInvalidationFixture {

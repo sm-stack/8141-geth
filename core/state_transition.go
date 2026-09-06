@@ -1565,11 +1565,16 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []types.Fra
 			vmerr     error
 		)
 		frameBudget := vm.NewFrameGasBudget(frame.GasLimit, frame.StateGasLimit)
+		if !vm.ChargeFrameTargetAccess(st.state, target, &frameBudget) {
+			remaining, vmerr = frameBudget.ExitHalt(), vm.ErrOutOfGas
+		}
 		callValue := new(uint256.Int)
 		if frame.Mode == types.FrameModeSender && frame.Value != nil {
 			callValue.Set(frame.Value)
 		}
-		if isExpiryVerifier {
+		if vmerr != nil {
+			// The target access exhausted the frame before any target state read.
+		} else if isExpiryVerifier {
 			if !bytes.Equal(st.state.GetCode(target), params.FrameExpiryVerifierCode) {
 				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: expiry verifier frame %d missing canonical code", ErrFrameTxInvalid, i)
 			}

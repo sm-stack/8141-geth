@@ -22,7 +22,8 @@ func TestValidationDependencyIndexDeduplicatesSharedCode(t *testing.T) {
 	statedb.CreateAccount(helper)
 	statedb.SetCode(helper, []byte{0x00}, tracing.CodeChangeUnspecified)
 	helperCodeHash := statedb.GetCodeHash(helper)
-	rules := pool.chainconfig.Rules(pool.currentHead.Number, pool.currentHead.Difficulty.Sign() == 0, pool.currentHead.Time)
+	simulationHead := framePoolSimulationHeader(pool.chainconfig, pool.currentHead)
+	rules := pool.chainconfig.Rules(simulationHead.Number, simulationHead.Difficulty.Sign() == 0, simulationHead.Time)
 
 	index := newValidationDependencyIndex()
 	var hashes [2]common.Hash
@@ -143,6 +144,7 @@ func TestValidationDependencyTouchesUseBALChanges(t *testing.T) {
 		{kind: validationBalanceDependency, address: address},
 		{kind: validationNonceDependency, address: address},
 		{kind: validationCodeDependency, address: address},
+		{kind: validationAccountExistenceDependency, address: address},
 	}
 	for _, key := range want {
 		if _, ok := touches.keys[key]; !ok {
@@ -163,13 +165,15 @@ func TestValidationDependencyIndexTracksDirectSenderBalance(t *testing.T) {
 	balance := common.Hash(statedb.GetBalance(sender).Bytes32())
 	hash := common.HexToHash("0x01")
 	index := newValidationDependencyIndex()
+	simulationHead := framePoolSimulationHeader(pool.chainconfig, pool.currentHead)
+	rules := pool.chainconfig.Rules(simulationHead.Number, simulationHead.Difficulty.Sign() == 0, simulationHead.Time)
 	index.add(hash, sender, frameTxMeta{
 		payer:         common.HexToAddress("0x5555555555555555555555555555555555555555"),
 		payerCodeHash: types.EmptyCodeHash,
 		validationDeps: &validationDependencySnapshot{
 			senderCodeHash: types.EmptyCodeHash,
 			senderBalance:  &balance,
-			rules:          pool.chainconfig.Rules(pool.currentHead.Number, pool.currentHead.Difficulty.Sign() == 0, pool.currentHead.Time),
+			rules:          rules,
 			storageValues:  make(map[storageDependency]common.Hash),
 			codeHashes:     make(map[common.Address]common.Hash),
 		},
@@ -196,7 +200,8 @@ func TestValidationDependencyIndexUsesBALTouches(t *testing.T) {
 		statedb.SetCode(helper, []byte{0x00}, tracing.CodeChangeUnspecified)
 	}
 	index := newValidationDependencyIndex()
-	rules := pool.chainconfig.Rules(pool.currentHead.Number, pool.currentHead.Difficulty.Sign() == 0, pool.currentHead.Time)
+	simulationHead := framePoolSimulationHeader(pool.chainconfig, pool.currentHead)
+	rules := pool.chainconfig.Rules(simulationHead.Number, simulationHead.Difficulty.Sign() == 0, simulationHead.Time)
 	var hashes [2]common.Hash
 	for i, helper := range []common.Address{firstHelper, secondHelper} {
 		sender := massInvalidationSender(i)

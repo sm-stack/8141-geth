@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -166,6 +168,36 @@ func newTestEnvWithConfig(poolConfig Config) (*FramePool, *state.StateDB, *param
 	pool.canonicalPaymasters[benchmarkPaymasterAuthShimCodeHash] = benchmarkPaymasterPendingWithdrawalSlot
 	pool.Init(0, head, newReserver())
 	return pool, statedb, config
+}
+
+func TestFramePoolSimulationHeaderUsesNextBlockContext(t *testing.T) {
+	pool, _, config := newTestEnv()
+	parent := pool.currentHead
+	zero := uint64(0)
+	parent.ExcessBlobGas = &zero
+	parent.BlobGasUsed = &zero
+	parent.GasUsed = parent.GasLimit
+	nextTime := parent.Time + params.SecondsPerSlot
+	config.BogotaTime = &nextTime
+
+	head := framePoolSimulationHeader(config, parent)
+	if want := new(big.Int).Add(parent.Number, common.Big1); head.Number.Cmp(want) != 0 {
+		t.Fatalf("simulation number = %v, want %v", head.Number, want)
+	}
+	if head.Time != nextTime {
+		t.Fatalf("simulation time = %d, want %d", head.Time, nextTime)
+	}
+	if want := eip1559.CalcBaseFee(config, parent); head.BaseFee.Cmp(want) != 0 {
+		t.Fatalf("simulation base fee = %v, want %v", head.BaseFee, want)
+	}
+	if want := eip4844.CalcExcessBlobGas(config, parent, nextTime); head.ExcessBlobGas == nil || *head.ExcessBlobGas != want {
+		t.Fatalf("simulation excess blob gas = %v, want %d", head.ExcessBlobGas, want)
+	}
+	currentRules := config.Rules(parent.Number, parent.Difficulty.Sign() == 0, parent.Time)
+	nextRules := config.Rules(head.Number, head.Difficulty.Sign() == 0, head.Time)
+	if currentRules.IsBogota || !nextRules.IsBogota {
+		t.Fatalf("simulation rules did not cross next-block fork: current=%v next=%v", currentRules.IsBogota, nextRules.IsBogota)
+	}
 }
 
 // makeFrameTx creates a wrapped *types.Transaction from a FrameTx.
@@ -969,6 +1001,7 @@ func TestFramePoolResetDoesNotHoldPoolLockDuringValidation(t *testing.T) {
 	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
 		t.Fatalf("add frame transaction: %v", err)
 	}
+	pool.selectiveRevalidation = false
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1146,6 +1179,72 @@ func TestFramePoolResetReinjectsBlobTransactionFromDiscardedBranch(t *testing.T)
 	}
 }
 
+func TestFramePoolResetRefreshesBlobReservationWithoutMaxCostRead(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+	chain := pool.chain.(*testChain)
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, new(uint256.Int).SetAllOne(), tracing.BalanceChangeUnspecified)
+
+	var (
+		blob kzg4844.Blob
+		zero uint64
+	)
+	commitment, err := kzg4844.BlobToCommitment(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := kzg4844.ComputeCellProofs(&blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.currentHead.ExcessBlobGas = &zero
+	pool.currentHead.BlobGasUsed = &zero
+	ftx := baseFTX(sender, 0, config)
+	ftx.BlobFeeCap = uint256.NewInt(1_000_000_000_000_000_000)
+	ftx.BlobHashes = []common.Hash{kzg4844.CalcBlobHashV1(sha256.New(), &commitment)}
+	ftx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: 3, GasLimit: 50_000}}
+	tx := makeFrameTx(ftx).WithBlobTxSidecar(types.NewBlobTxSidecar(
+		types.BlobSidecarVersion1,
+		[]kzg4844.Blob{blob},
+		[]kzg4844.Commitment{commitment},
+		proofs,
+	))
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatalf("add blob frame transaction: %v", err)
+	}
+	oldCost := new(big.Int).Set(pool.meta[tx.Hash()].maxCost)
+	if pool.meta[tx.Hash()].validationDeps.blobBaseFee != nil {
+		t.Fatal("approve-only validation unexpectedly read max_cost")
+	}
+
+	oldHead := chain.head
+	newHead := types.CopyHeader(oldHead)
+	newHead.Number = new(big.Int).Add(oldHead.Number, common.Big1)
+	newHead.Time = oldHead.Time + params.SecondsPerSlot
+	excess := uint64(100_000_000)
+	newHead.ExcessBlobGas = &excess
+	newHead.BlobGasUsed = &zero
+	chain.statedb = pool.currentState.Copy()
+	chain.head = newHead
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	pool.Reset(oldHead, newHead)
+	if !pool.Has(tx.Hash()) {
+		t.Fatal("blob transaction was not retained after accounting-only refresh")
+	}
+	newCost := pool.meta[tx.Hash()].maxCost
+	if newCost == nil || newCost.Cmp(oldCost) <= 0 {
+		t.Fatalf("blob max cost was not refreshed: old=%v new=%v", oldCost, newCost)
+	}
+	if reserved := pool.paymasterReserved[sender]; reserved == nil || reserved.Cmp(newCost) != 0 {
+		t.Fatalf("blob reservation = %v, want %v", reserved, newCost)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+		t.Fatalf("accounting-only blob refresh ran %d validation simulations", delta)
+	}
+}
+
 func TestFramePoolAcceptsKeyedNonceDomain(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -1164,10 +1263,13 @@ func TestFramePoolAcceptsKeyedNonceDomain(t *testing.T) {
 func setupRecentRootFrameTx(t *testing.T, currentSlot, refSlot uint64) (*FramePool, *state.StateDB, *types.FrameTx, types.RecentRootRef) {
 	t.Helper()
 	pool, statedb, config := newTestEnv()
-	pool.currentHead.Time = currentSlot * params.SecondsPerSlot
+	pool.currentHead.Time = (currentSlot - 1) * params.SecondsPerSlot
+	pool.cacheValidationPrecompiles = true
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
-	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	precompileCall := fixedPrecompileNoApproveCode(1, 2, 1)
+	code := append(common.CopyBytes(precompileCall[:len(precompileCall)-1]), approveBothCode...)
+	statedb.SetCode(sender, code, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 	ref := types.RecentRootRef{SourceID: common.HexToHash("0x1234"), Slot: refSlot, Root: common.HexToHash("0x5678")}
 	key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
@@ -1179,7 +1281,6 @@ func setupRecentRootFrameTx(t *testing.T, currentSlot, refSlot uint64) (*FramePo
 }
 
 func TestFramePoolRecentRootAdmission(t *testing.T) {
-	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	tests := []struct {
 		name   string
@@ -1201,12 +1302,22 @@ func TestFramePoolRecentRootAdmission(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&ftx.RecentRootRefs[0])
 			}
+			verifyBefore := verifyRunMeter.Snapshot().Count()
+			precompileBefore := validationMemoActualRunMeter.Snapshot().Count()
 			err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]
 			if tt.valid && err != nil {
 				t.Fatalf("valid reference rejected: %v", err)
 			}
 			if !tt.valid && err == nil {
 				t.Fatal("invalid reference accepted")
+			}
+			if !tt.valid {
+				if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+					t.Fatalf("invalid reference ran %d VERIFY simulations", delta)
+				}
+				if delta := validationMemoActualRunMeter.Snapshot().Count() - precompileBefore; delta != 0 {
+					t.Fatalf("invalid reference ran %d validation precompiles", delta)
+				}
 			}
 			key := types.RecentRootStorageKey(ref.SourceID, ref.Slot)
 			if addressWarm, slotWarm := statedb.SlotInAccessList(params.RecentRootAddress, key); addressWarm || slotWarm {
@@ -1217,7 +1328,6 @@ func TestFramePoolRecentRootAdmission(t *testing.T) {
 }
 
 func TestFramePoolRecentRootAdmissionUsesSlotProvider(t *testing.T) {
-	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	pool, _, ftx, _ := setupRecentRootFrameTx(t, 1, 8999)
 	pool.slotProvider = func(*types.Header) vm.SlotProvider { return fixedFramePoolSlotProvider(9000) }
 	if err := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)[0]; err != nil {
@@ -1226,7 +1336,6 @@ func TestFramePoolRecentRootAdmissionUsesSlotProvider(t *testing.T) {
 }
 
 func TestWarmRecentRootReferences(t *testing.T) {
-	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	_, statedb, _, ref := setupRecentRootFrameTx(t, 9000, 8999)
 	copyState := statedb.Copy()
 	warmRecentRootReferences(copyState, []types.RecentRootRef{ref})
@@ -1240,7 +1349,6 @@ func TestWarmRecentRootReferences(t *testing.T) {
 }
 
 func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
-	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	t.Run("expiry", func(t *testing.T) {
 		pool, _, ftx, ref := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
@@ -1249,9 +1357,17 @@ func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
 		}
 		newHead := *pool.currentHead
 		newHead.Time = (ref.Slot + params.RecentRootWindow) * params.SecondsPerSlot
+		verifyBefore := verifyRunMeter.Snapshot().Count()
+		precompileBefore := validationMemoActualRunMeter.Snapshot().Count()
 		pool.Reset(pool.currentHead, &newHead)
 		if pending, _ := pool.Stats(); pending != 0 {
 			t.Fatalf("expired tx retained: %d", pending)
+		}
+		if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+			t.Fatalf("expired reference ran %d VERIFY simulations", delta)
+		}
+		if delta := validationMemoActualRunMeter.Snapshot().Count() - precompileBefore; delta != 0 {
+			t.Fatalf("expired reference ran %d validation precompiles", delta)
 		}
 	})
 	t.Run("reorg mismatch", func(t *testing.T) {
@@ -1261,15 +1377,22 @@ func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
 		}
 		statedb.SetState(params.RecentRootAddress, types.RecentRootStorageKey(ref.SourceID, ref.Slot), common.Hash{})
 		newHead := *pool.currentHead
+		verifyBefore := verifyRunMeter.Snapshot().Count()
+		precompileBefore := validationMemoActualRunMeter.Snapshot().Count()
 		pool.Reset(pool.currentHead, &newHead)
 		if pending, _ := pool.Stats(); pending != 0 {
 			t.Fatalf("mismatched tx retained: %d", pending)
+		}
+		if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 0 {
+			t.Fatalf("mismatched reference ran %d VERIFY simulations", delta)
+		}
+		if delta := validationMemoActualRunMeter.Snapshot().Count() - precompileBefore; delta != 0 {
+			t.Fatalf("mismatched reference ran %d validation precompiles", delta)
 		}
 	})
 }
 
 func TestFramePoolInvalidRecentRootReplacementKeepsOriginal(t *testing.T) {
-	t.Skip("recent-root references were removed from the latest EIP-8141 draft")
 	const currentSlot = uint64(9000)
 	pool, _, ftx, _ := setupRecentRootFrameTx(t, currentSlot, currentSlot-1)
 	original := makeFrameTx(ftx)

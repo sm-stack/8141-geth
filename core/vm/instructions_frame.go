@@ -34,6 +34,21 @@ const (
 	ApproveBoth      uint8 = 3 // APPROVE(0x3): both execution and payment.
 )
 
+// ChargeFrameTargetAccess charges the ordinary Amsterdam account-access cost
+// for entering a frame. The target is warmed only after the frame budget can
+// cover the access, so an exceptional halt does not perform an unpriced read.
+func ChargeFrameTargetAccess(statedb StateDB, target common.Address, gas *GasBudget) bool {
+	cost := params.ColdAccountAccessAmsterdam
+	if statedb.AddressInAccessList(target) {
+		cost = params.WarmAccountAccessAmsterdam
+	}
+	if _, ok := gas.ChargeExecution(cost); !ok {
+		return false
+	}
+	statedb.AddAddressToAccessList(target)
+	return true
+}
+
 // FrameContext holds the context for executing a frame transaction (EIP-8141).
 // It is set on the EVM when processing a frame transaction and provides data
 // needed by the frame transaction introspection opcodes. All fields are

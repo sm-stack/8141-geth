@@ -96,14 +96,15 @@ var bannedOpcodes = map[OpCode]bool{
 // It is designed to be lightweight and fail-fast: it records the first violation
 // and short-circuits all subsequent hooks.
 type FrameValidationTracer struct {
-	stateDB      StateDB        // For validation target code inspection.
-	sender       common.Address // tx.sender — exempt from OP-041, owns storage (STO-010)
-	frameTarget  common.Address // VERIFY frame target
-	precompiles  map[common.Address]bool
-	storageReads map[common.Hash]struct{}
-	codeReads    map[common.Address]struct{}
-	legacyNonce  bool
-	blobBaseFee  bool
+	stateDB        StateDB        // For validation target code inspection.
+	sender         common.Address // tx.sender — exempt from OP-041, owns storage (STO-010)
+	frameTarget    common.Address // VERIFY frame target
+	precompiles    map[common.Address]bool
+	storageReads   map[common.Hash]struct{}
+	codeReads      map[common.Address]struct{}
+	existenceReads map[common.Address]struct{}
+	legacyNonce    bool
+	blobBaseFee    bool
 
 	lastOp         OpCode // Previous opcode for GAS rule (OP-012)
 	lastOpValid    bool   // Whether lastOp is meaningful
@@ -145,6 +146,12 @@ type FrameValidationTracerOptions struct {
 	// FrameGasLimit is the declared execution gas of the validation frame.
 	FrameGasLimit uint64
 
+	// RootGasLimit is the execution gas passed to the root EVM call after the
+	// frame-target access charge. RootGasLimitSet distinguishes a valid zero
+	// budget from callers that do not precharge frame access.
+	RootGasLimit    uint64
+	RootGasLimitSet bool
+
 	// PrecompileMemo is the frame-local memo view used by this validation EVM.
 	// The tracer marks it after the first mutable read so memo statistics can
 	// distinguish structural pure-prefix reuse.
@@ -170,6 +177,7 @@ func NewFrameValidationTracerWithOptions(stateDB StateDB, sender common.Address,
 		precompiles:    pm,
 		storageReads:   make(map[common.Hash]struct{}),
 		codeReads:      make(map[common.Address]struct{}),
+		existenceReads: make(map[common.Address]struct{}),
 		allowTimestamp: frameTarget == params.FrameExpiryVerifierAddress && bytes.Equal(stateDB.GetCode(frameTarget), params.FrameExpiryVerifierCode),
 		options:        opts,
 		profile: ValidationWorkProfile{
@@ -202,6 +210,17 @@ func (t *FrameValidationTracer) StorageReads() []common.Hash {
 func (t *FrameValidationTracer) CodeReads() []common.Address {
 	reads := make([]common.Address, 0, len(t.codeReads))
 	for addr := range t.codeReads {
+		reads = append(reads, addr)
+	}
+	return reads
+}
+
+// AccountExistenceReads returns addresses whose existence was observed by
+// EXTCODEHASH. An account can move from non-existent to empty-code through a
+// balance or nonce change without a code write.
+func (t *FrameValidationTracer) AccountExistenceReads() []common.Address {
+	reads := make([]common.Address, 0, len(t.existenceReads))
+	for addr := range t.existenceReads {
 		reads = append(reads, addr)
 	}
 	return reads
@@ -268,6 +287,9 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 	}
 	if isExtOrCallOp(opcode) && scope != nil {
 		if addr, ok := validationCodeTarget(opcode, scope); ok {
+			if opcode == EXTCODEHASH {
+				t.existenceReads[addr] = struct{}{}
+			}
 			mutableIdentity := isExtOp(opcode) || !t.precompiles[addr]
 			if mutableIdentity && addr != t.sender && addr != t.frameTarget {
 				t.recordMutableRead(ValidationMutableReadCode, pc, depth, gas)
@@ -371,15 +393,19 @@ func (t *FrameValidationTracer) OnEnter(depth int, typ byte, from common.Address
 			t.markGasAccountingConservative()
 		} else {
 			t.rootEntered = true
-			if t.profile.FrameGasLimit == 0 {
+			expectedRootGas := t.profile.FrameGasLimit
+			if t.options.RootGasLimitSet {
+				expectedRootGas = t.options.RootGasLimit
+			}
+			if t.profile.FrameGasLimit == 0 && !t.options.RootGasLimitSet {
 				t.profile.FrameGasLimit = gas
-			} else if gas != t.profile.FrameGasLimit {
+			} else if gas != expectedRootGas {
 				t.markGasAccountingConservative()
 			}
 			if t.options.Deployment {
-				t.recordMutableRead(ValidationMutableReadDeployment, 0, 0, gas)
+				t.recordMutableRead(ValidationMutableReadDeployment, 0, 0, t.profile.FrameGasLimit)
 			} else if t.options.PriorFrameMutable {
-				t.recordMutableRead(ValidationMutableReadPriorFrame, 0, 0, gas)
+				t.recordMutableRead(ValidationMutableReadPriorFrame, 0, 0, t.profile.FrameGasLimit)
 			}
 		}
 	} else if depth > 0 {
@@ -477,6 +503,7 @@ func (t *FrameValidationTracer) recordMutableRead(kind ValidationMutableReadKind
 }
 
 func (t *FrameValidationTracer) markGasAccountingConservative() {
+	t.options.PrecompileMemo.MarkValidationMutable()
 	t.profile.GasAccountingConservative = true
 	t.profile.StateDependentGasLimit = t.profile.FrameGasLimit
 	t.profile.GasUsedBeforeFirstMutable = 0

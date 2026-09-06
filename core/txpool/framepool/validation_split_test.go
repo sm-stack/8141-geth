@@ -153,6 +153,29 @@ func TestValidationWorkSummaryChargesLaterFramesAfterGlobalWatershed(t *testing.
 	}
 }
 
+func TestValidationWorkSummaryFailsClosedForConservativeFrame(t *testing.T) {
+	var summary validationWorkSummary
+	if err := summary.addFrame(0, vm.ValidationWorkProfile{
+		FrameGasLimit:             100,
+		StateDependentGasLimit:    100,
+		GasAccountingConservative: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := summary.addFrame(1, vm.ValidationWorkProfile{FrameGasLimit: 50}); err != nil {
+		t.Fatal(err)
+	}
+	if summary.StateDependentGasLimit != 150 {
+		t.Fatalf("conservative transaction-global bound = %d, want 150", summary.StateDependentGasLimit)
+	}
+	if !summary.hasEarlierMutableFrame(1) {
+		t.Fatal("conservative frame did not propagate the transaction-global watershed")
+	}
+	if index, _, ok := firstMutableWorkProfile(summary); !ok || index != 0 {
+		t.Fatalf("first state-dependent profile = (%d, %v), want frame 0", index, ok)
+	}
+}
+
 func TestValidationWorkInvariantIgnoresPostWatershedFrameProfiles(t *testing.T) {
 	first := vm.ValidationWorkProfile{
 		HasMutableRead:         true,
@@ -242,9 +265,9 @@ func TestValidationSimulationSharesWarmSetAcrossFrames(t *testing.T) {
 	frameTx := baseFTX(sender, 0, chainConfig)
 	frameTx.Frames = []types.Frame{
 		{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 20_000},
-		// A cold library access costs more than this entire frame; the warm
-		// access left by frame 0 must make the second validation call succeed.
-		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 2_000},
+		// The cold frame target plus a warm library access fits, but a second
+		// cold library access does not. Frame 0 must leave the library warm.
+		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 4_000},
 	}
 	if _, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0); err != nil {
 		t.Fatalf("cross-frame warm access was not retained: %v", err)
@@ -252,6 +275,37 @@ func TestValidationSimulationSharesWarmSetAcrossFrames(t *testing.T) {
 	statedb.SetCode(sender, approveScopeCode(vm.ApproveExecution), tracing.CodeChangeUnspecified)
 	if _, _, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0); err == nil {
 		t.Fatal("cold pay-frame access unexpectedly fit the warm-only gas budget")
+	}
+}
+
+func TestVerifySimulationChargesFrameTargetAccess(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	for address, code := range map[common.Address][]byte{
+		sender: approveScopeCode(vm.ApproveExecution),
+		payer:  approveScopeCode(vm.ApprovePayment),
+	} {
+		statedb.CreateAccount(address)
+		statedb.SetCode(address, code, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(address, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 20_000},
+		{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &payer, GasLimit: 20_000},
+	}
+	_, outcome, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approveGas := uint64(7) // PUSH1, two PUSH0 instructions; APPROVE itself is free.
+	if got, want := outcome.frameGasUsed(), params.ColdAccountAccessAmsterdam+approveGas; got != want {
+		t.Fatalf("cold payer frame gas = %d, want %d", got, want)
+	}
+	wantPrefix := params.WarmAccountAccessAmsterdam + params.ColdAccountAccessAmsterdam + 2*approveGas
+	if got := outcome.gasUsed(); got != wantPrefix {
+		t.Fatalf("validation prefix gas = %d, want %d", got, wantPrefix)
 	}
 }
 
@@ -269,7 +323,9 @@ func TestBlobMaxCostIsMutableAndInvalidatesOnBlobBaseFeeChange(t *testing.T) {
 	pool, statedb, chainConfig := newTestEnv()
 	zero := uint64(0)
 	pool.currentHead.ExcessBlobGas = &zero
+	pool.currentHead.BlobGasUsed = &zero
 	pool.chain.(*testChain).head.ExcessBlobGas = &zero
+	pool.chain.(*testChain).head.BlobGasUsed = &zero
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
 	statedb.SetCode(sender, txMaxCostThenApproveCode(), tracing.CodeChangeUnspecified)
@@ -290,6 +346,7 @@ func TestBlobMaxCostIsMutableAndInvalidatesOnBlobBaseFeeChange(t *testing.T) {
 	nextHead := types.CopyHeader(pool.currentHead)
 	excess := uint64(100_000_000)
 	nextHead.ExcessBlobGas = &excess
+	nextHead.BlobGasUsed = &zero
 	pool.currentHead = nextHead
 	if pool.validationDependenciesUnchanged(frameTx, meta) {
 		t.Fatal("changed blob base fee reused validation")
@@ -333,7 +390,39 @@ func TestPrecompileExtCodeHashDustDropsBeforeResetExecution(t *testing.T) {
 	}
 }
 
-func TestStrictMemoRejectsOnlyIncompletePurePrefix(t *testing.T) {
+func TestPrecompileExtCodeHashExistenceChangeUsesDependencyIndex(t *testing.T) {
+	config := DefaultConfig
+	config.PayerCodeIdentityPreflight = false
+	pool, statedb, chainConfig := newTestEnvWithConfig(config)
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	precompile := common.BytesToAddress([]byte{1})
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, extCodeHashThenApproveCode(precompile), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 20_000}}
+	tx := makeFrameTx(frameTx)
+	if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
+		t.Fatal(err)
+	}
+	key := validationDependencyKey{kind: validationAccountExistenceDependency, address: precompile}
+	if entry := pool.dependencyIndex.byKey[key]; entry == nil {
+		t.Fatal("EXTCODEHASH account-existence dependency was not indexed")
+	}
+	verifyBefore := verifyRunMeter.Snapshot().Count()
+	resetWithStateChange(pool, pool.chain.(*testChain), func(next *state.StateDB) {
+		next.CreateAccount(precompile)
+		next.SetBalance(precompile, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	})
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("revalidated precompile identity retained %d transactions, want 1", pending)
+	}
+	if delta := verifyRunMeter.Snapshot().Count() - verifyBefore; delta != 1 {
+		t.Fatalf("precompile existence change ran %d validation simulations, want 1", delta)
+	}
+}
+
+func TestStrictMemoRequiresCompleteReusablePrefix(t *testing.T) {
 	config := validationSplitConfig(250_000, true)
 	config.RejectIncompleteValidationMemo = true
 	pool, _, _ := newTestEnvWithConfig(config)
@@ -341,7 +430,13 @@ func TestStrictMemoRejectsOnlyIncompletePurePrefix(t *testing.T) {
 	address := common.BytesToAddress([]byte{2})
 	precompile := vm.PrecompiledContractsBerlin[address]
 
-	testMemo := func(afterMutable bool) error {
+	stateDependentWork := validationWorkSummary{FrameProfiles: map[int]vm.ValidationWorkProfile{
+		0: {HasMutableRead: true, FrameGasLimit: 1_000, StateDependentGasLimit: 500},
+	}}
+	if err := stateDependentWork.recompute(); err != nil {
+		t.Fatal(err)
+	}
+	testMemo := func(afterMutable bool, work validationWorkSummary) error {
 		memo := vm.NewValidationPrecompileMemo(vm.ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
 		view := memo.ValidationFrameView()
 		if afterMutable {
@@ -352,16 +447,59 @@ func TestStrictMemoRejectsOnlyIncompletePurePrefix(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		return pool.finalizeValidationArtifacts(&frameTxMeta{}, validationWorkSummary{}, validationArtifacts{precompileMemo: memo})
+		return pool.finalizeValidationArtifacts(&frameTxMeta{}, work, validationArtifacts{precompileMemo: memo})
 	}
-	if err := testMemo(false); err == nil || !strings.Contains(err.Error(), "memo incomplete") {
-		t.Fatalf("incomplete pure prefix error = %v", err)
+	if err := testMemo(false, stateDependentWork); err == nil || !strings.Contains(err.Error(), "memo incomplete") {
+		t.Fatalf("incomplete reusable prefix error = %v", err)
 	}
-	if err := testMemo(true); err != nil {
+	if err := testMemo(true, stateDependentWork); err != nil {
 		t.Fatalf("after-watershed saturation rejected: %v", err)
 	}
+	if err := testMemo(false, validationWorkSummary{}); err != nil {
+		t.Fatalf("pure-only incomplete memo rejected: %v", err)
+	}
+	if err := pool.finalizeValidationArtifacts(&frameTxMeta{}, validationWorkSummary{}, validationArtifacts{}); err != nil {
+		t.Fatalf("pure-only missing memo rejected: %v", err)
+	}
+	if err := pool.finalizeValidationArtifacts(&frameTxMeta{}, stateDependentWork, validationArtifacts{}); err == nil {
+		t.Fatal("strict policy accepted a missing reusable-prefix memo")
+	}
+	pool.selectiveRevalidation = false
 	if err := pool.finalizeValidationArtifacts(&frameTxMeta{}, validationWorkSummary{}, validationArtifacts{}); err == nil {
-		t.Fatal("strict policy accepted a missing validation memo")
+		t.Fatal("strict full-revalidation policy accepted a missing pure-only memo")
+	}
+}
+
+func TestStrictMemoConfigurationReachesAdmissionView(t *testing.T) {
+	config := validationSplitConfig(250_000, true)
+	config.RejectIncompleteValidationMemo = true
+	config.ValidationMemoMaxEntries = 1
+	pool, statedb, chainConfig := newTestEnvWithConfig(config)
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	firstCall := fixedPrecompileNoApproveCode(1, 2, 1)
+	secondCall := fixedPrecompileNoApproveCode(1, 3, 1)
+	code := append([]byte{}, firstCall[:len(firstCall)-1]...)
+	code = append(code, secondCall[:len(secondCall)-1]...)
+	pureCode := append([]byte{}, code...)
+	pureCode = append(pureCode, approveBothCode...)
+	code = append(code, byte(vm.PUSH0), byte(vm.SLOAD), byte(vm.POP))
+	code = append(code, approveBothCode...)
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, code, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 20_000, Data: []byte{1}}}
+	if err := pool.Add([]*types.Transaction{makeFrameTx(frameTx)}, false)[0]; err == nil || !strings.Contains(err.Error(), "memo incomplete") {
+		t.Fatalf("strict admission error = %v", err)
+	}
+	purePool, pureState, pureChainConfig := newTestEnvWithConfig(config)
+	pureState.CreateAccount(sender)
+	pureState.SetCode(sender, pureCode, tracing.CodeChangeUnspecified)
+	pureState.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	pureFrameTx := baseFTX(sender, 0, pureChainConfig)
+	pureFrameTx.Frames = frameTx.Frames
+	if err := purePool.Add([]*types.Transaction{makeFrameTx(pureFrameTx)}, false)[0]; err != nil {
+		t.Fatalf("strict policy rejected pure-only incomplete memo: %v", err)
 	}
 }
 

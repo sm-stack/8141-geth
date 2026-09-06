@@ -416,6 +416,17 @@ func TestFrameValidationExtCodePrecompile(t *testing.T) {
 	}
 }
 
+func TestFrameValidationExtCodeHashTracksAccountExistence(t *testing.T) {
+	tracer := newTestTracer()
+	tracer.OnOpcode(0, byte(EXTCODEHASH), 100000, 100, scopeForExt(testPrecompile1), nil, 1, nil)
+	if reads := tracer.CodeReads(); len(reads) != 1 || reads[0] != testPrecompile1 {
+		t.Fatalf("precompile EXTCODEHASH code reads = %v", reads)
+	}
+	if reads := tracer.AccountExistenceReads(); len(reads) != 1 || reads[0] != testPrecompile1 {
+		t.Fatalf("precompile EXTCODEHASH existence reads = %v", reads)
+	}
+}
+
 // TestFrameValidationExtCodeWithCode verifies address with code passes OP-041.
 func TestFrameValidationExtCodeWithCode(t *testing.T) {
 	tracer := newTestTracer()
@@ -747,6 +758,27 @@ func TestFrameValidationEnvironmentAndDeploymentProfiles(t *testing.T) {
 	deploy.OnEnter(0, byte(CALL), common.Address{}, testSender, nil, gasLimit, nil)
 	if profile := deploy.WorkProfile(); profile.FirstMutableReadKind != ValidationMutableReadDeployment || profile.StateDependentGasLimit != gasLimit {
 		t.Fatalf("deployment profile: %+v", profile)
+	}
+}
+
+func TestFrameValidationAcceptsPrechargedRootGas(t *testing.T) {
+	const (
+		frameGas = uint64(100_000)
+		rootGas  = frameGas - params.WarmAccountAccessAmsterdam
+	)
+	tracer := NewFrameValidationTracerWithOptions(newTestTracer().stateDB, testSender, testSender, nil, FrameValidationTracerOptions{
+		FrameGasLimit:   frameGas,
+		RootGasLimit:    rootGas,
+		RootGasLimitSet: true,
+	})
+	tracer.OnEnter(0, byte(STATICCALL), common.Address{}, testSender, nil, rootGas, nil)
+	tracer.OnOpcode(0, byte(SLOAD), rootGas, 2_100, scopeForSload(testSender, testSlot), nil, 1, nil)
+	profile := tracer.WorkProfile()
+	if profile.GasAccountingConservative || profile.StateDependentGasLimit != rootGas {
+		t.Fatalf("precharged root profile: %+v", profile)
+	}
+	if profile.GasUsedBeforeFirstMutable != params.WarmAccountAccessAmsterdam {
+		t.Fatalf("gas before mutable read = %d, want %d", profile.GasUsedBeforeFirstMutable, params.WarmAccountAccessAmsterdam)
 	}
 }
 

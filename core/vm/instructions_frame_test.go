@@ -22,10 +22,35 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
+
+func TestChargeFrameTargetAccess(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	target := common.HexToAddress("0x1234")
+	insufficient := NewFrameGasBudget(params.ColdAccountAccessAmsterdam-1, 0)
+	if ChargeFrameTargetAccess(statedb, target, &insufficient) {
+		t.Fatal("insufficient frame target access succeeded")
+	}
+	if statedb.AddressInAccessList(target) {
+		t.Fatal("unaffordable frame target access warmed the target")
+	}
+	if insufficient.ExecutionGas != params.ColdAccountAccessAmsterdam-1 {
+		t.Fatalf("failed charge changed execution gas to %d", insufficient.ExecutionGas)
+	}
+
+	cold := NewFrameGasBudget(params.ColdAccountAccessAmsterdam, 0)
+	if !ChargeFrameTargetAccess(statedb, target, &cold) || cold.ExecutionGas != 0 {
+		t.Fatalf("cold frame target charge failed: %+v", cold)
+	}
+	warm := NewFrameGasBudget(params.WarmAccountAccessAmsterdam, 0)
+	if !ChargeFrameTargetAccess(statedb, target, &warm) || warm.ExecutionGas != 0 {
+		t.Fatalf("warm frame target charge failed: %+v", warm)
+	}
+}
 
 func TestFrameOpcodeNames(t *testing.T) {
 	tests := map[OpCode]string{

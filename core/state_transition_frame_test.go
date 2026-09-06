@@ -872,6 +872,44 @@ func TestFrameTxGasAccounting(t *testing.T) {
 	t.Logf("total gas used: %d, gas limit: %d", result.UsedGas, msg.GasLimit)
 }
 
+func TestFrameTxTargetAccessGasAccounting(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	sender := common.HexToAddress("0x1111")
+	sponsor := common.HexToAddress("0x2222")
+	for address, code := range map[common.Address][]byte{
+		sender:  approveExecCode,
+		sponsor: approvePayCode,
+	} {
+		statedb.CreateAccount(address)
+		statedb.SetCode(address, code, tracing.CodeChangeUnspecified)
+		statedb.SetBalance(address, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	}
+	ftx := &types.FrameTx{
+		ChainID:   uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys: []*uint256.Int{uint256.NewInt(0)},
+		NonceSeq:  0,
+		Sender:    sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: vm.ApproveExecution, GasLimit: 50_000},
+			{Mode: types.FrameModeVerify, Flags: vm.ApprovePayment, Target: &sponsor, GasLimit: 50_000},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	result, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+	if err != nil || result.Failed() {
+		t.Fatalf("sponsored frame tx failed: result=%v err=%v", result, err)
+	}
+	approveGas := uint64(9) // three PUSH1 instructions; APPROVE itself is free.
+	if got, want := result.frameGasUsed[0].Execution, params.WarmAccountAccessAmsterdam+approveGas; got != want {
+		t.Fatalf("warm sender frame gas = %d, want %d", got, want)
+	}
+	if got, want := result.frameGasUsed[1].Execution, params.ColdAccountAccessAmsterdam+approveGas; got != want {
+		t.Fatalf("cold sponsor frame gas = %d, want %d", got, want)
+	}
+}
+
 func TestFrameTxGasReservations(t *testing.T) {
 	msg := &Message{
 		FrameIntrinsicGas: 1_000,
