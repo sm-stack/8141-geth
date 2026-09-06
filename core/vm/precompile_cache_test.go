@@ -20,17 +20,34 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+type countingCacheablePrecompile struct {
+	runs   atomic.Uint64
+	gas    uint64
+	output []byte
+	err    error
+}
+
+func (p *countingCacheablePrecompile) RequiredGas([]byte) uint64 { return p.gas }
+func (p *countingCacheablePrecompile) Run([]byte) ([]byte, error) {
+	p.runs.Add(1)
+	return common.CopyBytes(p.output), p.err
+}
+func (p *countingCacheablePrecompile) Name() string    { return "COUNTING" }
+func (p *countingCacheablePrecompile) Cacheable() bool { return true }
 
 // allPrecompileSets returns every set a node can run with, labelled by a fork
 // that selects it. It walks the flags of params.Rules and asks
@@ -296,6 +313,200 @@ func TestPrecompileCacheHit(t *testing.T) {
 	scope := precompileCacheScope{activePrecompiledContracts(rules), addr}
 	if _, ok := cache.load(scope, key); !ok {
 		t.Error("result was not stored under its key")
+	}
+}
+
+func TestValidationPrecompileMemoHitPreservesGasAndOutput(t *testing.T) {
+	const gasCost = uint64(1_234)
+	var (
+		memo  = NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 2, MaxBytes: 4096})
+		addr  = common.HexToAddress("0x01")
+		input = []byte{1, 2, 3}
+		p     = &countingCacheablePrecompile{gas: gasCost, output: []byte{4, 5, 6}}
+		rules = params.Rules{IsBerlin: true}
+	)
+	want, wantGas, wantErr := RunPrecompiledContract(nil, p, addr, input, NewGasBudget(gasCost+99, 0), nil, rules, memo)
+	want[0] = 0xff // Returned bytes must not alias the stored entry.
+	got, gotGas, gotErr := RunPrecompiledContract(nil, p, addr, input, NewGasBudget(gasCost+99, 0), nil, rules, memo)
+	if !bytes.Equal(got, []byte{4, 5, 6}) {
+		t.Fatalf("cached output = %x, want 040506", got)
+	}
+	if gotGas != wantGas || !errEqual(gotErr, wantErr) {
+		t.Fatalf("cached outcome gas/error = %v/%v, want %v/%v", gotGas, gotErr, wantGas, wantErr)
+	}
+	if runs := p.runs.Load(); runs != 1 {
+		t.Fatalf("actual runs = %d, want 1", runs)
+	}
+	stats := memo.Stats()
+	if stats.Hits != 1 || stats.Misses != 1 || stats.ActualRuns != 1 || stats.Stores != 1 || stats.CachedGas != gasCost {
+		t.Fatalf("memo stats: %+v", stats)
+	}
+	if stats.BeforeMutableHits != 1 || stats.BeforeMutableMisses != 1 || stats.BeforeMutableActualRuns != 1 || stats.AfterMutableHits != 0 {
+		t.Fatalf("memo watershed stats: %+v", stats)
+	}
+	if !memo.Complete() {
+		t.Fatal("complete memo reported incomplete")
+	}
+}
+
+func TestValidationPrecompileMemoHitPreservesStateTouch(t *testing.T) {
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	addr := common.HexToAddress("0x01")
+	statedb := &mockStateDB{touches: make(map[common.Address]int)}
+	rules := params.Rules{IsAmsterdam: true}
+	for range 2 {
+		if _, _, err := RunPrecompiledContract(statedb, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, memo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if touches := statedb.touches[addr]; touches != 2 {
+		t.Fatalf("precompile state touches = %d, want 2", touches)
+	}
+	if runs := p.runs.Load(); runs != 1 {
+		t.Fatalf("precompile actual runs = %d, want 1", runs)
+	}
+}
+
+func TestValidationPrecompileMemoFrameWatershedIsLocal(t *testing.T) {
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 2, MaxBytes: 4096})
+	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	addr := common.HexToAddress("0x01")
+	rules := params.Rules{}
+
+	stateFirst := memo.ValidationFrameView()
+	stateFirst.MarkValidationMutable()
+	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, stateFirst); err != nil {
+		t.Fatal(err)
+	}
+	pureFirst := memo.ValidationFrameView()
+	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, pureFirst); err != nil {
+		t.Fatal(err)
+	}
+	stats := memo.Stats()
+	if stats.AfterMutableMisses != 1 || stats.AfterMutableActualRuns != 1 || stats.BeforeMutableHits != 1 {
+		t.Fatalf("frame-local watershed stats: %+v", stats)
+	}
+}
+
+func TestValidationPrecompileMemoOOGPrecedesLookup(t *testing.T) {
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 1024})
+	p := &countingCacheablePrecompile{gas: 100, output: []byte{1}}
+	_, remaining, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x01"), []byte{1}, NewGasBudget(99, 0), nil, params.Rules{}, memo)
+	if !errors.Is(err, ErrOutOfGas) || remaining.ExecutionGas != 99 {
+		t.Fatalf("OOG result = %v, %v", remaining, err)
+	}
+	if stats := memo.Stats(); stats != (PrecompileCacheStats{}) {
+		t.Fatalf("OOG touched memo: %+v", stats)
+	}
+}
+
+func TestValidationPrecompileMemoStrictBoundsAndCopies(t *testing.T) {
+	var (
+		scope = precompileCacheScope{set: activePrecompiledContracts(params.Rules{}), addr: common.HexToAddress("0x01")}
+		key   = []byte{1, 2, 3}
+		out   = []byte{4, 5}
+		size  = validationMemoEntryOverhead + common.AddressLength + uint64(len(key)+len(out))
+	)
+	t.Run("exact byte limit", func(t *testing.T) {
+		memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: size})
+		memo.store(scope, key, out)
+		key[0], out[0] = 9, 9
+		got, ok := memo.load(scope, []byte{1, 2, 3})
+		if !ok || !bytes.Equal(got, []byte{4, 5}) {
+			t.Fatalf("copied entry = %x, %v", got, ok)
+		}
+		stats := memo.Stats()
+		if stats.Entries != 1 || stats.AccountedBytes != size || stats.Saturated != 0 || !memo.Complete() {
+			t.Fatalf("exact-limit stats: %+v complete=%v", stats, memo.Complete())
+		}
+	})
+	t.Run("one byte over", func(t *testing.T) {
+		memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: size - 1})
+		memo.store(scope, []byte{1, 2, 3}, []byte{4, 5})
+		stats := memo.Stats()
+		if stats.Entries != 0 || stats.Saturated != 1 || memo.Complete() {
+			t.Fatalf("over-limit stats: %+v complete=%v", stats, memo.Complete())
+		}
+	})
+	t.Run("entry limit does not evict", func(t *testing.T) {
+		memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
+		memo.store(scope, []byte{1}, []byte{2})
+		memo.store(scope, []byte{3}, []byte{4})
+		if _, ok := memo.load(scope, []byte{1}); !ok {
+			t.Fatal("saturation evicted the first admission artifact")
+		}
+		if _, ok := memo.load(scope, []byte{3}); ok {
+			t.Fatal("over-limit entry was stored")
+		}
+		if stats := memo.Stats(); stats.Entries != 1 || stats.Saturated != 1 {
+			t.Fatalf("entry-limit stats: %+v", stats)
+		}
+	})
+}
+
+func TestValidationPrecompileMemoExactInputAndForkScope(t *testing.T) {
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 4, MaxBytes: 4096})
+	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	addr := common.HexToAddress("0x01")
+	otherAddr := common.HexToAddress("0x02")
+	homestead := params.Rules{}
+	berlin := params.Rules{IsBerlin: true}
+	for _, call := range []struct {
+		input []byte
+		rules params.Rules
+		addr  common.Address
+	}{
+		{[]byte{1, 2}, homestead, addr},
+		{[]byte{1, 3}, homestead, addr},
+		{[]byte{1, 2}, berlin, addr},
+		{[]byte{1, 2}, homestead, otherAddr},
+	} {
+		if _, _, err := RunPrecompiledContract(nil, p, call.addr, call.input, NewGasBudget(1, 0), nil, call.rules, memo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runs := p.runs.Load(); runs != 4 {
+		t.Fatalf("exact input/fork/address actual runs = %d, want 4", runs)
+	}
+	if stats := memo.Stats(); stats.Misses != 4 || stats.Hits != 0 || stats.Stores != 4 {
+		t.Fatalf("exact input/fork/address stats: %+v", stats)
+	}
+}
+
+func TestValidationPrecompileMemoIsolationAndDisabledBehavior(t *testing.T) {
+	limits := ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096}
+	first := NewValidationPrecompileMemo(limits)
+	second := NewValidationPrecompileMemo(limits)
+	scope := precompileCacheScope{set: activePrecompiledContracts(params.Rules{}), addr: common.HexToAddress("0x01")}
+	first.store(scope, []byte{1}, []byte{1})
+	first.store(scope, []byte{2}, []byte{2})
+	second.store(scope, []byte{2}, []byte{2})
+	if first.Complete() || !second.Complete() || second.Stats().Entries != 1 {
+		t.Fatalf("transaction-local saturation leaked: first=%+v second=%+v", first.Stats(), second.Stats())
+	}
+
+	p := &countingCacheablePrecompile{gas: 7, output: []byte{1}}
+	for range 2 {
+		if _, gas, err := RunPrecompiledContract(nil, p, scope.addr, []byte{3}, NewGasBudget(9, 0), nil, params.Rules{}, nil); err != nil || gas.ExecutionGas != 2 {
+			t.Fatalf("cache-disabled invocation = %v, %v", gas, err)
+		}
+	}
+	if runs := p.runs.Load(); runs != 2 {
+		t.Fatalf("cache-disabled actual runs = %d, want 2", runs)
+	}
+}
+
+func TestValidationPrecompileMemoFailureIsIncomplete(t *testing.T) {
+	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 1024})
+	p := &countingCacheablePrecompile{gas: 1, err: errors.New("deterministic failure")}
+	_, _, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x01"), []byte{1}, NewGasBudget(1, 0), nil, params.Rules{}, memo)
+	if err == nil {
+		t.Fatal("expected precompile failure")
+	}
+	stats := memo.Stats()
+	if stats.ActualRuns != 1 || stats.Uncacheable != 1 || stats.Stores != 0 || memo.Complete() {
+		t.Fatalf("failure stats: %+v complete=%v", stats, memo.Complete())
 	}
 }
 

@@ -290,14 +290,20 @@ func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address comm
 		if key, ok := precompileCacheKey(p, input); ok {
 			scope := precompileCacheScope{activePrecompiledContracts(rules), address}
 			if output, ok := cache.load(scope, key); ok {
+				cache.recordCachedGas(gasCost)
 				return output, gas, nil
 			}
+			cache.recordActualRun()
 			output, err := p.Run(input)
 			if err == nil && len(output) <= maxCacheablePrecompileOutput {
 				cache.store(scope, key, output)
+			} else {
+				cache.recordUncacheable()
 			}
 			return output, gas, err
 		}
+		cache.recordActualRun()
+		cache.recordUncacheable()
 	}
 	output, err := p.Run(input)
 	return output, gas, err
