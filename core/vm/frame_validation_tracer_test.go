@@ -36,6 +36,7 @@ type mockStateDB struct {
 	code     map[common.Address][]byte
 	state    map[common.Address]map[common.Hash]common.Hash
 	exists   map[common.Address]bool
+	touches  map[common.Address]int
 }
 
 func (m *mockStateDB) GetCodeSize(addr common.Address) int { return m.codeSize[addr] }
@@ -90,9 +91,13 @@ func (m *mockStateDB) Exist(addr common.Address) bool {
 	}
 	return false
 }
-func (m *mockStateDB) Empty(common.Address) bool                                 { return true }
-func (m *mockStateDB) IsNewContract(common.Address) bool                         { return false }
-func (m *mockStateDB) Touch(common.Address)                                      {}
+func (m *mockStateDB) Empty(common.Address) bool         { return true }
+func (m *mockStateDB) IsNewContract(common.Address) bool { return false }
+func (m *mockStateDB) Touch(addr common.Address) {
+	if m.touches != nil {
+		m.touches[addr]++
+	}
+}
 func (m *mockStateDB) AddressInAccessList(common.Address) bool                   { return false }
 func (m *mockStateDB) SlotInAccessList(common.Address, common.Hash) (bool, bool) { return false, false }
 func (m *mockStateDB) AddAddressToAccessList(common.Address)                     {}
@@ -575,5 +580,238 @@ func TestSTO_NoExternalAccess(t *testing.T) {
 	tracer.OnExit(1, nil, 50000, nil, false)
 	if v := tracer.Violation(); v != nil {
 		t.Fatalf("unexpected violation: %s", v)
+	}
+}
+
+func newProfileTracer(gasLimit uint64) *FrameValidationTracer {
+	state := &mockStateDB{
+		codeSize: map[common.Address]int{
+			testContract:    100,
+			testPrecompile1: 0,
+		},
+	}
+	tracer := NewFrameValidationTracerWithOptions(state, testSender, testSender, []common.Address{testPrecompile1}, FrameValidationTracerOptions{FrameGasLimit: gasLimit})
+	tracer.OnEnter(0, byte(STATICCALL), common.Address{}, testSender, nil, gasLimit, nil)
+	return tracer
+}
+
+func TestFrameValidationWorkProfile(t *testing.T) {
+	const gasLimit = uint64(100_000)
+	t.Run("pure", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(0, byte(ADD), gasLimit, 3, emptyScope(), nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if profile.HasMutableRead || profile.StateDependentGasLimit != 0 {
+			t.Fatalf("pure profile: %+v", profile)
+		}
+	})
+	t.Run("first sload", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(7, byte(SLOAD), 99_000, 2_100, scopeForSload(testSender, testSlot), nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if !profile.HasMutableRead || profile.FirstMutableReadKind != ValidationMutableReadStorage || profile.FirstMutableReadPC != 7 || profile.FirstMutableReadDepth != 1 {
+			t.Fatalf("first mutable read: %+v", profile)
+		}
+		if profile.StateDependentGasLimit != 99_000 || profile.GasUsedBeforeFirstMutable != 1_000 {
+			t.Fatalf("remaining-gas bound: %+v", profile)
+		}
+		tracer.OnOpcode(8, byte(SLOAD), 80_000, 100, scopeForSload(testSender, common.HexToHash("0x02")), nil, 1, nil)
+		if got := tracer.WorkProfile(); got != profile {
+			t.Fatalf("second mutable read overwrote profile: have %+v want %+v", got, profile)
+		}
+	})
+	t.Run("late sload", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(90_000, byte(SLOAD), 10_000, 2_100, scopeForSload(testSender, testSlot), nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if profile.StateDependentGasLimit != 10_000 || profile.GasUsedBeforeFirstMutable != 90_000 {
+			t.Fatalf("late remaining-gas bound: %+v", profile)
+		}
+	})
+	t.Run("suffix branch does not change bound", func(t *testing.T) {
+		cheap := newProfileTracer(gasLimit)
+		expensive := newProfileTracer(gasLimit)
+		for _, tracer := range []*FrameValidationTracer{cheap, expensive} {
+			tracer.OnOpcode(1, byte(SLOAD), 80_000, 2_100, scopeForSload(testSender, testSlot), nil, 1, nil)
+		}
+		cheap.OnOpcode(2, byte(STOP), 77_900, 0, emptyScope(), nil, 1, nil)
+		expensive.OnOpcode(2, byte(ADD), 77_900, 3, emptyScope(), nil, 1, nil)
+		if cheap.WorkProfile() != expensive.WorkProfile() {
+			t.Fatalf("post-watershed branch changed bound: cheap=%+v expensive=%+v", cheap.WorkProfile(), expensive.WorkProfile())
+		}
+	})
+	t.Run("legacy nonce only", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		other := *uint256.NewInt(txParamLegacyNonce + 1)
+		tracer.OnOpcode(0, byte(TXPARAM), gasLimit, 2, &mockScope{stackData: []uint256.Int{other}}, nil, 1, nil)
+		if tracer.WorkProfile().HasMutableRead {
+			t.Fatal("immutable TXPARAM selector was classified as mutable")
+		}
+		legacy := *uint256.NewInt(txParamLegacyNonce)
+		tracer.OnOpcode(1, byte(TXPARAM), gasLimit-2, 2, &mockScope{stackData: []uint256.Int{legacy}}, nil, 1, nil)
+		if got := tracer.WorkProfile().FirstMutableReadKind; got != ValidationMutableReadLegacyNonce {
+			t.Fatalf("mutable kind: have %d want legacy nonce", got)
+		}
+	})
+	t.Run("precompile and external code", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(0, byte(STATICCALL), gasLimit, 10_000, scopeForCall(testPrecompile1), nil, 1, nil)
+		tracer.OnEnter(1, byte(STATICCALL), testSender, testPrecompile1, nil, 9_000, nil)
+		tracer.OnExit(1, nil, 0, nil, false)
+		if tracer.WorkProfile().HasMutableRead {
+			t.Fatal("precompile call was classified as a mutable code read")
+		}
+		tracer.OnOpcode(1, byte(EXTCODEHASH), 89_000, 100, scopeForExt(testContract), nil, 1, nil)
+		if got := tracer.WorkProfile().FirstMutableReadKind; got != ValidationMutableReadCode {
+			t.Fatalf("mutable kind: have %d want code", got)
+		}
+	})
+	t.Run("fail closed", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(0, byte(STATICCALL), 10, 11, scopeForCall(testPrecompile1), nil, 1, nil)
+		profile := tracer.WorkProfile()
+		if !profile.GasAccountingConservative || profile.StateDependentGasLimit != gasLimit {
+			t.Fatalf("underflow profile: %+v", profile)
+		}
+	})
+	t.Run("depth mismatch fails closed", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnEnter(2, byte(STATICCALL), testSender, testSender, nil, 50_000, nil)
+		profile := tracer.WorkProfile()
+		if !profile.GasAccountingConservative || profile.StateDependentGasLimit != gasLimit {
+			t.Fatalf("depth-mismatch profile: %+v", profile)
+		}
+	})
+	t.Run("unclosed child fails closed", func(t *testing.T) {
+		tracer := newProfileTracer(gasLimit)
+		tracer.OnOpcode(0, byte(STATICCALL), 90_000, 50_000, scopeForCall(testPrecompile1), nil, 1, nil)
+		tracer.OnExit(0, nil, 50_000, nil, false)
+		profile := tracer.WorkProfile()
+		if !profile.GasAccountingConservative || profile.StateDependentGasLimit != gasLimit {
+			t.Fatalf("unclosed-child profile: %+v", profile)
+		}
+	})
+}
+
+func TestFrameValidationEnvironmentAndDeploymentProfiles(t *testing.T) {
+	const gasLimit = uint64(100_000)
+	state := &mockStateDB{
+		codeSize: map[common.Address]int{params.FrameExpiryVerifierAddress: len(params.FrameExpiryVerifierCode)},
+		code:     map[common.Address][]byte{params.FrameExpiryVerifierAddress: params.FrameExpiryVerifierCode},
+	}
+	expiry := NewFrameValidationTracerWithOptions(state, testSender, params.FrameExpiryVerifierAddress, nil, FrameValidationTracerOptions{FrameGasLimit: gasLimit})
+	expiry.OnEnter(0, byte(STATICCALL), common.Address{}, params.FrameExpiryVerifierAddress, nil, gasLimit, nil)
+	expiry.OnOpcode(3, byte(TIMESTAMP), 99_000, 2, emptyScope(), nil, 1, nil)
+	if profile := expiry.WorkProfile(); profile.FirstMutableReadKind != ValidationMutableReadEnvironment || profile.StateDependentGasLimit != 99_000 {
+		t.Fatalf("expiry profile: %+v", profile)
+	}
+
+	deploy := NewFrameValidationTracerWithOptions(state, testSender, testSender, nil, FrameValidationTracerOptions{Deployment: true, FrameGasLimit: gasLimit})
+	deploy.OnEnter(0, byte(CALL), common.Address{}, testSender, nil, gasLimit, nil)
+	if profile := deploy.WorkProfile(); profile.FirstMutableReadKind != ValidationMutableReadDeployment || profile.StateDependentGasLimit != gasLimit {
+		t.Fatalf("deployment profile: %+v", profile)
+	}
+}
+
+func TestFrameValidationProfileOnlyDoesNotEnforceRules(t *testing.T) {
+	state := &mockStateDB{codeSize: map[common.Address]int{testContract: 100}}
+	tracer := NewFrameValidationTracerWithOptions(state, testSender, testContract, nil, FrameValidationTracerOptions{
+		ProfileOnly:   true,
+		FrameGasLimit: 100_000,
+	})
+	tracer.OnEnter(0, byte(STATICCALL), common.Address{}, testContract, nil, 100_000, nil)
+	tracer.OnOpcode(0, byte(SLOAD), 99_000, 2_100, scopeForSload(testContract, testSlot), nil, 1, nil)
+	tracer.OnOpcode(1, byte(BALANCE), 90_000, 100, emptyScope(), nil, 1, nil)
+	if violation := tracer.Violation(); violation != nil {
+		t.Fatalf("profile-only tracer changed validation result: %v", violation)
+	}
+	if got := tracer.WorkProfile().FirstMutableReadKind; got != ValidationMutableReadStorage {
+		t.Fatalf("profile-only mutable kind: have %d want storage", got)
+	}
+}
+
+func TestFrameValidationNestedCallUsesFrameWideGas(t *testing.T) {
+	const gasLimit = uint64(100_000)
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	statedb.CreateAccount(testSender)
+	// The top-level invocation has empty calldata and STATICCALLs itself with a
+	// one-byte input. The child branch then executes SLOAD. Calling the same
+	// validation program avoids introducing an external-code watershed first.
+	code := []byte{
+		byte(CALLDATASIZE), byte(PUSH1), 0x2b, byte(JUMPI),
+		byte(PUSH1), 0x01, byte(PUSH1), 0x00, byte(MSTORE),
+		byte(PUSH1), 0x00, byte(PUSH1), 0x00, byte(PUSH1), 0x01, byte(PUSH1), 0x1f,
+		byte(PUSH20),
+	}
+	code = append(code, testSender.Bytes()...)
+	code = append(code,
+		byte(PUSH2), 0xff, 0xff, byte(STATICCALL), byte(STOP),
+		byte(JUMPDEST), byte(PUSH1), 0x00, byte(SLOAD), byte(STOP),
+	)
+	statedb.SetCode(testSender, code, tracing.CodeChangeUnspecified)
+	tracer := NewFrameValidationTracerWithOptions(statedb, testSender, testSender, ActivePrecompiles(params.TestRules), FrameValidationTracerOptions{FrameGasLimit: gasLimit})
+	evm := NewEVM(BlockContext{BlockNumber: new(big.Int), Time: 1}, statedb, params.TestChainConfig, Config{Tracer: tracer.Hooks()})
+	_, _, err := evm.StaticCall(common.Address{}, testSender, nil, NewGasBudget(gasLimit, 0))
+	if err != nil {
+		t.Fatalf("nested validation call failed: %v", err)
+	}
+	if violation := tracer.Violation(); violation != nil {
+		t.Fatalf("nested validation trace failed: %v", violation)
+	}
+	profile := tracer.WorkProfile()
+	if profile.FirstMutableReadKind != ValidationMutableReadStorage || profile.FirstMutableReadDepth != 2 {
+		t.Fatalf("nested first mutable read: %+v", profile)
+	}
+	if profile.GasAccountingConservative || profile.StateDependentGasLimit == 0 || profile.StateDependentGasLimit > gasLimit {
+		t.Fatalf("nested frame-wide gas: %+v", profile)
+	}
+	if profile.StateDependentGasLimit <= 60_000 {
+		t.Fatalf("nested bound appears to contain child-local gas only: %+v", profile)
+	}
+}
+
+func TestFrameValidationTwoLevelNestedCallsUseFrameWideGas(t *testing.T) {
+	const gasLimit = uint64(200_000)
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	statedb.CreateAccount(testSender)
+
+	// Calldata sizes select root -> STATICCALL -> DELEGATECALL -> SLOAD. Both
+	// calls target the already fingerprinted sender, so code identity does not
+	// become the first mutable read. PUSH2 asks for more gas than EIP-150 may
+	// forward at the second level, exercising the interpreter's dynamic cost.
+	code := []byte{
+		byte(CALLDATASIZE), byte(PUSH1), 2, byte(EQ), byte(PUSH2), 0, 0, byte(JUMPI),
+		byte(CALLDATASIZE), byte(PUSH1), 1, byte(EQ), byte(PUSH2), 0, 0, byte(JUMPI),
+	}
+	sloadPatch, delegatePatch := 5, 13
+	code = append(code, byte(PUSH1), 1, byte(PUSH1), 0, byte(MSTORE))
+	code = append(code, byte(PUSH1), 0, byte(PUSH1), 0, byte(PUSH1), 1, byte(PUSH1), 31, byte(PUSH20))
+	code = append(code, testSender.Bytes()...)
+	code = append(code, byte(PUSH2), 0xff, 0xff, byte(STATICCALL), byte(STOP))
+	delegatePC := len(code)
+	code = append(code, byte(JUMPDEST), byte(PUSH1), 1, byte(PUSH1), 0, byte(MSTORE))
+	code = append(code, byte(PUSH1), 0, byte(PUSH1), 0, byte(PUSH1), 2, byte(PUSH1), 30, byte(PUSH20))
+	code = append(code, testSender.Bytes()...)
+	code = append(code, byte(PUSH2), 0xff, 0xff, byte(DELEGATECALL), byte(STOP))
+	sloadPC := len(code)
+	code = append(code, byte(JUMPDEST), byte(PUSH1), 0, byte(SLOAD), byte(STOP))
+	code[sloadPatch], code[sloadPatch+1] = byte(sloadPC>>8), byte(sloadPC)
+	code[delegatePatch], code[delegatePatch+1] = byte(delegatePC>>8), byte(delegatePC)
+
+	statedb.SetCode(testSender, code, tracing.CodeChangeUnspecified)
+	tracer := NewFrameValidationTracerWithOptions(statedb, testSender, testSender, ActivePrecompiles(params.TestRules), FrameValidationTracerOptions{FrameGasLimit: gasLimit})
+	evm := NewEVM(BlockContext{BlockNumber: new(big.Int), Time: 1}, statedb, params.TestChainConfig, Config{Tracer: tracer.Hooks()})
+	if _, _, err := evm.StaticCall(common.Address{}, testSender, nil, NewGasBudget(gasLimit, 0)); err != nil {
+		t.Fatalf("nested validation call failed: %v", err)
+	}
+	if violation := tracer.Violation(); violation != nil {
+		t.Fatalf("nested validation trace failed: %v", violation)
+	}
+	profile := tracer.WorkProfile()
+	if profile.FirstMutableReadKind != ValidationMutableReadStorage || profile.FirstMutableReadDepth != 3 {
+		t.Fatalf("two-level first mutable read: %+v", profile)
+	}
+	if profile.GasAccountingConservative || profile.StateDependentGasLimit <= 150_000 || profile.StateDependentGasLimit > gasLimit {
+		t.Fatalf("two-level frame-wide gas: %+v", profile)
 	}
 }

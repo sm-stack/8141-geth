@@ -34,6 +34,34 @@ type FrameValidationError struct {
 	Message string
 }
 
+// ValidationMutableReadKind identifies the first mutable execution input read
+// by an EIP-8141 validation frame.
+type ValidationMutableReadKind uint8
+
+const (
+	ValidationMutableReadNone ValidationMutableReadKind = iota
+	ValidationMutableReadStorage
+	ValidationMutableReadLegacyNonce
+	ValidationMutableReadCode
+	ValidationMutableReadEnvironment
+	ValidationMutableReadDeployment
+)
+
+// ValidationWorkProfile describes the maximum execution gas that may be spent
+// after a validation frame first observes mutable input. The bound is the
+// frame-wide gas remaining immediately before that read, not the gas actually
+// consumed by the observed suffix.
+type ValidationWorkProfile struct {
+	HasMutableRead            bool
+	FirstMutableReadKind      ValidationMutableReadKind
+	FirstMutableReadPC        uint64
+	FirstMutableReadDepth     int
+	FrameGasLimit             uint64
+	GasUsedBeforeFirstMutable uint64
+	StateDependentGasLimit    uint64
+	GasAccountingConservative bool
+}
+
 func (e *FrameValidationError) Error() string {
 	return fmt.Sprintf("[%s] %s", e.Rule, e.Message)
 }
@@ -79,6 +107,9 @@ type FrameValidationTracer struct {
 	lastOpValid    bool   // Whether lastOp is meaningful
 	allowTimestamp bool
 	options        FrameValidationTracerOptions
+	profile        ValidationWorkProfile
+	parentRetained map[int]uint64
+	rootEntered    bool
 
 	violation *FrameValidationError // First violation (nil = no violation)
 
@@ -91,6 +122,22 @@ type FrameValidationTracerOptions struct {
 
 	// AllowSenderStorageWrites permits SSTORE only when the executing scope is tx.sender.
 	AllowSenderStorageWrites bool
+
+	// ProfileOnly records dependencies and work without enforcing public-mempool
+	// trace rules. It is used for protocol-recognized validation programs whose
+	// existing acceptance semantics must not change.
+	ProfileOnly bool
+
+	// Deployment charges the full declared frame execution gas as mutable work.
+	Deployment bool
+
+	// FrameGasLimit is the declared execution gas of the validation frame.
+	FrameGasLimit uint64
+
+	// PrecompileMemo is the frame-local memo view used by this validation EVM.
+	// The tracer marks it after the first mutable read so memo statistics can
+	// distinguish structural pure-prefix reuse.
+	PrecompileMemo *PrecompileCache
 }
 
 // NewFrameValidationTracer creates a tracer for VERIFY frame validation.
@@ -114,7 +161,16 @@ func NewFrameValidationTracerWithOptions(stateDB StateDB, sender common.Address,
 		codeReads:      make(map[common.Address]struct{}),
 		allowTimestamp: frameTarget == params.FrameExpiryVerifierAddress && bytes.Equal(stateDB.GetCode(frameTarget), params.FrameExpiryVerifierCode),
 		options:        opts,
+		profile: ValidationWorkProfile{
+			FrameGasLimit: opts.FrameGasLimit,
+		},
+		parentRetained: make(map[int]uint64),
 	}
+}
+
+// WorkProfile returns the mutable-work measurement for this frame.
+func (t *FrameValidationTracer) WorkProfile() ValidationWorkProfile {
+	return t.profile
 }
 
 // StorageReads returns the tx.sender storage slots read by the validation frame.
@@ -164,18 +220,36 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		return
 	}
 	opcode := OpCode(op)
+	if t.options.Deployment {
+		t.recordMutableRead(ValidationMutableReadDeployment, pc, depth, gas)
+	}
 	if opcode == TXPARAM && scope != nil {
 		stackData := scope.StackData()
 		if len(stackData) > 0 {
 			selector, overflow := stackData[len(stackData)-1].Uint64WithOverflow()
 			if !overflow && selector == txParamLegacyNonce {
 				t.legacyNonce = true
+				t.recordMutableRead(ValidationMutableReadLegacyNonce, pc, depth, gas)
 			}
 		}
 	}
+	if opcode == SLOAD {
+		t.recordMutableRead(ValidationMutableReadStorage, pc, depth, gas)
+	}
+	if opcode == TIMESTAMP && t.allowTimestamp {
+		t.recordMutableRead(ValidationMutableReadEnvironment, pc, depth, gas)
+	}
+	if isExtOrCallOp(opcode) && scope != nil {
+		if addr, ok := validationCodeTarget(opcode, scope); ok && !t.precompiles[addr] && addr != t.sender && addr != t.frameTarget {
+			t.recordMutableRead(ValidationMutableReadCode, pc, depth, gas)
+		}
+	}
+	if isCallOp(opcode) {
+		t.trackParentRetainedGas(depth, gas, cost)
+	}
 
 	// [OP-012] Check if previous opcode was GAS not followed by CALL.
-	if t.lastOpValid && t.lastOp == GAS && !isCallOp(opcode) {
+	if !t.options.ProfileOnly && t.lastOpValid && t.lastOp == GAS && !isCallOp(opcode) {
 		t.violation = &FrameValidationError{
 			Rule:    "OP-012",
 			Message: fmt.Sprintf("GAS opcode not followed by CALL (followed by %s at pc=%d depth=%d)", opcode, pc, depth),
@@ -184,7 +258,7 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 	}
 
 	// [OP-011, OP-080] Check banned opcodes.
-	if bannedOpcodes[opcode] {
+	if !t.options.ProfileOnly && bannedOpcodes[opcode] {
 		if (opcode == CREATE || opcode == CREATE2) && t.options.AllowCreate {
 			t.lastOp = opcode
 			t.lastOpValid = true
@@ -213,18 +287,12 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 
 	// [OP-041] EXTCODE/CALL targets must have deployed code.
 	if isExtOrCallOp(opcode) && scope != nil {
-		stackData := scope.StackData()
-		addrIdx := 0
-		if isCallOp(opcode) {
-			addrIdx = 1 // CALL-type: address is stack[1] (after gas argument)
-		}
-		if len(stackData) > addrIdx {
-			addr := common.BytesToAddress(stackData[len(stackData)-addrIdx-1].Bytes())
+		if addr, ok := validationCodeTarget(opcode, scope); ok {
 			if !t.precompiles[addr] {
 				t.codeReads[addr] = struct{}{}
 			}
 			// Skip precompiles and sender (OP-042 exception).
-			if !t.precompiles[addr] && addr != t.sender {
+			if !t.options.ProfileOnly && !t.precompiles[addr] && addr != t.sender {
 				code := t.stateDB.GetCode(addr)
 				_, delegated := types.ParseDelegation(code)
 				if t.stateDB.GetCodeSize(addr) == 0 || delegated {
@@ -240,22 +308,27 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 
 	// EIP-8141 permits validation-prefix storage reads only from tx.sender.
 	if opcode == SLOAD && scope != nil {
-		if addr := scope.Address(); addr != t.sender {
+		addr := scope.Address()
+		if !t.options.ProfileOnly && addr != t.sender {
 			t.violation = &FrameValidationError{
 				Rule:    "STO-010",
 				Message: fmt.Sprintf("storage read outside sender at %s", addr.Hex()),
 			}
 			return
 		}
-		stackData := scope.StackData()
-		if len(stackData) > 0 {
-			t.storageReads[common.Hash(stackData[len(stackData)-1].Bytes32())] = struct{}{}
+		if addr == t.sender {
+			stackData := scope.StackData()
+			if len(stackData) > 0 {
+				t.storageReads[common.Hash(stackData[len(stackData)-1].Bytes32())] = struct{}{}
+			}
 		}
 	}
 
 	// Track lastOp for OP-012.
-	t.lastOp = opcode
-	t.lastOpValid = true
+	if !t.options.ProfileOnly {
+		t.lastOp = opcode
+		t.lastOpValid = true
+	}
 }
 
 // OnEnter is called when EVM enters a new call scope.
@@ -263,11 +336,30 @@ func (t *FrameValidationTracer) OnEnter(depth int, typ byte, from common.Address
 	if t.violation != nil {
 		return
 	}
+	if depth == 0 {
+		if t.rootEntered {
+			t.markGasAccountingConservative()
+		} else {
+			t.rootEntered = true
+			if t.profile.FrameGasLimit == 0 {
+				t.profile.FrameGasLimit = gas
+			} else if gas != t.profile.FrameGasLimit {
+				t.markGasAccountingConservative()
+			}
+			if t.options.Deployment {
+				t.recordMutableRead(ValidationMutableReadDeployment, 0, 0, gas)
+			}
+		}
+	} else if depth > 0 {
+		if _, ok := t.parentRetained[depth]; !ok {
+			t.markGasAccountingConservative()
+		}
+	}
 	opcode := OpCode(typ)
 	if opcode != CREATE && opcode != CREATE2 {
 		return
 	}
-	if !t.options.AllowCreate || to != t.sender {
+	if !t.options.ProfileOnly && (!t.options.AllowCreate || to != t.sender) {
 		t.violation = &FrameValidationError{
 			Rule:    "OP-011",
 			Message: fmt.Sprintf("%s creates %s instead of sender %s", opcode, to.Hex(), t.sender.Hex()),
@@ -280,14 +372,82 @@ func (t *FrameValidationTracer) OnExit(depth int, output []byte, gasUsed uint64,
 	if t.violation != nil {
 		return
 	}
+	if depth == 0 && len(t.parentRetained) != 0 {
+		t.markGasAccountingConservative()
+	} else if depth > 0 {
+		if _, ok := t.parentRetained[depth]; !ok {
+			t.markGasAccountingConservative()
+		} else {
+			delete(t.parentRetained, depth)
+		}
+	}
 	// [OP-020] Out-of-gas revert is forbidden — prevents gas limit probing.
-	if errors.Is(err, ErrOutOfGas) || errors.Is(err, ErrCodeStoreOutOfGas) {
+	if !t.options.ProfileOnly && (errors.Is(err, ErrOutOfGas) || errors.Is(err, ErrCodeStoreOutOfGas)) {
 		t.violation = &FrameValidationError{
 			Rule:    "OP-020",
 			Message: "out-of-gas during VERIFY frame execution",
 		}
 		return
 	}
+}
+
+func validationCodeTarget(opcode OpCode, scope tracing.OpContext) (common.Address, bool) {
+	stackData := scope.StackData()
+	addrIndex := 0
+	if isCallOp(opcode) {
+		addrIndex = 1 // CALL-type: address is stack[1] (after gas argument)
+	}
+	if len(stackData) <= addrIndex {
+		return common.Address{}, false
+	}
+	return common.BytesToAddress(stackData[len(stackData)-addrIndex-1].Bytes()), true
+}
+
+func (t *FrameValidationTracer) trackParentRetainedGas(depth int, gas, cost uint64) {
+	if depth <= 0 {
+		t.markGasAccountingConservative()
+		return
+	}
+	if _, exists := t.parentRetained[depth]; exists || cost > gas {
+		t.markGasAccountingConservative()
+		return
+	}
+	t.parentRetained[depth] = gas - cost
+}
+
+func (t *FrameValidationTracer) recordMutableRead(kind ValidationMutableReadKind, pc uint64, depth int, localGas uint64) {
+	t.options.PrecompileMemo.MarkValidationMutable()
+	if t.profile.HasMutableRead {
+		return
+	}
+	t.profile.HasMutableRead = true
+	t.profile.FirstMutableReadKind = kind
+	t.profile.FirstMutableReadPC = pc
+	t.profile.FirstMutableReadDepth = depth
+	if t.profile.GasAccountingConservative {
+		t.profile.StateDependentGasLimit = t.profile.FrameGasLimit
+		return
+	}
+	remaining := localGas
+	for parentDepth, retained := range t.parentRetained {
+		if parentDepth >= depth || ^uint64(0)-remaining < retained {
+			t.markGasAccountingConservative()
+			return
+		}
+		remaining += retained
+	}
+	if t.profile.FrameGasLimit == 0 || remaining > t.profile.FrameGasLimit {
+		t.markGasAccountingConservative()
+		return
+	}
+	t.profile.StateDependentGasLimit = remaining
+	t.profile.GasUsedBeforeFirstMutable = t.profile.FrameGasLimit - remaining
+}
+
+func (t *FrameValidationTracer) markGasAccountingConservative() {
+	t.profile.GasAccountingConservative = true
+	t.profile.StateDependentGasLimit = t.profile.FrameGasLimit
+	t.profile.GasUsedBeforeFirstMutable = 0
 }
 
 func isCallOp(op OpCode) bool {
