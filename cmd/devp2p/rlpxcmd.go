@@ -126,7 +126,7 @@ var (
 		ArgsUsage: "<node>",
 		Action:    rlpxFrameLoad,
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "corpus", Value: "bls", Usage: "workload corpus: arithmetic or bls"},
+			&cli.StringFlag{Name: "corpus", Value: "bls", Usage: "workload corpus: arithmetic, bls, or an EIP-8141 validation-split shape"},
 			&cli.Uint64Flag{Name: "chain-id", Value: 1337, Usage: "frame transaction chain ID"},
 			&cli.Uint64Flag{Name: "verify-gas", Value: 100_000, Usage: "VERIFY frame gas limit"},
 			&cli.IntFlag{Name: "peers", Value: 16, Usage: "parallel RLPx peers"},

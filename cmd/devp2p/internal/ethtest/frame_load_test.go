@@ -9,6 +9,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/internal/framecorpus"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -70,5 +71,37 @@ func TestFrameResultErrorJSONCompatibility(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFrameLoadValidationSplitCorpus(t *testing.T) {
+	config := FrameLoadConfig{Corpus: framecorpus.PairingPureFirst, ChainID: 1337, VerifyGas: framecorpus.VerifyGas}
+	first, err := frameLoadTx(config, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := frameLoadTx(config, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := frameLoadTx(config, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Frames()[0].Data, repeat.Frames()[0].Data) {
+		t.Fatal("same transaction variant did not retain its pairing input")
+	}
+	if bytes.Equal(first.Frames()[0].Data, second.Frames()[0].Data) {
+		t.Fatal("different transaction variants reused a pairing input")
+	}
+	workload, err := framecorpus.WorkloadFor(config.Corpus, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := FrameLoadGenesisCode()[workload.Sender]; !bytes.Equal(code, workload.Code) {
+		t.Fatal("frame-load genesis code differs from the shared corpus")
+	}
+	if _, err := frameLoadIterations(config.Corpus, framecorpus.VerifyGas-1); err == nil {
+		t.Fatal("pairing corpus accepted an undersized gas limit")
 	}
 }

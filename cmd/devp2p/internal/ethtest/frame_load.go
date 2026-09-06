@@ -21,6 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/internal/framecorpus"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
@@ -139,13 +140,13 @@ func (c *frameLoadConn) write(proto Proto, code uint64, msg any) error {
 	return c.Write(proto, code, msg)
 }
 
-// FrameLoadGenesisCode returns the runtime bytecode expected at the two
-// benchmark sender addresses.
+// FrameLoadGenesisCode returns the runtime bytecode expected at the benchmark
+// sender addresses.
 func FrameLoadGenesisCode() map[common.Address][]byte {
-	return map[common.Address][]byte{
-		FrameLoadArithmeticSender: common.CopyBytes(frameLoadArithmeticCode),
-		FrameLoadBLSSender:        common.CopyBytes(frameLoadBLSCode),
-	}
+	code := framecorpus.GenesisCode()
+	code[FrameLoadArithmeticSender] = common.CopyBytes(frameLoadArithmeticCode)
+	code[FrameLoadBLSSender] = common.CopyBytes(frameLoadBLSCode)
+	return code
 }
 
 func mirrorStatusPeer(s *Suite) (*frameLoadConn, error) {
@@ -205,7 +206,15 @@ func frameLoadIterations(corpus string, gasLimit uint64) (uint64, error) {
 		}
 		return (target - frameLoadBLSFixedGas + frameLoadBLSLoopGas - 1) / frameLoadBLSLoopGas, nil
 	default:
-		return 0, fmt.Errorf("unknown corpus %q (want arithmetic or bls)", corpus)
+		for _, name := range framecorpus.Names() {
+			if corpus == name {
+				if gasLimit < framecorpus.VerifyGas {
+					return 0, fmt.Errorf("corpus %q requires verify gas >= %d", corpus, framecorpus.VerifyGas)
+				}
+				return 1, nil
+			}
+		}
+		return 0, fmt.Errorf("unknown corpus %q", corpus)
 	}
 }
 
@@ -219,9 +228,18 @@ func frameLoadTx(config FrameLoadConfig, sequence uint64) (*types.Transaction, e
 
 	sender := FrameLoadArithmeticSender
 	data := word
-	if config.Corpus == "bls" {
+	switch config.Corpus {
+	case "bls":
 		sender = FrameLoadBLSSender
 		data = append(common.CopyBytes(frameLoadBLSInput), word...)
+	case "arithmetic":
+	default:
+		workload, err := framecorpus.WorkloadFor(config.Corpus, sequence)
+		if err != nil {
+			return nil, err
+		}
+		sender = workload.Sender
+		data = workload.Data
 	}
 	fee := uint256.NewInt(100_000_000_000 + sequence)
 	return types.NewTx(&types.FrameTx{
