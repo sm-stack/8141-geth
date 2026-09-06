@@ -202,6 +202,13 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if err := validateFramePoolNetworkPolicy(config.FramePool, networkID, genesisHash, stack.Config().P2P, config.EthDiscoveryURLs, config.SnapDiscoveryURLs); err != nil {
 		return nil, err
 	}
+	log.Info("Configured framepool validation policy",
+		"maxVerifyGas", config.FramePool.MaxVerifyGas,
+		"maxStateDependentVerifyGas", config.FramePool.MaxStateDependentVerifyGas,
+		"cacheValidationPrecompiles", config.FramePool.CacheValidationPrecompiles,
+		"validationMemoMaxEntries", config.FramePool.ValidationMemoMaxEntries,
+		"validationMemoMaxBytes", config.FramePool.ValidationMemoMaxBytes,
+	)
 	if raised := raisedFramePoolPolicy(config.FramePool); len(raised) > 0 {
 		log.Warn("Enabling unsafe framepool benchmark policy",
 			"network", networkID,

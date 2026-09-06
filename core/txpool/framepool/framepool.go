@@ -61,6 +61,12 @@ const (
 	PublicMaxVerifyGas uint64 = 100_000
 	maxVerifyGas              = PublicMaxVerifyGas
 
+	// Transaction-local validation memo defaults hold several normal proof
+	// precompile invocations while bounding a full 5,120-transaction pool to an
+	// 80 MiB configured entry budget, plus fixed per-memo and map overhead.
+	defaultValidationMemoMaxEntries = 8
+	defaultValidationMemoMaxBytes   = 16 * 1024
+
 	// frameTxPriceBump is the same-nonce replacement bump percentage.
 	frameTxPriceBump = 10
 
@@ -79,6 +85,10 @@ const (
 // Config configures frame transaction validation and resource policy.
 type Config struct {
 	MaxVerifyGas                       uint64
+	MaxStateDependentVerifyGas         uint64
+	CacheValidationPrecompiles         bool
+	ValidationMemoMaxEntries           int
+	ValidationMemoMaxBytes             uint64
 	MaxPendingPerSender                int
 	MaxPendingPerNonCanonicalPaymaster int
 	MaxPoolSize                        int
@@ -93,6 +103,10 @@ type Config struct {
 // checks run before protocol signatures and validation-prefix execution.
 var DefaultConfig = Config{
 	MaxVerifyGas:                       maxVerifyGas,
+	MaxStateDependentVerifyGas:         maxVerifyGas,
+	CacheValidationPrecompiles:         false,
+	ValidationMemoMaxEntries:           defaultValidationMemoMaxEntries,
+	ValidationMemoMaxBytes:             defaultValidationMemoMaxBytes,
 	MaxPendingPerSender:                PublicMaxPendingPerSender,
 	MaxPendingPerNonCanonicalPaymaster: PublicMaxPendingPerNonCanonicalPaymaster,
 	MaxPoolSize:                        defaultMaxFramePoolSize,
@@ -108,6 +122,18 @@ var DefaultConfig = Config{
 func (config Config) Sanitized() Config {
 	if config.MaxVerifyGas == 0 {
 		config.MaxVerifyGas = maxVerifyGas
+	}
+	if config.MaxStateDependentVerifyGas == 0 {
+		config.MaxStateDependentVerifyGas = config.MaxVerifyGas
+	}
+	if config.MaxStateDependentVerifyGas > config.MaxVerifyGas {
+		config.MaxStateDependentVerifyGas = config.MaxVerifyGas
+	}
+	if config.ValidationMemoMaxEntries <= 0 {
+		config.ValidationMemoMaxEntries = defaultValidationMemoMaxEntries
+	}
+	if config.ValidationMemoMaxBytes == 0 {
+		config.ValidationMemoMaxBytes = defaultValidationMemoMaxBytes
 	}
 	if config.MaxPendingPerSender <= 0 {
 		config.MaxPendingPerSender = PublicMaxPendingPerSender
@@ -162,6 +188,9 @@ type FramePool struct {
 	currentState               *state.StateDB
 	slotProvider               func(*types.Header) vm.SlotProvider
 	verifyGasCap               uint64
+	stateDependentVerifyGasCap uint64
+	cacheValidationPrecompiles bool
+	validationMemoLimits       vm.ValidationPrecompileMemoLimits
 	limits                     framePoolLimits
 	payerSolvencyPreflight     bool
 	payerCodeIdentityPreflight bool
@@ -175,14 +204,15 @@ type FramePool struct {
 	admissionValidationState *state.StateDB // reusable current-head view, guarded by validationMu
 	signatureValidationSlots chan struct{}
 	mu                       sync.RWMutex
-	pending                  map[common.Address][]*types.Transaction // sender → txs
-	all                      map[common.Hash]*types.Transaction      // hash → tx
-	nonceKeyOwner            nonceKeyOwnerIndex                      // sender and nonce key → transaction hash
-	meta                     map[common.Hash]frameTxMeta             // hash → validation/accounting metadata
-	dependencyIndex          *validationDependencyIndex              // mutable validation dependency → transaction hashes
-	stalePayerCode           map[common.Hash]payerCodeIdentity       // hash → admission-time payer code identity
-	blobSidecars             map[common.Hash]cachedBlobSidecar       // recently mined tx hash → full sidecar
-	blobCells                map[common.Hash][]kzg4844.Cell          // validated cells for pooled and recently mined txs
+	pending                  map[common.Address][]*types.Transaction   // sender → txs
+	all                      map[common.Hash]*types.Transaction        // hash → tx
+	nonceKeyOwner            nonceKeyOwnerIndex                        // sender and nonce key → transaction hash
+	meta                     map[common.Hash]frameTxMeta               // hash → validation/accounting metadata
+	dependencyIndex          *validationDependencyIndex                // mutable validation dependency → transaction hashes
+	stalePayerCode           map[common.Hash]payerCodeIdentity         // hash → admission-time payer code identity
+	staleValidationPrograms  map[common.Hash]validationProgramIdentity // hash → admission-time validation program identity
+	blobSidecars             map[common.Hash]cachedBlobSidecar         // recently mined tx hash → full sidecar
+	blobCells                map[common.Hash][]kzg4844.Cell            // validated cells for pooled and recently mined txs
 
 	paymasterReserved map[common.Address]*big.Int // payer → reserved pending max cost
 	paymasterPending  map[common.Address]int      // non-canonical payer → pending count
@@ -202,6 +232,43 @@ type frameTxMeta struct {
 	payerAvailableBalance *big.Int
 	payerCodeHash         common.Hash
 	validationDeps        *validationDependencySnapshot
+	validationWork        validationWorkSummary
+	validationMemo        *vm.PrecompileCache
+}
+
+type validationWorkSummary struct {
+	StateDependentGasLimit uint64
+	FirstMutableFrames     int
+	ConservativeFrames     int
+	DeployValidationGas    uint64
+	FrameProfiles          map[int]vm.ValidationWorkProfile
+}
+
+type validationArtifacts struct {
+	precompileMemo *vm.PrecompileCache
+}
+
+func (summary *validationWorkSummary) addFrame(index int, profile vm.ValidationWorkProfile) error {
+	if summary.FrameProfiles == nil {
+		summary.FrameProfiles = make(map[int]vm.ValidationWorkProfile)
+	}
+	summary.FrameProfiles[index] = profile
+	if profile.HasMutableRead {
+		summary.FirstMutableFrames++
+	}
+	if profile.GasAccountingConservative {
+		summary.ConservativeFrames++
+	}
+	if profile.FirstMutableReadKind == vm.ValidationMutableReadDeployment {
+		summary.DeployValidationGas = profile.StateDependentGasLimit
+	}
+	total, overflow := commonmath.SafeAdd(summary.StateDependentGasLimit, profile.StateDependentGasLimit)
+	if overflow {
+		summary.StateDependentGasLimit = ^uint64(0)
+		return fmt.Errorf("validation state-dependent gas overflows uint64")
+	}
+	summary.StateDependentGasLimit = total
+	return nil
 }
 
 type storageDependency struct {
@@ -211,6 +278,7 @@ type storageDependency struct {
 
 type validationDependencySnapshot struct {
 	senderCodeHash common.Hash
+	deployedSender bool
 	rules          params.Rules
 	legacyNonce    *uint64
 	senderBalance  *common.Hash
@@ -266,6 +334,11 @@ type payerCodeIdentity struct {
 	codeHash common.Hash
 }
 
+type validationProgramIdentity struct {
+	rules      params.Rules
+	codeHashes map[common.Address]common.Hash
+}
+
 type cachedBlobSidecar struct {
 	sidecar     *types.BlobTxSidecar
 	blockNumber uint64
@@ -285,6 +358,8 @@ type resetValidation struct {
 	meta          frameTxMeta
 	err           error
 	verifyElapsed time.Duration
+	memoBefore    vm.PrecompileCacheStats
+	memoAfter     vm.PrecompileCacheStats
 }
 
 // New creates a new frame transaction pool.
@@ -296,10 +371,16 @@ func New(chain BlockChain) *FramePool {
 func NewWithConfig(config Config, chain BlockChain) *FramePool {
 	config = config.Sanitized()
 	return &FramePool{
-		chain:        chain,
-		chainconfig:  chain.Config(),
-		signer:       types.LatestSigner(chain.Config()),
-		verifyGasCap: config.MaxVerifyGas,
+		chain:                      chain,
+		chainconfig:                chain.Config(),
+		signer:                     types.LatestSigner(chain.Config()),
+		verifyGasCap:               config.MaxVerifyGas,
+		stateDependentVerifyGasCap: config.MaxStateDependentVerifyGas,
+		cacheValidationPrecompiles: config.CacheValidationPrecompiles,
+		validationMemoLimits: vm.ValidationPrecompileMemoLimits{
+			MaxEntries: config.ValidationMemoMaxEntries,
+			MaxBytes:   config.ValidationMemoMaxBytes,
+		},
 		limits: framePoolLimits{
 			maxPendingPerSender:                config.MaxPendingPerSender,
 			maxPendingPerNonCanonicalPaymaster: config.MaxPendingPerNonCanonicalPaymaster,
@@ -317,6 +398,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		meta:                       make(map[common.Hash]frameTxMeta),
 		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             make(map[common.Hash]payerCodeIdentity),
+		staleValidationPrograms:    make(map[common.Hash]validationProgramIdentity),
 		blobSidecars:               make(map[common.Hash]cachedBlobSidecar),
 		blobCells:                  make(map[common.Hash][]kzg4844.Cell),
 		slotProvider: func(head *types.Header) vm.SlotProvider {
@@ -374,6 +456,11 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	resetLastVerifyMaxGauge.Update(0)
 	resetLastVerifyCountGauge.Update(0)
 	resetLastVerifyWorkersGauge.Update(0)
+	resetLastMemoHitsGauge.Update(0)
+	resetLastMemoMissesGauge.Update(0)
+	resetLastMemoActualRunsGauge.Update(0)
+	resetLastMemoCachedGasGauge.Update(0)
+	resetLastStateDependentGasGauge.Update(0)
 
 	resetRunMeter.Mark(1)
 	defer func() {
@@ -424,6 +511,10 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	for hash, identity := range p.stalePayerCode {
 		stalePayerCode[hash] = identity
 	}
+	staleValidationPrograms := make(map[common.Hash]validationProgramIdentity, len(p.staleValidationPrograms))
+	for hash, identity := range p.staleValidationPrograms {
+		staleValidationPrograms[hash] = identity
+	}
 	blobCells := make(map[common.Hash][]kzg4844.Cell, len(p.blobCells))
 	for hash, cells := range p.blobCells {
 		blobCells[hash] = cells
@@ -438,6 +529,9 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		currentState:               statedb,
 		slotProvider:               p.slotProvider,
 		verifyGasCap:               p.verifyGasCap,
+		stateDependentVerifyGasCap: p.stateDependentVerifyGasCap,
+		cacheValidationPrecompiles: p.cacheValidationPrecompiles,
+		validationMemoLimits:       p.validationMemoLimits,
 		limits:                     p.limits,
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
@@ -451,6 +545,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		meta:                       make(map[common.Hash]frameTxMeta),
 		dependencyIndex:            newValidationDependencyIndex(),
 		stalePayerCode:             stalePayerCode,
+		staleValidationPrograms:    staleValidationPrograms,
 		blobCells:                  blobCells,
 		paymasterReserved:          make(map[common.Address]*big.Int),
 		paymasterPending:           make(map[common.Address]int),
@@ -482,6 +577,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 	p.meta = candidate.meta
 	p.dependencyIndex = candidate.dependencyIndex
 	p.stalePayerCode = candidate.stalePayerCode
+	p.staleValidationPrograms = candidate.staleValidationPrograms
 	p.blobCells = candidate.blobCells
 	p.paymasterReserved = candidate.paymasterReserved
 	p.paymasterPending = candidate.paymasterPending
@@ -578,7 +674,7 @@ func (p *FramePool) revalidate(txs []*types.Transaction, oldMeta map[common.Hash
 			continue
 		}
 		meta, metaOK := oldMeta[tx.Hash()]
-		if metaOK && p.rejectChangedPayerCode(tx.Hash(), meta) {
+		if metaOK && p.rejectChangedValidationProgram(tx.Hash(), frameTx, meta) {
 			continue
 		}
 		if p.selectiveRevalidation {
@@ -659,9 +755,10 @@ func defaultSignatureValidationWorkers() int {
 	return min(max(runtime.GOMAXPROCS(0), 1), maxSignatureValidationWorkers)
 }
 
-// prepareResetValidations runs only the state-dependent EVM work in parallel.
-// Each worker owns a StateDB snapshot; results are written to their original
-// positions and committed later in deterministic reset priority order.
+// prepareResetValidations reruns the full current-format validation prefix for
+// state-affected candidates in parallel. Precompile memo hits may skip CPU
+// recomputation, but pure EVM still starts at PC 0. Each worker owns a StateDB
+// snapshot; results are committed later in deterministic reset priority order.
 func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 	var full []int
 	for i := range validations {
@@ -686,9 +783,14 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 			for index := range jobs {
 				validation := &validations[index]
 				cached := validation.meta
+				artifacts := validationArtifacts{precompileMemo: cached.validationMemo}
+				if artifacts.precompileMemo == nil {
+					artifacts = view.newValidationArtifacts()
+				}
+				validation.memoBefore = artifacts.precompileMemo.Stats()
 				start := time.Now()
 				if cached.signatureValidated {
-					validation.meta, validation.err = view.simulateVerifyFramesWithSignatureGas(validation.tx, cached.signatureGas)
+					validation.meta, validation.err = view.simulateVerifyFramesWithSignatureGasAndArtifacts(validation.tx, cached.signatureGas, artifacts)
 					if validation.err == nil {
 						validation.meta.signatureValidated = true
 						validation.meta.signatureGas = cached.signatureGas
@@ -697,6 +799,15 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 					validation.meta, validation.err = view.simulateVerifyFrames(validation.tx)
 				}
 				validation.verifyElapsed = time.Since(start)
+				if validation.meta.validationMemo != nil {
+					validation.memoAfter = validation.meta.validationMemo.Stats()
+				} else {
+					validation.memoAfter = artifacts.precompileMemo.Stats()
+				}
+				if validation.err == nil && cached.validationDeps != nil && cached.validationWork.FrameProfiles != nil && !validationWorkEqual(cached.validationWork, validation.meta.validationWork) {
+					resetProfileMismatchMeter.Mark(1)
+					validation.err = fmt.Errorf("%w: validation work profile changed without a program fingerprint change", core.ErrFrameTxInvalid)
+				}
 			}
 		}(view)
 	}
@@ -706,17 +817,48 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 	close(jobs)
 	wg.Wait()
 
-	var sum, maximum time.Duration
+	var (
+		sum, maximum                      time.Duration
+		memoHits, memoMisses, actualRuns  uint64
+		cachedGas, stateDependentGasTotal uint64
+	)
 	for _, index := range full {
-		elapsed := validations[index].verifyElapsed
+		validation := validations[index]
+		elapsed := validation.verifyElapsed
 		sum += elapsed
 		maximum = max(maximum, elapsed)
+		memoHits += validation.memoAfter.Hits - validation.memoBefore.Hits
+		memoMisses += validation.memoAfter.Misses - validation.memoBefore.Misses
+		actualRuns += validation.memoAfter.ActualRuns - validation.memoBefore.ActualRuns
+		cachedGas += validation.memoAfter.CachedGas - validation.memoBefore.CachedGas
+		stateDependentGasTotal += validation.meta.validationWork.StateDependentGasLimit
 	}
 	resetLastVerifySumGauge.Update(sum.Nanoseconds())
 	resetLastVerifyMeanGauge.Update((sum / time.Duration(len(full))).Nanoseconds())
 	resetLastVerifyMaxGauge.Update(maximum.Nanoseconds())
 	resetLastVerifyCountGauge.Update(int64(len(full)))
 	resetLastVerifyWorkersGauge.Update(int64(workers))
+	resetLastMemoHitsGauge.Update(int64(memoHits))
+	resetLastMemoMissesGauge.Update(int64(memoMisses))
+	resetLastMemoActualRunsGauge.Update(int64(actualRuns))
+	resetLastMemoCachedGasGauge.Update(int64(cachedGas))
+	resetLastStateDependentGasGauge.Update(int64(stateDependentGasTotal))
+}
+
+func validationWorkEqual(left, right validationWorkSummary) bool {
+	if left.StateDependentGasLimit != right.StateDependentGasLimit ||
+		left.FirstMutableFrames != right.FirstMutableFrames ||
+		left.ConservativeFrames != right.ConservativeFrames ||
+		left.DeployValidationGas != right.DeployValidationGas ||
+		len(left.FrameProfiles) != len(right.FrameProfiles) {
+		return false
+	}
+	for index, profile := range left.FrameProfiles {
+		if right.FrameProfiles[index] != profile {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *FramePool) reorgTransactions(oldHead, newHead *types.Header) (types.Transactions, types.Transactions, *validationDependencyTouches) {
@@ -1127,11 +1269,15 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if p.all[tx.Hash()] != nil {
 		return check, txpool.ErrAlreadyKnown
 	}
-	if staleCode, stale := p.stalePayerCode[tx.Hash()]; p.payerCodeIdentityPreflight && stale && p.currentState.GetCodeHash(staleCode.payer) != staleCode.codeHash {
-		if meterPreflight {
-			payerCodeIdentityReplayRejectMeter.Mark(1)
+	if staleProgram, stale := p.staleValidationPrograms[tx.Hash()]; p.payerCodeIdentityPreflight && stale {
+		if changed, address := p.validationProgramIdentityChanged(staleProgram); changed {
+			if meterPreflight {
+				payerCodeIdentityReplayRejectMeter.Mark(1)
+			}
+			return check, fmt.Errorf("%w: validation program at %s changed since transaction admission", core.ErrFrameTxInvalid, address)
 		}
-		return check, fmt.Errorf("%w: payer %s code hash changed since transaction admission", core.ErrFrameTxInvalid, staleCode.payer)
+		delete(p.staleValidationPrograms, tx.Hash())
+		delete(p.stalePayerCode, tx.Hash())
 	}
 	firstUse, err := validateFrameNonceAndCountFirstUse(frameTx, p.currentState)
 	if err != nil {
@@ -1272,6 +1418,7 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction, cells []kzg4844.Cell, 
 	}
 	p.reserveTxAccounting(tx, meta)
 	delete(p.stalePayerCode, tx.Hash())
+	delete(p.staleValidationPrograms, tx.Hash())
 	return nil
 }
 
@@ -1361,6 +1508,9 @@ func (p *FramePool) validationViewWithStateLocked(statedb *state.StateDB) *Frame
 		currentState:               statedb,
 		slotProvider:               p.slotProvider,
 		verifyGasCap:               p.verifyGasCap,
+		stateDependentVerifyGasCap: p.stateDependentVerifyGasCap,
+		cacheValidationPrecompiles: p.cacheValidationPrecompiles,
+		validationMemoLimits:       p.validationMemoLimits,
 		limits:                     p.limits,
 		payerSolvencyPreflight:     p.payerSolvencyPreflight,
 		payerCodeIdentityPreflight: p.payerCodeIdentityPreflight,
@@ -1431,8 +1581,14 @@ func (p *FramePool) validateFrameSignaturesBounded(frameTx *types.FrameTx) (uint
 }
 
 func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, signatureGas uint64) (frameTxMeta, error) {
+	return p.simulateVerifyFramesWithSignatureGasAndArtifacts(tx, signatureGas, p.newValidationArtifacts())
+}
+
+func (p *FramePool) simulateVerifyFramesWithSignatureGasAndArtifacts(tx *types.Transaction, signatureGas uint64, artifacts validationArtifacts) (frameTxMeta, error) {
 	start := time.Now()
-	meta, outcome, err := p.simulateVerifyFramesWithSignatureGasOutcome(tx, signatureGas)
+	memoBefore := artifacts.precompileMemo.Stats()
+	meta, outcome, err := p.simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx, signatureGas, artifacts)
+	markValidationMemoDelta(memoBefore, artifacts.precompileMemo.Stats())
 	verifyRunMeter.Mark(1)
 	verifyTimeTimer.UpdateSince(start)
 	verifyGasMeter.Mark(int64(outcome.gasUsed()))
@@ -1441,10 +1597,30 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGas(tx *types.Transaction, 
 	return meta, err
 }
 
+func markValidationMemoDelta(before, after vm.PrecompileCacheStats) {
+	validationMemoHitMeter.Mark(int64(after.Hits - before.Hits))
+	validationMemoMissMeter.Mark(int64(after.Misses - before.Misses))
+	validationMemoActualRunMeter.Mark(int64(after.ActualRuns - before.ActualRuns))
+	validationMemoStoreMeter.Mark(int64(after.Stores - before.Stores))
+	validationMemoUncacheableMeter.Mark(int64(after.Uncacheable - before.Uncacheable))
+	validationMemoSaturatedMeter.Mark(int64(after.Saturated - before.Saturated))
+}
+
 // simulateVerifyFramesWithSignatureGasOutcome runs the production validation
 // path while retaining the final VERIFY execution outcome for benchmarks and
 // corpus qualification. Admission callers intentionally discard the outcome.
 func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transaction, signatureGas uint64) (frameTxMeta, verifyResult, error) {
+	return p.simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx, signatureGas, p.newValidationArtifacts())
+}
+
+func (p *FramePool) newValidationArtifacts() validationArtifacts {
+	if !p.cacheValidationPrecompiles {
+		return validationArtifacts{}
+	}
+	return validationArtifacts{precompileMemo: vm.NewValidationPrecompileMemo(p.validationMemoLimits)}
+}
+
+func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *types.Transaction, signatureGas uint64, artifacts validationArtifacts) (frameTxMeta, verifyResult, error) {
 	frameTx := tx.GetFrameTx()
 	if frameTx == nil {
 		return frameTxMeta{}, verifyResult{}, fmt.Errorf("not a frame transaction")
@@ -1512,6 +1688,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	storageReads := make(map[common.Hash]struct{})
 	codeReads := make(map[common.Address]struct{})
 	legacyNonceRead := false
+	workSummary := validationWorkSummary{FrameProfiles: make(map[int]vm.ValidationWorkProfile)}
 	mergeDependencies := func(result verifyResult) {
 		for _, slot := range result.storageReads {
 			storageReads[slot] = struct{}{}
@@ -1520,6 +1697,9 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			codeReads[addr] = struct{}{}
 		}
 		legacyNonceRead = legacyNonceRead || result.legacyNonceRead
+	}
+	mergeWork := func(result verifyResult) error {
+		return workSummary.addFrame(result.frameIndex, result.workProfile)
 	}
 	directDefaultCode := canDirectEvaluateDefaultCodePrefix(frameTx, plan, baseState)
 	if directDefaultCode {
@@ -1536,11 +1716,16 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 		if frame.Target != nil {
 			target = *frame.Target
 		}
+		frameMemo := artifacts.precompileMemo.ValidationFrameView()
 		tracer := vm.NewFrameValidationTracerWithOptions(baseState, frameTx.Sender, target, precompiles, vm.FrameValidationTracerOptions{
 			AllowCreate:              true,
 			AllowSenderStorageWrites: true,
+			Deployment:               true,
+			FrameGasLimit:            frame.GasLimit,
+			PrecompileMemo:           frameMemo,
 		})
 		evm := vm.NewEVM(blockCtx, baseState, p.chainconfig, vm.Config{Tracer: tracer.Hooks()})
+		evm.SetPrecompileCache(frameMemo)
 		evm.SetTxContext(vm.TxContext{
 			Origin:   params.FrameEntryPointAddress,
 			GasPrice: new(uint256.Int),
@@ -1558,6 +1743,9 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			codeReads[addr] = struct{}{}
 		}
 		legacyNonceRead = legacyNonceRead || tracer.ReadsLegacyNonce()
+		if err := workSummary.addFrame(i, tracer.WorkProfile()); err != nil {
+			return frameTxMeta{}, verifyResult{}, err
+		}
 		if violation := tracer.Violation(); violation != nil {
 			return frameTxMeta{}, verifyResult{}, fmt.Errorf("deploy frame %d: %w", i, violation)
 		}
@@ -1573,9 +1761,12 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if directDefaultCode {
 		senderResult, err = evaluateDefaultCodeVerifyFrame(frameTx, plan.senderVerifyIndex)
 	} else {
-		senderResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.senderVerifyIndex, true)
+		senderResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.senderVerifyIndex, true, artifacts)
 	}
 	mergeDependencies(senderResult)
+	if workErr := mergeWork(senderResult); workErr != nil {
+		return frameTxMeta{}, senderResult, workErr
+	}
 	senderVerifyRunMeter.Mark(1)
 	senderVerifyGasMeter.Mark(int64(senderResult.frameGasUsed()))
 	if err != nil {
@@ -1592,6 +1783,9 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 			payerCodeHash:         p.currentState.GetCodeHash(frameTx.Sender),
 		}
 		meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead, directDefaultCode)
+		if err := p.finalizeValidationArtifacts(&meta, workSummary, artifacts); err != nil {
+			return frameTxMeta{}, senderResult, err
+		}
 		return meta, senderResult, nil
 	}
 	if senderResult.approveScope != vm.ApproveExecution {
@@ -1606,9 +1800,12 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	if directDefaultCode {
 		payResult, err = evaluateDefaultCodeVerifyFrame(frameTx, plan.payVerifyIndex)
 	} else {
-		payResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !meta.canonicalPaymaster)
+		payResult, err = p.simulateVerifyFrame(frameTx, frameCtx, blockCtx, rules, precompiles, baseState, plan.payVerifyIndex, !meta.canonicalPaymaster, artifacts)
 	}
 	mergeDependencies(payResult)
+	if workErr := mergeWork(payResult); workErr != nil {
+		return frameTxMeta{}, payResult, workErr
+	}
 	payResult.prefixGasUsed = senderResult.gasUsed() + payResult.frameGasUsed()
 	if err != nil {
 		return frameTxMeta{}, payResult, err
@@ -1623,7 +1820,45 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcome(tx *types.Transa
 	meta.payerAvailableBalance = p.payerAvailableBalance(meta)
 	meta.payerCodeHash = p.currentState.GetCodeHash(meta.payer)
 	meta.validationDeps = p.snapshotValidationDependencies(frameTx, plan, meta, storageReads, codeReads, legacyNonceRead, directDefaultCode)
+	if err := p.finalizeValidationArtifacts(&meta, workSummary, artifacts); err != nil {
+		return frameTxMeta{}, payResult, err
+	}
 	return meta, payResult, nil
+}
+
+func (p *FramePool) finalizeValidationArtifacts(meta *frameTxMeta, work validationWorkSummary, artifacts validationArtifacts) error {
+	meta.validationWork = work
+	meta.validationMemo = artifacts.precompileMemo
+	stateDependentGasMeter.Mark(int64(work.StateDependentGasLimit))
+	stateDependentGasHistogram.Update(int64(work.StateDependentGasLimit))
+	for _, profile := range work.FrameProfiles {
+		markFirstMutable(profile)
+	}
+	cap := p.stateDependentVerifyGasCap
+	if cap == 0 {
+		cap = p.verifyGasCap
+	}
+	if work.StateDependentGasLimit > cap {
+		stateDependentRejectMeter.Mark(1)
+		return fmt.Errorf("%w: state-dependent validation gas %d exceeds cap %d", core.ErrFrameTxInvalid, work.StateDependentGasLimit, cap)
+	}
+	return nil
+}
+
+func markFirstMutable(profile vm.ValidationWorkProfile) {
+	if profile.GasAccountingConservative {
+		firstMutableConservativeMeter.Mark(1)
+	}
+	switch profile.FirstMutableReadKind {
+	case vm.ValidationMutableReadStorage:
+		firstMutableStorageMeter.Mark(1)
+	case vm.ValidationMutableReadLegacyNonce:
+		firstMutableLegacyNonceMeter.Mark(1)
+	case vm.ValidationMutableReadCode:
+		firstMutableCodeMeter.Mark(1)
+	case vm.ValidationMutableReadEnvironment:
+		firstMutableEnvironmentMeter.Mark(1)
+	}
 }
 
 type validationPrefixPlan struct {
@@ -1815,6 +2050,9 @@ func evaluateDefaultCodeVerifyFrame(frameTx *types.FrameTx, index int) (verifyRe
 		target:       target,
 		gasLimit:     frame.GasLimit,
 		gasRemaining: remaining.ExecutionGas,
+		workProfile: vm.ValidationWorkProfile{
+			FrameGasLimit: frame.GasLimit,
+		},
 	}
 	if err == nil {
 		return result, nil
@@ -1830,7 +2068,7 @@ func evaluateDefaultCodeVerifyFrame(frameTx *types.FrameTx, index int) (verifyRe
 	return result, fmt.Errorf("VERIFY frame %d execution failed: %v", index, err)
 }
 
-func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.FrameContext, blockCtx vm.BlockContext, rules params.Rules, precompiles []common.Address, baseState *state.StateDB, index int, useTracer bool) (verifyResult, error) {
+func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.FrameContext, blockCtx vm.BlockContext, rules params.Rules, precompiles []common.Address, baseState *state.StateDB, index int, enforceRules bool, artifacts validationArtifacts) (verifyResult, error) {
 	frame := frameTx.Frames[index]
 	target := resolveFrameTarget(frameTx.Sender, frame)
 
@@ -1839,13 +2077,15 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 	frameSnapshot := baseState.Snapshot()
 	defer baseState.RevertToSnapshot(frameSnapshot)
 	simState := baseState
-	var tracer *vm.FrameValidationTracer
-	evmConfig := vm.Config{}
-	if useTracer {
-		tracer = vm.NewFrameValidationTracer(simState, frameTx.Sender, target, precompiles)
-		evmConfig.Tracer = tracer.Hooks()
-	}
+	frameMemo := artifacts.precompileMemo.ValidationFrameView()
+	tracer := vm.NewFrameValidationTracerWithOptions(simState, frameTx.Sender, target, precompiles, vm.FrameValidationTracerOptions{
+		ProfileOnly:    !enforceRules,
+		FrameGasLimit:  frame.GasLimit,
+		PrecompileMemo: frameMemo,
+	})
+	evmConfig := vm.Config{Tracer: tracer.Hooks()}
 	evm := vm.NewEVM(blockCtx, simState, p.chainconfig, evmConfig)
+	evm.SetPrecompileCache(frameMemo)
 	evm.SetTxContext(vm.TxContext{
 		Origin:   params.FrameEntryPointAddress,
 		GasPrice: new(uint256.Int),
@@ -1876,19 +2116,18 @@ func (p *FramePool) simulateVerifyFrame(frameTx *types.FrameTx, frameCtx *vm.Fra
 		target:       target,
 		gasLimit:     frame.GasLimit,
 		gasRemaining: gasRemaining,
+		workProfile:  tracer.WorkProfile(),
 	}
-	if tracer != nil {
-		result.storageReads = tracer.StorageReads()
-		result.codeReads = tracer.CodeReads()
-		result.legacyNonceRead = tracer.ReadsLegacyNonce()
-		if violation := tracer.Violation(); violation != nil {
-			if violation.Rule == "OP-020" {
-				result.failureClass = verifyFailureOutOfGas
-			} else {
-				result.failureClass = verifyFailureTracerViolation
-			}
-			return result, fmt.Errorf("VERIFY frame %d: %w", index, violation)
+	result.storageReads = tracer.StorageReads()
+	result.codeReads = tracer.CodeReads()
+	result.legacyNonceRead = tracer.ReadsLegacyNonce()
+	if violation := tracer.Violation(); violation != nil {
+		if violation.Rule == "OP-020" {
+			result.failureClass = verifyFailureOutOfGas
+		} else {
+			result.failureClass = verifyFailureTracerViolation
 		}
+		return result, fmt.Errorf("VERIFY frame %d: %w", index, violation)
 	}
 	scope := evm.TxContext.ApproveScope
 	if scope == vm.ApproveNone {
@@ -2206,6 +2445,7 @@ func uint64DependencyValue(value uint64) common.Hash {
 func (p *FramePool) snapshotValidationDependencies(frameTx *types.FrameTx, plan validationPrefixPlan, meta frameTxMeta, storageReads map[common.Hash]struct{}, codeReads map[common.Address]struct{}, legacyNonceRead, senderExistence bool) *validationDependencySnapshot {
 	snapshot := &validationDependencySnapshot{
 		senderCodeHash: p.currentState.GetCodeHash(frameTx.Sender),
+		deployedSender: plan.deployIndex >= 0,
 		rules:          p.chainconfig.Rules(p.currentHead.Number, p.currentHead.Difficulty.Sign() == 0, p.currentHead.Time),
 		storageValues:  make(map[storageDependency]common.Hash),
 		codeHashes:     make(map[common.Address]common.Hash),
@@ -2302,29 +2542,77 @@ func (p *FramePool) validationDependenciesUnchangedIndexed(hash common.Hash, fra
 	return currentRules == meta.validationDeps.rules
 }
 
-// rejectChangedPayerCode performs the admission-time external-payer code-identity
-// gate during head reset. A mismatch is known before signatures or validation-prefix
-// EVM execution, so the transaction is evicted directly and remembered for cheap
-// rejection if the exact same hash is replayed while the mismatch remains. Self-paid
-// transactions are excluded because a deploy prefix changes the sender's code only
-// inside the validation view before the payer metadata is captured.
-func (p *FramePool) rejectChangedPayerCode(hash common.Hash, meta frameTxMeta) bool {
-	if !p.payerCodeIdentityPreflight || !meta.usesPaymaster {
+// rejectChangedValidationProgram drops a pending transaction before signatures
+// or EVM execution when any code identity or fork rule used by its admission
+// profile has changed. The old profile and memo are valid only for the exact
+// validation program that produced them.
+func (p *FramePool) rejectChangedValidationProgram(hash common.Hash, frameTx *types.FrameTx, meta frameTxMeta) bool {
+	if !p.payerCodeIdentityPreflight || meta.validationDeps == nil {
 		return false
 	}
-	payerCodeIdentityCheckMeter.Mark(1)
-	if p.currentState.GetCodeHash(meta.payer) == meta.payerCodeHash {
+	if meta.usesPaymaster {
+		payerCodeIdentityCheckMeter.Mark(1)
+	}
+	identity := validationProgramIdentityFromMeta(frameTx, meta)
+	changed, address := p.validationProgramIdentityChanged(identity)
+	if !changed {
 		return false
 	}
-	payerCodeIdentityRejectMeter.Mark(1)
+	resetProgramDropMeter.Mark(1)
+	if meta.usesPaymaster && address == meta.payer {
+		payerCodeIdentityRejectMeter.Mark(1)
+	}
 	if len(p.stalePayerCode) >= p.limits.maxPoolSize {
 		for staleHash := range p.stalePayerCode {
 			delete(p.stalePayerCode, staleHash)
 			break
 		}
 	}
-	p.stalePayerCode[hash] = payerCodeIdentity{payer: meta.payer, codeHash: meta.payerCodeHash}
+	if meta.usesPaymaster && address == meta.payer {
+		p.stalePayerCode[hash] = payerCodeIdentity{payer: meta.payer, codeHash: meta.payerCodeHash}
+	}
+	if len(p.staleValidationPrograms) >= p.limits.maxPoolSize {
+		for staleHash := range p.staleValidationPrograms {
+			delete(p.staleValidationPrograms, staleHash)
+			delete(p.stalePayerCode, staleHash)
+			break
+		}
+	}
+	p.staleValidationPrograms[hash] = identity
 	return true
+}
+
+func validationProgramIdentityFromMeta(frameTx *types.FrameTx, meta frameTxMeta) validationProgramIdentity {
+	identity := validationProgramIdentity{
+		rules:      meta.validationDeps.rules,
+		codeHashes: make(map[common.Address]common.Hash, len(meta.validationDeps.codeHashes)+2),
+	}
+	if !meta.validationDeps.deployedSender {
+		identity.codeHashes[frameTx.Sender] = meta.validationDeps.senderCodeHash
+	}
+	if !meta.validationDeps.deployedSender || meta.payer != frameTx.Sender {
+		identity.codeHashes[meta.payer] = meta.payerCodeHash
+	}
+	for address, codeHash := range meta.validationDeps.codeHashes {
+		if meta.validationDeps.deployedSender && address == frameTx.Sender {
+			continue
+		}
+		identity.codeHashes[address] = codeHash
+	}
+	return identity
+}
+
+func (p *FramePool) validationProgramIdentityChanged(identity validationProgramIdentity) (bool, common.Address) {
+	currentRules := p.chainconfig.Rules(p.currentHead.Number, p.currentHead.Difficulty.Sign() == 0, p.currentHead.Time)
+	if currentRules != identity.rules {
+		return true, common.Address{}
+	}
+	for address, codeHash := range identity.codeHashes {
+		if p.currentState.GetCodeHash(address) != codeHash {
+			return true, address
+		}
+	}
+	return false, common.Address{}
 }
 
 // preflightPayerSolvency applies the all-payer solvency-only optimization before
@@ -2440,6 +2728,7 @@ type verifyResult struct {
 	storageReads    []common.Hash
 	codeReads       []common.Address
 	legacyNonceRead bool
+	workProfile     vm.ValidationWorkProfile
 }
 
 func (r verifyResult) frameGasUsed() uint64 {

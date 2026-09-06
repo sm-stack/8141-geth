@@ -22,6 +22,14 @@ func TestValidateFramePoolNetworkPolicy(t *testing.T) {
 	if err := validateFramePoolNetworkPolicy(framepool.DefaultConfig, 1, params.MainnetGenesisHash, networked, []string{"enrtree://mainnet"}, nil); err != nil {
 		t.Fatalf("public validation limit must be accepted on networked nodes: %v", err)
 	}
+	bounded := framepool.DefaultConfig
+	bounded.MaxStateDependentVerifyGas = 20_000
+	bounded.CacheValidationPrecompiles = true
+	bounded.ValidationMemoMaxEntries = 4
+	bounded.ValidationMemoMaxBytes = 8192
+	if err := validateFramePoolNetworkPolicy(bounded, 1, params.MainnetGenesisHash, networked, []string{"enrtree://mainnet"}, nil); err != nil {
+		t.Fatalf("bounded state policy and memo must not require the unsafe acceptance override: %v", err)
+	}
 	for _, mutate := range []func(*framepool.Config){
 		func(config *framepool.Config) { config.MaxVerifyGas++ },
 		func(config *framepool.Config) { config.MaxPendingPerSender++ },

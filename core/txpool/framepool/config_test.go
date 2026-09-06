@@ -10,6 +10,12 @@ func TestConfigSanitized(t *testing.T) {
 	if defaults.MaxVerifyGas != PublicMaxVerifyGas {
 		t.Fatalf("default validation gas = %d, want %d", defaults.MaxVerifyGas, PublicMaxVerifyGas)
 	}
+	if defaults.MaxStateDependentVerifyGas != defaults.MaxVerifyGas {
+		t.Fatalf("default state-dependent gas = %d, want %d", defaults.MaxStateDependentVerifyGas, defaults.MaxVerifyGas)
+	}
+	if defaults.ValidationMemoMaxEntries != defaultValidationMemoMaxEntries || defaults.ValidationMemoMaxBytes != defaultValidationMemoMaxBytes {
+		t.Fatalf("default memo limits = %d/%d, want %d/%d", defaults.ValidationMemoMaxEntries, defaults.ValidationMemoMaxBytes, defaultValidationMemoMaxEntries, defaultValidationMemoMaxBytes)
+	}
 	if defaults.MaxPendingPerSender != PublicMaxPendingPerSender {
 		t.Fatalf("default sender limit = %d, want %d", defaults.MaxPendingPerSender, PublicMaxPendingPerSender)
 	}
@@ -25,6 +31,10 @@ func TestConfigSanitized(t *testing.T) {
 
 	explicit := Config{
 		MaxVerifyGas:                       200_000,
+		MaxStateDependentVerifyGas:         20_000,
+		CacheValidationPrecompiles:         true,
+		ValidationMemoMaxEntries:           4,
+		ValidationMemoMaxBytes:             8192,
 		MaxPendingPerSender:                8,
 		MaxPendingPerNonCanonicalPaymaster: 16,
 		MaxPoolSize:                        1024,
@@ -47,12 +57,20 @@ func TestConfigSanitized(t *testing.T) {
 		invalid.ResetValidationWorkers != defaults.ResetValidationWorkers {
 		t.Fatalf("invalid configuration was not normalized: have %+v want numeric defaults %+v", invalid, defaults)
 	}
+	clamped := (Config{MaxVerifyGas: 50_000, MaxStateDependentVerifyGas: 60_000}).Sanitized()
+	if clamped.MaxStateDependentVerifyGas != clamped.MaxVerifyGas {
+		t.Fatalf("state-dependent gas was not clamped: %+v", clamped)
+	}
 }
 
 func TestConfigPropagatesToFramePool(t *testing.T) {
 	standard, _, _ := newTestEnv()
 	config := Config{
 		MaxVerifyGas:                       200_000,
+		MaxStateDependentVerifyGas:         20_000,
+		CacheValidationPrecompiles:         true,
+		ValidationMemoMaxEntries:           4,
+		ValidationMemoMaxBytes:             8192,
 		MaxPendingPerSender:                8,
 		MaxPendingPerNonCanonicalPaymaster: 16,
 		MaxPoolSize:                        1024,
@@ -60,6 +78,10 @@ func TestConfigPropagatesToFramePool(t *testing.T) {
 	}
 	pool := NewWithConfig(config, standard.chain)
 	if pool.verifyGasCap != config.MaxVerifyGas ||
+		pool.stateDependentVerifyGasCap != config.MaxStateDependentVerifyGas ||
+		pool.cacheValidationPrecompiles != config.CacheValidationPrecompiles ||
+		pool.validationMemoLimits.MaxEntries != config.ValidationMemoMaxEntries ||
+		pool.validationMemoLimits.MaxBytes != config.ValidationMemoMaxBytes ||
 		pool.limits.maxPendingPerSender != config.MaxPendingPerSender ||
 		pool.limits.maxPendingPerNonCanonicalPaymaster != config.MaxPendingPerNonCanonicalPaymaster ||
 		pool.limits.maxPoolSize != config.MaxPoolSize ||

@@ -484,6 +484,30 @@ var (
 		Value:    ethconfig.Defaults.FramePool.MaxVerifyGas,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolMaxStateDependentVerifyGasFlag = &cli.Uint64Flag{
+		Name:     "framepool.maxstatedependentverifygas",
+		Usage:    "Maximum frame validation gas remaining after the first mutable read (0 = maxverifygas)",
+		Value:    ethconfig.Defaults.FramePool.MaxStateDependentVerifyGas,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolCacheValidationPrecompilesFlag = &cli.BoolFlag{
+		Name:     "framepool.cachevalidationprecompiles",
+		Usage:    "Cache pure precompile outputs per frame transaction for reset revalidation (research A/B)",
+		Value:    ethconfig.Defaults.FramePool.CacheValidationPrecompiles,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolValidationMemoMaxEntriesFlag = &cli.IntFlag{
+		Name:     "framepool.validationmemomaxentries",
+		Usage:    "Maximum precompile memo entries retained per frame transaction (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.ValidationMemoMaxEntries,
+		Category: flags.TxPoolCategory,
+	}
+	FramePoolValidationMemoMaxBytesFlag = &cli.Uint64Flag{
+		Name:     "framepool.validationmemomaxbytes",
+		Usage:    "Maximum conservatively accounted precompile memo bytes per frame transaction (0 = default)",
+		Value:    ethconfig.Defaults.FramePool.ValidationMemoMaxBytes,
+		Category: flags.TxPoolCategory,
+	}
 	FramePoolMaxPendingPerSenderFlag = &cli.IntFlag{
 		Name:     "framepool.maxpendingpersender",
 		Usage:    "Maximum number of pending frame transactions per sender (0 = default)",
@@ -1814,6 +1838,25 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setTxPool(ctx, &cfg.TxPool)
 	if ctx.IsSet(FramePoolMaxVerifyGasFlag.Name) {
 		cfg.FramePool.MaxVerifyGas = ctx.Uint64(FramePoolMaxVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolMaxStateDependentVerifyGasFlag.Name) {
+		cfg.FramePool.MaxStateDependentVerifyGas = ctx.Uint64(FramePoolMaxStateDependentVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolCacheValidationPrecompilesFlag.Name) {
+		cfg.FramePool.CacheValidationPrecompiles = ctx.Bool(FramePoolCacheValidationPrecompilesFlag.Name)
+	}
+	if ctx.IsSet(FramePoolValidationMemoMaxEntriesFlag.Name) {
+		value := ctx.Int(FramePoolValidationMemoMaxEntriesFlag.Name)
+		if value < 0 {
+			Fatalf("--%s must not be negative", FramePoolValidationMemoMaxEntriesFlag.Name)
+		}
+		cfg.FramePool.ValidationMemoMaxEntries = value
+	}
+	if ctx.IsSet(FramePoolValidationMemoMaxBytesFlag.Name) {
+		cfg.FramePool.ValidationMemoMaxBytes = ctx.Uint64(FramePoolValidationMemoMaxBytesFlag.Name)
+	}
+	if ctx.IsSet(FramePoolMaxStateDependentVerifyGasFlag.Name) && cfg.FramePool.MaxStateDependentVerifyGas > cfg.FramePool.MaxVerifyGas {
+		Fatalf("--%s must not exceed --%s", FramePoolMaxStateDependentVerifyGasFlag.Name, FramePoolMaxVerifyGasFlag.Name)
 	}
 	if ctx.IsSet(FramePoolMaxPendingPerSenderFlag.Name) {
 		value := ctx.Int(FramePoolMaxPendingPerSenderFlag.Name)

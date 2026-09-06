@@ -104,6 +104,32 @@ func TestIsNetworkPresetUsesFlagValue(t *testing.T) {
 	}
 }
 
+func TestFramePoolValidationFlags(t *testing.T) {
+	ctx := newTestContext(t, []string{
+		"--framepool.maxstatedependentverifygas=20000",
+		"--framepool.cachevalidationprecompiles",
+		"--framepool.validationmemomaxentries=4",
+		"--framepool.validationmemomaxbytes=8192",
+	},
+		FramePoolMaxStateDependentVerifyGasFlag,
+		FramePoolCacheValidationPrecompilesFlag,
+		FramePoolValidationMemoMaxEntriesFlag,
+		FramePoolValidationMemoMaxBytesFlag,
+	)
+	if got := ctx.Uint64(FramePoolMaxStateDependentVerifyGasFlag.Name); got != 20_000 {
+		t.Fatalf("state-dependent gas flag = %d", got)
+	}
+	if !ctx.Bool(FramePoolCacheValidationPrecompilesFlag.Name) {
+		t.Fatal("validation precompile memo flag was not enabled")
+	}
+	if got := ctx.Int(FramePoolValidationMemoMaxEntriesFlag.Name); got != 4 {
+		t.Fatalf("memo entries flag = %d", got)
+	}
+	if got := ctx.Uint64(FramePoolValidationMemoMaxBytesFlag.Name); got != 8192 {
+		t.Fatalf("memo bytes flag = %d", got)
+	}
+}
+
 func newTestContext(t *testing.T, args []string, flags ...cli.Flag) *cli.Context {
 	t.Helper()
 
