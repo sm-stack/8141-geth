@@ -34,10 +34,27 @@ const (
 	ApproveBoth      uint8 = 3 // APPROVE(0x3): both execution and payment.
 )
 
-// ChargeFrameTargetAccess charges the ordinary Amsterdam account-access cost
-// for entering a frame. The target is warmed only after the frame budget can
-// cover the access, so an exceptional halt does not perform an unpriced read.
+// ChargeFrameTargetAccess charges the Amsterdam account-access costs required
+// for entering a frame. This includes the resolved target and, for EIP-7702
+// delegated code, the implementation address. Each address is warmed only
+// after the frame budget can cover its access, so an exceptional halt does not
+// perform an unpriced read.
 func ChargeFrameTargetAccess(statedb StateDB, target common.Address, gas *GasBudget) bool {
+	if !chargeFrameAccountAccess(statedb, target, gas) {
+		return false
+	}
+	if implementation, delegated := types.ParseDelegation(statedb.GetCode(target)); delegated {
+		if !chargeFrameAccountAccess(statedb, implementation, gas) {
+			return false
+		}
+		// Record the implementation's code access in the block-level access list
+		// only after the access charge succeeds.
+		statedb.GetCode(implementation)
+	}
+	return true
+}
+
+func chargeFrameAccountAccess(statedb StateDB, target common.Address, gas *GasBudget) bool {
 	cost := params.ColdAccountAccessAmsterdam
 	if statedb.AddressInAccessList(target) {
 		cost = params.WarmAccountAccessAmsterdam

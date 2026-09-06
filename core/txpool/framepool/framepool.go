@@ -1760,6 +1760,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *
 
 	// Shared block context used for both simulation phases.
 	random := common.Hash{}
+	slotProvider := p.slotProvider(simulationHead)
 	blockCtx := vm.BlockContext{
 		CanTransfer:  core.CanTransfer,
 		Transfer:     core.Transfer,
@@ -1771,7 +1772,8 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *
 		Difficulty:   new(big.Int),
 		BaseFee:      simulationHead.BaseFee,
 		Random:       &random,
-		SlotProvider: p.slotProvider(simulationHead),
+		SlotNum:      slotProvider.CurrentSlot(),
+		SlotProvider: slotProvider,
 	}
 	blockCtx.BlobBaseFee = framePoolBlobBaseFee(p.chainconfig, simulationHead)
 
@@ -2772,6 +2774,10 @@ func framePoolSimulationHeader(config *params.ChainConfig, parent *types.Header)
 	head := types.CopyHeader(parent)
 	head.Number = new(big.Int).Add(parent.Number, common.Big1)
 	head.Time = parent.Time + params.SecondsPerSlot
+	if parent.SlotNumber != nil {
+		nextSlot := *parent.SlotNumber + 1
+		head.SlotNumber = &nextSlot
+	}
 	if config.IsLondon(head.Number) {
 		head.BaseFee = eip1559.CalcBaseFee(config, parent)
 	} else {

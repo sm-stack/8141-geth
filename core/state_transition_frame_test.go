@@ -910,6 +910,36 @@ func TestFrameTxTargetAccessGasAccounting(t *testing.T) {
 	}
 }
 
+func TestFrameTxDelegatedTargetAccessGasAccounting(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+	sender := common.HexToAddress("0x1111")
+	implementation := common.HexToAddress("0x2222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, types.AddressToDelegation(implementation), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(implementation)
+	statedb.SetCode(implementation, approveBothCode, tracing.CodeChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID:    uint256.NewInt(config.ChainID.Uint64()),
+		NonceKeys:  []*uint256.Int{uint256.NewInt(0)},
+		Sender:     sender,
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 50_000}},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+	result, err := applyFrameTx(evm, config, makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee)))
+	if err != nil || result.Failed() {
+		t.Fatalf("delegated frame tx failed: result=%v err=%v", result, err)
+	}
+	approveGas := uint64(9) // three PUSH1 instructions; APPROVE itself is free.
+	want := params.WarmAccountAccessAmsterdam + params.ColdAccountAccessAmsterdam + approveGas
+	if got := result.frameGasUsed[0].Execution; got != want {
+		t.Fatalf("delegated sender frame gas = %d, want %d", got, want)
+	}
+}
+
 func TestFrameTxGasReservations(t *testing.T) {
 	msg := &Message{
 		FrameIntrinsicGas: 1_000,

@@ -23,6 +23,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -49,6 +50,62 @@ func TestChargeFrameTargetAccess(t *testing.T) {
 	warm := NewFrameGasBudget(params.WarmAccountAccessAmsterdam, 0)
 	if !ChargeFrameTargetAccess(statedb, target, &warm) || warm.ExecutionGas != 0 {
 		t.Fatalf("warm frame target charge failed: %+v", warm)
+	}
+
+	authority := common.HexToAddress("0x5678")
+	implementation := common.HexToAddress("0x9abc")
+	statedb.SetCode(authority, types.AddressToDelegation(implementation), tracing.CodeChangeUnspecified)
+	statedb.SetCode(implementation, []byte{byte(STOP)}, tracing.CodeChangeUnspecified)
+	delegated := NewFrameGasBudget(2*params.ColdAccountAccessAmsterdam, 0)
+	if !ChargeFrameTargetAccess(statedb, authority, &delegated) || delegated.ExecutionGas != 0 {
+		t.Fatalf("delegated frame target charge failed: %+v", delegated)
+	}
+	if !statedb.AddressInAccessList(authority) || !statedb.AddressInAccessList(implementation) {
+		t.Fatal("delegated frame target access did not warm authority and implementation")
+	}
+	warmDelegated := NewFrameGasBudget(2*params.WarmAccountAccessAmsterdam, 0)
+	if !ChargeFrameTargetAccess(statedb, authority, &warmDelegated) || warmDelegated.ExecutionGas != 0 {
+		t.Fatalf("warm delegated frame target charge failed: %+v", warmDelegated)
+	}
+
+	coldAuthority := common.HexToAddress("0xdef0")
+	coldImplementation := common.HexToAddress("0xdef1")
+	statedb.SetCode(coldAuthority, types.AddressToDelegation(coldImplementation), tracing.CodeChangeUnspecified)
+	insufficientDelegation := NewFrameGasBudget(2*params.ColdAccountAccessAmsterdam-1, 0)
+	if ChargeFrameTargetAccess(statedb, coldAuthority, &insufficientDelegation) {
+		t.Fatal("insufficient delegation implementation access succeeded")
+	}
+	if !statedb.AddressInAccessList(coldAuthority) {
+		t.Fatal("successfully charged delegation authority was not warmed")
+	}
+	if statedb.AddressInAccessList(coldImplementation) {
+		t.Fatal("unaffordable delegation implementation access warmed the implementation")
+	}
+}
+
+func TestChargeFrameDelegationAccessRecordsImplementation(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	rules := params.Rules{IsAmsterdam: true}
+	authority := common.HexToAddress("0x1234")
+	implementation := common.HexToAddress("0x5678")
+
+	// Finalise setup separately so the access list below contains only reads
+	// performed while charging this frame entry.
+	statedb.Prepare(rules, common.Address{}, common.Address{}, nil, nil, nil)
+	statedb.CreateAccount(authority)
+	statedb.SetCode(authority, types.AddressToDelegation(implementation), tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(implementation)
+	statedb.SetCode(implementation, []byte{byte(STOP)}, tracing.CodeChangeUnspecified)
+	statedb.Finalise(rules)
+	statedb.Prepare(rules, common.Address{}, common.Address{}, nil, nil, nil)
+
+	budget := NewFrameGasBudget(2*params.ColdAccountAccessAmsterdam, 0)
+	if !ChargeFrameTargetAccess(statedb, authority, &budget) {
+		t.Fatal("delegated frame target charge failed")
+	}
+	accesses := statedb.Finalise(rules)
+	if _, ok := accesses.Accounts[implementation]; !ok {
+		t.Fatal("delegation implementation code read missing from block access list")
 	}
 }
 

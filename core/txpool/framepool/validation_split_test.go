@@ -309,6 +309,29 @@ func TestVerifySimulationChargesFrameTargetAccess(t *testing.T) {
 	}
 }
 
+func TestVerifySimulationChargesDelegatedTargetAccess(t *testing.T) {
+	pool, statedb, chainConfig := newTestEnv()
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	implementation := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, types.AddressToDelegation(implementation), tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(implementation)
+	statedb.SetCode(implementation, approveScopeCode(vm.ApproveBoth), tracing.CodeChangeUnspecified)
+
+	frameTx := baseFTX(sender, 0, chainConfig)
+	frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: 20_000}}
+	_, outcome, err := pool.simulateVerifyFramesWithSignatureGasOutcome(makeFrameTx(frameTx), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approveGas := uint64(7) // PUSH1, two PUSH0 instructions; APPROVE itself is free.
+	want := params.WarmAccountAccessAmsterdam + params.ColdAccountAccessAmsterdam + approveGas
+	if got := outcome.gasUsed(); got != want {
+		t.Fatalf("delegated validation frame gas = %d, want %d", got, want)
+	}
+}
+
 func txMaxCostThenApproveCode() []byte {
 	return append([]byte{byte(vm.PUSH1), 0x06, byte(vm.TXPARAM), byte(vm.POP)}, approveBothCode...)
 }

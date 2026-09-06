@@ -174,8 +174,10 @@ func TestFramePoolSimulationHeaderUsesNextBlockContext(t *testing.T) {
 	pool, _, config := newTestEnv()
 	parent := pool.currentHead
 	zero := uint64(0)
+	parentSlot := uint64(8272)
 	parent.ExcessBlobGas = &zero
 	parent.BlobGasUsed = &zero
+	parent.SlotNumber = &parentSlot
 	parent.GasUsed = parent.GasLimit
 	nextTime := parent.Time + params.SecondsPerSlot
 	config.BogotaTime = &nextTime
@@ -186,6 +188,12 @@ func TestFramePoolSimulationHeaderUsesNextBlockContext(t *testing.T) {
 	}
 	if head.Time != nextTime {
 		t.Fatalf("simulation time = %d, want %d", head.Time, nextTime)
+	}
+	if head.SlotNumber == nil || *head.SlotNumber != parentSlot+1 {
+		t.Fatalf("simulation slot = %v, want %d", head.SlotNumber, parentSlot+1)
+	}
+	if *parent.SlotNumber != parentSlot {
+		t.Fatalf("simulation mutated parent slot to %d", *parent.SlotNumber)
 	}
 	if want := eip1559.CalcBaseFee(config, parent); head.BaseFee.Cmp(want) != 0 {
 		t.Fatalf("simulation base fee = %v, want %v", head.BaseFee, want)
@@ -1264,6 +1272,8 @@ func setupRecentRootFrameTx(t *testing.T, currentSlot, refSlot uint64) (*FramePo
 	t.Helper()
 	pool, statedb, config := newTestEnv()
 	pool.currentHead.Time = (currentSlot - 1) * params.SecondsPerSlot
+	parentSlot := currentSlot - 1
+	pool.currentHead.SlotNumber = &parentSlot
 	pool.cacheValidationPrecompiles = true
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
@@ -1356,7 +1366,9 @@ func TestFramePoolRecentRootResetRevalidation(t *testing.T) {
 			t.Fatal(err)
 		}
 		newHead := *pool.currentHead
-		newHead.Time = (ref.Slot + params.RecentRootWindow) * params.SecondsPerSlot
+		newParentSlot := ref.Slot + params.RecentRootWindow - 1
+		newHead.SlotNumber = &newParentSlot
+		newHead.Time = newParentSlot * params.SecondsPerSlot
 		verifyBefore := verifyRunMeter.Snapshot().Count()
 		precompileBefore := validationMemoActualRunMeter.Snapshot().Count()
 		pool.Reset(pool.currentHead, &newHead)
