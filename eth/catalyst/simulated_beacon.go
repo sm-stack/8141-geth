@@ -218,7 +218,12 @@ func (c *SimulatedBeacon) sealBlockLocked(withdrawals []*types.Withdrawal, times
 		BeaconRoot:            &common.Hash{},
 	}
 	if c.eth.BlockChain().Config().IsAmsterdam(new(big.Int).Add(header.Number, big.NewInt(1)), timestamp) {
-		slotNumber := uint64(0)
+		// There is no beacon chain in developer mode, so derive the EIP-7843
+		// slot number from wall-clock time the same way the pre-Amsterdam
+		// TimestampSlotProvider does. This keeps slot-based features such as
+		// EIP-8272 recent roots usable on the devnet: every SecondsPerSlot
+		// seconds (including dev_advanceTime) advances the slot by one.
+		slotNumber := timestamp / params.SecondsPerSlot
 		attribute.SlotNumber = &slotNumber
 	}
 
