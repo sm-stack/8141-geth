@@ -35,7 +35,7 @@ var (
 const (
 	massInvalidationSignerKey  = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
 	massInvalidationPayerGas   = uint64(6_000)
-	massInvalidationSenderGas  = PublicMaxVerifyGas - params.SigGasSecp256k1 - massInvalidationPayerGas
+	massInvalidationSenderGas  = PublicMaxRevalidationGas - params.SigGasSecp256k1 - massInvalidationPayerGas
 	massInvalidationApproveGas = uint64(9)
 	// Seven BLS calls fit the 92,200-gas sender frame. The authenticated
 	// benchmark payer consumes 5,202 gas on its successful payment path,

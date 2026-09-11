@@ -74,6 +74,7 @@ var (
 		utils.TxPoolGlobalQueueFlag,
 		utils.TxPoolLifetimeFlag,
 		utils.FramePoolMaxVerifyGasFlag,
+		utils.FramePoolMaxRevalidationGasFlag,
 		utils.FramePoolMaxStateDependentVerifyGasFlag,
 		utils.FramePoolCacheValidationPrecompilesFlag,
 		utils.FramePoolRejectIncompleteValidationMemoFlag,

@@ -6,6 +6,22 @@ frame wire format.
 
 ## Policy and accounting
 
+Admission requires declared validation gas (including protocol signature gas)
+of at most 250,000, and `G - c <= 100,000`. Here `G` is the sum of declared
+execution gas across all validation-prefix frames, including unused gas;
+signature gas remains in the total cap but is not in `G - c`. `c` counts only
+native gas charged for allowlisted precompile invocations before the first
+transaction-global mutable read whose results are actually retained in the
+transaction memo. Repeated invocations of a retained key each count, but the
+credit is measured afresh on every execution, not accumulated across resets.
+Pure-only frames also pay `G - c`: ordinary EVM work before a mutable read is
+not deducted. Capacity misses earn no credit and conservative frames get none.
+
+`MaxRevalidationGas` is independent of the older optional suffix constraint
+`MaxStateDependentVerifyGas` described below. No section-5 aggregate gas budgets
+(pool, sender, or dependency) are enforced; sender/paymaster count limits remain
+unchanged at one.
+
 Every EVM validation frame records the gas remaining immediately before its
 first mutable read. This is a frame-wide remaining budget, including gas
 retained by active parent calls, rather than the gas eventually consumed by the
@@ -58,6 +74,12 @@ address, and normalized exact input bytes; outputs are copied on storage and
 return. Gas charging and state touching happen before lookup, so a hit skips
 only CPU recomputation.
 
+The validation allowlist requires at least 2,000 native gas and at most 1,024
+raw input bytes, checked before normalization/lookup. It covers ecrecover,
+bounded modexp, BN254 multiplication/pairing, KZG, P256 and qualifying BLS calls.
+SHA-256, RIPEMD-160, BN254 addition and IDENTITY are excluded. The separate
+block-processing cache is unchanged.
+
 The memo never evicts. Deterministic precompile failures are cached with their
 failure outcome. An uncacheable call or a capacity miss marks it incomplete
 while execution continues normally. Statistics and completeness distinguish
@@ -75,21 +97,23 @@ baseline. At the default 5,120 pool limit, `MaxPoolSize * MaxBytesPerTx` is 80
 MiB of configured entry budget; fixed memo and map overhead is additional and
 must be included in RSS measurements.
 
-Defaults preserve the prior policy:
+Current defaults:
 
 ```text
-MaxVerifyGas                    100000
-MaxStateDependentVerifyGas      100000
-CacheValidationPrecompiles      false
+MaxVerifyGas                    250000
+MaxRevalidationGas              100000
+MaxStateDependentVerifyGas      250000
+CacheValidationPrecompiles      true
 RejectIncompleteValidationMemo  false
 ValidationMemoMaxEntries        8
 ValidationMemoMaxBytes          16384
 ```
 
 The corresponding CLI flags are under `framepool.*`. Raising
-`MaxVerifyGas` continues to use the existing unsafe benchmark guard. The memo
-is opt-in, while profiling and the default-equivalent state cap remain active
-when it is off.
+`MaxVerifyGas` or `MaxRevalidationGas` above these defaults requires the existing
+unsafe benchmark guard. Disabling the memo sets `c = 0`; the G-c cap still applies.
+The `revalidation/gas`, `revalidation/creditgas` and `revalidation/reject` metrics
+report the per-transaction bound, retained credit and policy rejection.
 
 ## Measurement corpus
 

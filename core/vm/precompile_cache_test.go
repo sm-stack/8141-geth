@@ -318,24 +318,24 @@ func TestPrecompileCacheHit(t *testing.T) {
 }
 
 func TestValidationPrecompileMemoHitPreservesGasAndOutput(t *testing.T) {
-	const gasCost = uint64(1_234)
+	const gasCost = uint64(6_000)
 	var (
 		memo  = NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 2, MaxBytes: 4096})
-		addr  = common.HexToAddress("0x01")
-		input = []byte{1, 2, 3}
-		p     = &countingCacheablePrecompile{gas: gasCost, output: []byte{4, 5, 6}}
+		addr  = common.HexToAddress("0x07")
+		input = make([]byte, 96)
+		p     = &bn256ScalarMulIstanbul{}
 		rules = params.Rules{IsBerlin: true}
 	)
 	want, wantGas, wantErr := RunPrecompiledContract(nil, p, addr, input, NewGasBudget(gasCost+99, 0), nil, rules, memo)
 	want[0] = 0xff // Returned bytes must not alias the stored entry.
 	got, gotGas, gotErr := RunPrecompiledContract(nil, p, addr, input, NewGasBudget(gasCost+99, 0), nil, rules, memo)
-	if !bytes.Equal(got, []byte{4, 5, 6}) {
-		t.Fatalf("cached output = %x, want 040506", got)
+	if !bytes.Equal(got, make([]byte, 64)) {
+		t.Fatalf("cached output = %x, want zero point", got)
 	}
 	if gotGas != wantGas || !errEqual(gotErr, wantErr) {
 		t.Fatalf("cached outcome gas/error = %v/%v, want %v/%v", gotGas, gotErr, wantGas, wantErr)
 	}
-	if runs := p.runs.Load(); runs != 1 {
+	if runs := memo.Stats().ActualRuns; runs != 1 {
 		t.Fatalf("actual runs = %d, want 1", runs)
 	}
 	stats := memo.Stats()
@@ -352,36 +352,36 @@ func TestValidationPrecompileMemoHitPreservesGasAndOutput(t *testing.T) {
 
 func TestValidationPrecompileMemoHitPreservesStateTouch(t *testing.T) {
 	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 4096})
-	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	p := &ecrecover{}
 	addr := common.HexToAddress("0x01")
 	statedb := &mockStateDB{touches: make(map[common.Address]int)}
 	rules := params.Rules{IsAmsterdam: true}
 	for range 2 {
-		if _, _, err := RunPrecompiledContract(statedb, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, memo); err != nil {
+		if _, _, err := RunPrecompiledContract(statedb, p, addr, []byte{1}, NewGasBudget(params.EcrecoverGas, 0), nil, rules, memo); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if touches := statedb.touches[addr]; touches != 2 {
 		t.Fatalf("precompile state touches = %d, want 2", touches)
 	}
-	if runs := p.runs.Load(); runs != 1 {
+	if runs := memo.Stats().ActualRuns; runs != 1 {
 		t.Fatalf("precompile actual runs = %d, want 1", runs)
 	}
 }
 
 func TestValidationPrecompileMemoFrameWatershedIsLocal(t *testing.T) {
 	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 2, MaxBytes: 4096})
-	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	p := &ecrecover{}
 	addr := common.HexToAddress("0x01")
 	rules := params.Rules{}
 
 	stateFirst := memo.ValidationFrameView()
 	stateFirst.MarkValidationMutable()
-	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, stateFirst); err != nil {
+	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(params.EcrecoverGas, 0), nil, rules, stateFirst); err != nil {
 		t.Fatal(err)
 	}
 	pureFirst := memo.ValidationFrameView()
-	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(1, 0), nil, rules, pureFirst); err != nil {
+	if _, _, err := RunPrecompiledContract(nil, p, addr, []byte{1}, NewGasBudget(params.EcrecoverGas, 0), nil, rules, pureFirst); err != nil {
 		t.Fatal(err)
 	}
 	stats := memo.Stats()
@@ -448,7 +448,7 @@ func TestValidationPrecompileMemoStrictBoundsAndCopies(t *testing.T) {
 
 func TestValidationPrecompileMemoExactInputAndForkScope(t *testing.T) {
 	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 4, MaxBytes: 4096})
-	p := &countingCacheablePrecompile{gas: 1, output: []byte{1}}
+	p := &ecrecover{}
 	addr := common.HexToAddress("0x01")
 	otherAddr := common.HexToAddress("0x02")
 	homestead := params.Rules{}
@@ -463,11 +463,11 @@ func TestValidationPrecompileMemoExactInputAndForkScope(t *testing.T) {
 		{[]byte{1, 2}, berlin, addr},
 		{[]byte{1, 2}, homestead, otherAddr},
 	} {
-		if _, _, err := RunPrecompiledContract(nil, p, call.addr, call.input, NewGasBudget(1, 0), nil, call.rules, memo); err != nil {
+		if _, _, err := RunPrecompiledContract(nil, p, call.addr, call.input, NewGasBudget(params.EcrecoverGas, 0), nil, call.rules, memo); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if runs := p.runs.Load(); runs != 4 {
+	if runs := memo.Stats().ActualRuns; runs != 4 {
 		t.Fatalf("exact input/fork/address actual runs = %d, want 4", runs)
 	}
 	if stats := memo.Stats(); stats.Misses != 4 || stats.Hits != 0 || stats.Stores != 4 {
@@ -500,10 +500,12 @@ func TestValidationPrecompileMemoIsolationAndDisabledBehavior(t *testing.T) {
 
 func TestValidationPrecompileMemoCachesDeterministicFailure(t *testing.T) {
 	memo := NewValidationPrecompileMemo(ValidationPrecompileMemoLimits{MaxEntries: 1, MaxBytes: 1024})
-	p := &countingCacheablePrecompile{gas: 1, err: errors.New("deterministic failure")}
+	p := &bn256PairingIstanbul{}
+	input := bytes.Repeat([]byte{0xff}, 192)
+	_, wantErr := p.Run(input)
 	for range 2 {
-		_, remaining, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x01"), []byte{1}, NewGasBudget(2, 0), nil, params.Rules{}, memo)
-		if err == nil || err.Error() != "deterministic failure" || remaining.ExecutionGas != 1 {
+		_, remaining, err := RunPrecompiledContract(nil, p, common.HexToAddress("0x08"), input, NewGasBudget(p.RequiredGas(input)+1, 0), nil, params.Rules{}, memo)
+		if err == nil || !errEqual(err, wantErr) || remaining.ExecutionGas != 1 {
 			t.Fatalf("cached failure outcome = %v, %v", remaining, err)
 		}
 	}

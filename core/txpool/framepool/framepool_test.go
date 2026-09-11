@@ -902,6 +902,10 @@ func TestFramePoolExpiryVerifierFrame(t *testing.T) {
 	if errs[0] != nil {
 		t.Fatalf("expected valid expiry verifier frame to be accepted, got: %v", errs[0])
 	}
+	work := pool.meta[makeFrameTx(ftx).Hash()].validationWork
+	if work.ValidationGasLimit != 90_000 || work.RevalidationGasLimit != 90_000 {
+		t.Fatalf("expiry frame missing from declared validation budget: %+v", work)
+	}
 }
 
 func TestFramePoolExpiryVerifierExpiredDeadline(t *testing.T) {
@@ -1526,6 +1530,7 @@ func TestFramePoolGasCap(t *testing.T) {
 func TestFramePoolPrivacyProofVerifyGasBudget(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 	pool.verifyGasCap = 500_000
+	pool.revalidationGasCap = 500_000 // Explicit isolated override for the old total-budget test.
 
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	statedb.CreateAccount(sender)
@@ -1635,7 +1640,7 @@ func TestFramePoolCountsPayFrameInUpfrontVerifyBudget(t *testing.T) {
 func TestFramePoolRejectsSignatureGasBeforeCryptographicValidation(t *testing.T) {
 	pool, _, config := newTestEnv()
 	ftx := baseFTX(common.HexToAddress("0x1111111111111111111111111111111111111111"), 0, config)
-	for range 15 {
+	for range int(PublicMaxVerifyGas/params.SigGasP256) + 1 {
 		ftx.Signatures = append(ftx.Signatures, types.TxSignature{
 			Scheme:    types.SignatureSchemeP256,
 			Signature: make([]byte, 64), // Invalid, but the aggregate gas cap must win first.

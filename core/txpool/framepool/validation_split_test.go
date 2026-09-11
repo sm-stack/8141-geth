@@ -70,6 +70,8 @@ type stateChangeFixture struct {
 func validationSplitConfig(stateGas uint64, memo bool) Config {
 	config := DefaultConfig
 	config.MaxVerifyGas = 250_000
+	// These legacy tests isolate the suffix policy from the independent G-c cap.
+	config.MaxRevalidationGas = 250_000
 	config.MaxStateDependentVerifyGas = stateGas
 	config.CacheValidationPrecompiles = memo
 	return config
@@ -766,7 +768,7 @@ func TestValidationProgramChangesDropBeforeResetExecution(t *testing.T) {
 			statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 			changedAddress := test.setup(statedb, sender)
 			frameTx := baseFTX(sender, 0, chainConfig)
-			frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: PublicMaxVerifyGas}}
+			frameTx.Frames = []types.Frame{{Mode: types.FrameModeVerify, Flags: vm.ApproveBoth, GasLimit: PublicMaxRevalidationGas}}
 			tx := makeFrameTx(frameTx)
 			if err := pool.Add([]*types.Transaction{tx}, false)[0]; err != nil {
 				t.Fatalf("admission failed: %v", err)

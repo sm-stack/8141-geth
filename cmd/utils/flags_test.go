@@ -106,18 +106,23 @@ func TestIsNetworkPresetUsesFlagValue(t *testing.T) {
 
 func TestFramePoolValidationFlags(t *testing.T) {
 	ctx := newTestContext(t, []string{
+		"--framepool.maxrevalidationgas=80000",
 		"--framepool.maxstatedependentverifygas=20000",
 		"--framepool.cachevalidationprecompiles",
 		"--framepool.rejectincompletevalidationmemo",
 		"--framepool.validationmemomaxentries=4",
 		"--framepool.validationmemomaxbytes=8192",
 	},
+		FramePoolMaxRevalidationGasFlag,
 		FramePoolMaxStateDependentVerifyGasFlag,
 		FramePoolCacheValidationPrecompilesFlag,
 		FramePoolRejectIncompleteValidationMemoFlag,
 		FramePoolValidationMemoMaxEntriesFlag,
 		FramePoolValidationMemoMaxBytesFlag,
 	)
+	if got := ctx.Uint64(FramePoolMaxRevalidationGasFlag.Name); got != 80_000 {
+		t.Fatalf("revalidation gas flag = %d", got)
+	}
 	if got := ctx.Uint64(FramePoolMaxStateDependentVerifyGasFlag.Name); got != 20_000 {
 		t.Fatalf("state-dependent gas flag = %d", got)
 	}

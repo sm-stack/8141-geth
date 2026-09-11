@@ -58,6 +58,7 @@ type ValidationWorkProfile struct {
 	FirstMutableReadPC        uint64
 	FirstMutableReadDepth     int
 	FrameGasLimit             uint64
+	CachedPrecompileGas       uint64 // Retained native-call gas before the global watershed.
 	GasUsedBeforeFirstMutable uint64
 	StateDependentGasLimit    uint64
 	GasAccountingConservative bool
@@ -189,7 +190,11 @@ func NewFrameValidationTracerWithOptions(stateDB StateDB, sender common.Address,
 
 // WorkProfile returns the mutable-work measurement for this frame.
 func (t *FrameValidationTracer) WorkProfile() ValidationWorkProfile {
-	return t.profile
+	profile := t.profile
+	if !profile.GasAccountingConservative {
+		profile.CachedPrecompileGas = t.options.PrecompileMemo.ReusableValidationGas()
+	}
+	return profile
 }
 
 // StorageReads returns the tx.sender storage slots read by the validation frame.

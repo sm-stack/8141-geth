@@ -58,9 +58,12 @@ const (
 	// capacity matches the legacy pool's default executable-slot count.
 	defaultMaxFramePoolSize = 5120
 
-	// PublicMaxVerifyGas is the fixed EIP-8141 public-mempool validation budget.
-	PublicMaxVerifyGas uint64 = 100_000
+	// PublicMaxVerifyGas is this implementation's public-mempool validation budget.
+	PublicMaxVerifyGas uint64 = 250_000
 	maxVerifyGas              = PublicMaxVerifyGas
+
+	// PublicMaxRevalidationGas bounds G minus retained pre-watershed native gas.
+	PublicMaxRevalidationGas uint64 = 100_000
 
 	// Transaction-local validation memo defaults hold several normal proof
 	// precompile invocations while bounding a full 5,120-transaction pool to an
@@ -86,6 +89,7 @@ const (
 // Config configures frame transaction validation and resource policy.
 type Config struct {
 	MaxVerifyGas                       uint64
+	MaxRevalidationGas                 uint64
 	MaxStateDependentVerifyGas         uint64
 	CacheValidationPrecompiles         bool
 	RejectIncompleteValidationMemo     bool
@@ -101,12 +105,13 @@ type Config struct {
 	AllowUnsafeBenchmarkPolicy         bool `toml:"-"`
 }
 
-// DefaultConfig follows the EIP-8141 public-mempool constants. Cheap payer
+// DefaultConfig defines the experimental EIP-8141 public-mempool policy. Cheap payer
 // checks run before protocol signatures and validation-prefix execution.
 var DefaultConfig = Config{
 	MaxVerifyGas:                       maxVerifyGas,
+	MaxRevalidationGas:                 PublicMaxRevalidationGas,
 	MaxStateDependentVerifyGas:         maxVerifyGas,
-	CacheValidationPrecompiles:         false,
+	CacheValidationPrecompiles:         true,
 	RejectIncompleteValidationMemo:     false,
 	ValidationMemoMaxEntries:           defaultValidationMemoMaxEntries,
 	ValidationMemoMaxBytes:             defaultValidationMemoMaxBytes,
@@ -126,6 +131,10 @@ func (config Config) Sanitized() Config {
 	if config.MaxVerifyGas == 0 {
 		config.MaxVerifyGas = maxVerifyGas
 	}
+	if config.MaxRevalidationGas == 0 {
+		config.MaxRevalidationGas = PublicMaxRevalidationGas
+	}
+	config.MaxRevalidationGas = min(config.MaxRevalidationGas, config.MaxVerifyGas)
 	if config.MaxStateDependentVerifyGas == 0 {
 		config.MaxStateDependentVerifyGas = config.MaxVerifyGas
 	}
@@ -194,6 +203,7 @@ type FramePool struct {
 	currentState                   *state.StateDB
 	slotProvider                   func(*types.Header) vm.SlotProvider
 	verifyGasCap                   uint64
+	revalidationGasCap             uint64
 	stateDependentVerifyGasCap     uint64
 	cacheValidationPrecompiles     bool
 	rejectIncompleteValidationMemo bool
@@ -244,6 +254,9 @@ type frameTxMeta struct {
 }
 
 type validationWorkSummary struct {
+	ValidationGasLimit     uint64
+	CachedPrecompileGas    uint64
+	RevalidationGasLimit   uint64
 	StateDependentGasLimit uint64
 	FirstMutableFrames     int
 	ConservativeFrames     int
@@ -264,6 +277,9 @@ func (summary *validationWorkSummary) addFrame(index int, profile vm.ValidationW
 }
 
 func (summary *validationWorkSummary) recompute() error {
+	summary.ValidationGasLimit = 0
+	summary.CachedPrecompileGas = 0
+	summary.RevalidationGasLimit = 0
 	summary.StateDependentGasLimit = 0
 	summary.FirstMutableFrames = 0
 	summary.ConservativeFrames = 0
@@ -283,11 +299,24 @@ func (summary *validationWorkSummary) recompute() error {
 			summary.DeployValidationGas = profile.StateDependentGasLimit
 		}
 	}
-	if firstMutableIndex < 0 {
-		return nil
-	}
 	for frameIndex, profile := range summary.FrameProfiles {
-		if frameIndex < firstMutableIndex {
+		totalGas, overflow := commonmath.SafeAdd(summary.ValidationGasLimit, profile.FrameGasLimit)
+		if overflow {
+			summary.RevalidationGasLimit = ^uint64(0)
+			return fmt.Errorf("validation gas overflows uint64")
+		}
+		summary.ValidationGasLimit = totalGas
+		credit := uint64(0)
+		if !profile.GasAccountingConservative && (firstMutableIndex < 0 || frameIndex <= firstMutableIndex) {
+			credit = profile.CachedPrecompileGas
+		}
+		if credit > profile.FrameGasLimit || (profile.HasMutableRead && credit > profile.GasUsedBeforeFirstMutable) {
+			return fmt.Errorf("cached precompile gas exceeds pure-prefix budget")
+		}
+		// Credits cannot overflow: each is bounded by its frame's gas above.
+		summary.CachedPrecompileGas += credit
+		summary.RevalidationGasLimit = totalGas - summary.CachedPrecompileGas
+		if firstMutableIndex < 0 || frameIndex < firstMutableIndex {
 			continue
 		}
 		// Frame results, gas-used fields, and the transaction access journal can
@@ -436,6 +465,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		chainconfig:                    chain.Config(),
 		signer:                         types.LatestSigner(chain.Config()),
 		verifyGasCap:                   config.MaxVerifyGas,
+		revalidationGasCap:             config.MaxRevalidationGas,
 		stateDependentVerifyGasCap:     config.MaxStateDependentVerifyGas,
 		cacheValidationPrecompiles:     config.CacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: config.RejectIncompleteValidationMemo,
@@ -591,6 +621,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		currentState:                   statedb,
 		slotProvider:                   p.slotProvider,
 		verifyGasCap:                   p.verifyGasCap,
+		revalidationGasCap:             p.revalidationGasCap,
 		stateDependentVerifyGasCap:     p.stateDependentVerifyGasCap,
 		cacheValidationPrecompiles:     p.cacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: p.rejectIncompleteValidationMemo,
@@ -916,7 +947,10 @@ func (p *FramePool) prepareResetValidations(validations []resetValidation) {
 }
 
 func validationWorkEqual(left, right validationWorkSummary) bool {
-	if left.StateDependentGasLimit != right.StateDependentGasLimit ||
+	if left.ValidationGasLimit != right.ValidationGasLimit ||
+		left.CachedPrecompileGas != right.CachedPrecompileGas ||
+		left.RevalidationGasLimit != right.RevalidationGasLimit ||
+		left.StateDependentGasLimit != right.StateDependentGasLimit ||
 		left.FirstMutableFrames != right.FirstMutableFrames ||
 		left.ConservativeFrames != right.ConservativeFrames ||
 		left.DeployValidationGas != right.DeployValidationGas ||
@@ -936,7 +970,10 @@ func validationWorkEqual(left, right validationWorkSummary) bool {
 // because an earlier mutable frame can influence FRAMEPARAM values and the
 // shared access journal.
 func validationWorkInvariantEqual(left, right validationWorkSummary) bool {
-	if left.StateDependentGasLimit != right.StateDependentGasLimit {
+	if left.ValidationGasLimit != right.ValidationGasLimit ||
+		left.CachedPrecompileGas != right.CachedPrecompileGas ||
+		left.RevalidationGasLimit != right.RevalidationGasLimit ||
+		left.StateDependentGasLimit != right.StateDependentGasLimit {
 		return false
 	}
 	leftIndex, leftProfile, leftOK := firstMutableWorkProfile(left)
@@ -1606,6 +1643,7 @@ func (p *FramePool) validationViewWithStateLocked(statedb *state.StateDB) *Frame
 		slotProvider:                   p.slotProvider,
 		verifyGasCap:                   p.verifyGasCap,
 		stateDependentVerifyGasCap:     p.stateDependentVerifyGasCap,
+		revalidationGasCap:             p.revalidationGasCap,
 		cacheValidationPrecompiles:     p.cacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: p.rejectIncompleteValidationMemo,
 		validationMemoLimits:           p.validationMemoLimits,
@@ -1823,6 +1861,9 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *
 		if expiryErr != nil {
 			return frameTxMeta{}, expiryResult, expiryErr
 		}
+		if workErr := mergeWork(expiryResult); workErr != nil {
+			return frameTxMeta{}, expiryResult, workErr
+		}
 		recordSuccessfulValidationFrame(frameCtx, expiryResult)
 	}
 
@@ -1968,6 +2009,16 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *
 func (p *FramePool) finalizeValidationArtifacts(meta *frameTxMeta, work validationWorkSummary, artifacts validationArtifacts) error {
 	meta.validationWork = work
 	meta.validationMemo = artifacts.precompileMemo
+	revalidationGasHistogram.Update(int64(work.RevalidationGasLimit))
+	validationCreditGasHistogram.Update(int64(work.CachedPrecompileGas))
+	revalidationCap := p.revalidationGasCap
+	if revalidationCap == 0 {
+		revalidationCap = PublicMaxRevalidationGas
+	}
+	if work.RevalidationGasLimit > revalidationCap {
+		revalidationRejectMeter.Mark(1)
+		return fmt.Errorf("%w: revalidation gas G-c %d exceeds cap %d", core.ErrFrameTxInvalid, work.RevalidationGasLimit, revalidationCap)
+	}
 	stateDependentGasMeter.Mark(int64(work.StateDependentGasLimit))
 	stateDependentGasHistogram.Update(int64(work.StateDependentGasLimit))
 	for _, profile := range work.FrameProfiles {

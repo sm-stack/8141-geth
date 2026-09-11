@@ -53,6 +53,10 @@ const (
 	// string and slice headers, fork/precompile discriminator, and allocator
 	// bookkeeping retained by one transaction-local memo entry.
 	validationMemoEntryOverhead uint64 = 128
+
+	// Bound validation memo lookup/allocation independently of the shared cache.
+	maxValidationMemoInput = 1024
+	minValidationMemoGas   = 2000
 )
 
 // ValidationPrecompileMemoLimits bounds one transaction's validation memo.
@@ -106,7 +110,8 @@ type PrecompileCache struct {
 
 	// validationMutable is local to a validation frame view. The memo storage
 	// and counters remain shared by every frame belonging to the transaction.
-	validationMutable atomic.Bool
+	validationMutable     atomic.Bool
+	validationReusableGas atomic.Uint64
 }
 
 type validationPrecompileMemo struct {
@@ -296,14 +301,14 @@ func (c *PrecompileCache) store(scope precompileCacheScope, key []byte, output [
 
 // storeResult retains a validation result. Deterministic failures are scoped
 // by the same fork, address, and exact normalized input as successful outputs.
-func (c *PrecompileCache) storeResult(scope precompileCacheScope, key []byte, output []byte, err error) {
+func (c *PrecompileCache) storeResult(scope precompileCacheScope, key []byte, output []byte, err error) bool {
 	if c.validation != nil {
-		c.validationStoreResult(scope, key, output, err)
-		return
+		return c.validationStoreResult(scope, key, output, err)
 	}
 	if err == nil {
 		c.store(scope, key, output)
 	}
+	return false
 }
 
 func (c *PrecompileCache) validationLoadResult(scope precompileCacheScope, key []byte) ([]byte, error, bool) {
@@ -330,38 +335,38 @@ func (c *PrecompileCache) validationLoadResult(scope precompileCacheScope, key [
 	return nil, nil, false
 }
 
-func (c *PrecompileCache) validationStoreResult(scope precompileCacheScope, key []byte, output []byte, err error) {
+func (c *PrecompileCache) validationStoreResult(scope precompileCacheScope, key []byte, output []byte, err error) bool {
 	memo := c.validation
 	memo.mu.Lock()
 	defer memo.mu.Unlock()
 	keyString := string(key)
 	if scoped := memo.entries[scope]; scoped != nil {
 		if _, exists := scoped[keyString]; exists {
-			return
+			return true
 		}
 	}
 	entryBytes := validationMemoEntryOverhead + common.AddressLength
 	if ^uint64(0)-entryBytes < uint64(len(key)) {
 		c.memoSaturatedLocked(memo)
-		return
+		return false
 	}
 	entryBytes += uint64(len(key))
 	if ^uint64(0)-entryBytes < uint64(len(output)) {
 		c.memoSaturatedLocked(memo)
-		return
+		return false
 	}
 	entryBytes += uint64(len(output))
 	if err != nil {
 		errBytes := uint64(len(err.Error()))
 		if ^uint64(0)-entryBytes < errBytes {
 			c.memoSaturatedLocked(memo)
-			return
+			return false
 		}
 		entryBytes += errBytes
 	}
 	if memo.limits.MaxEntries <= 0 || memo.stats.Entries >= uint64(memo.limits.MaxEntries) || memo.stats.AccountedBytes > memo.limits.MaxBytes || entryBytes > memo.limits.MaxBytes-memo.stats.AccountedBytes {
 		c.memoSaturatedLocked(memo)
-		return
+		return false
 	}
 	scoped := memo.entries[scope]
 	if scoped == nil {
@@ -372,6 +377,51 @@ func (c *PrecompileCache) validationStoreResult(scope precompileCacheScope, key 
 	memo.stats.Stores++
 	memo.stats.Entries++
 	memo.stats.AccountedBytes += entryBytes
+	return true
+}
+
+// ReusableValidationGas is per execution/frame, unlike the cumulative hit metrics.
+// Each retained invocation earns credit, including repeated uses of one entry.
+func (c *PrecompileCache) ReusableValidationGas() uint64 {
+	if c == nil || c.validation == nil {
+		return 0
+	}
+	return c.validationReusableGas.Load()
+}
+
+func (c *PrecompileCache) recordReusableValidationGas(gas uint64) {
+	if c.validation == nil || c.validationMutable.Load() {
+		return
+	}
+	for {
+		previous := c.validationReusableGas.Load()
+		next := previous + gas
+		if next < previous {
+			next = ^uint64(0)
+		}
+		if c.validationReusableGas.CompareAndSwap(previous, next) {
+			return
+		}
+	}
+}
+
+// Validation memo policy is deliberately narrower than the block-processing
+// cache. Reject oversized/cheap calls before normalization or key allocation.
+func (c *PrecompileCache) invocationKey(p PrecompiledContract, input []byte, gas uint64) ([]byte, bool) {
+	if c.validation != nil {
+		if len(input) > maxValidationMemoInput || gas < minValidationMemoGas {
+			return nil, false
+		}
+		switch p.(type) {
+		case *ecrecover, *bigModExp, *bn256ScalarMulIstanbul, *bn256ScalarMulByzantium,
+			*bn256PairingIstanbul, *bn256PairingByzantium, *kzgPointEvaluation, *p256Verify,
+			*bls12381G1Add, *bls12381G1MultiExp, *bls12381G2Add, *bls12381G2MultiExp,
+			*bls12381Pairing, *bls12381MapG1, *bls12381MapG2:
+		default:
+			return nil, false
+		}
+	}
+	return precompileCacheKey(p, input)
 }
 
 func (c *PrecompileCache) memoSaturatedLocked(memo *validationPrecompileMemo) {

@@ -20,7 +20,7 @@ import (
 	"github.com/holiman/uint256"
 )
 
-const payerCodeToggleSenderGas = PublicMaxVerifyGas - params.SigGasArbitrary - params.SigGasSecp256k1 - massInvalidationPayerGas
+const payerCodeToggleSenderGas = PublicMaxRevalidationGas - params.SigGasArbitrary - params.SigGasSecp256k1 - massInvalidationPayerGas
 
 type payerCodeToggleFixture struct {
 	pool     *FramePool

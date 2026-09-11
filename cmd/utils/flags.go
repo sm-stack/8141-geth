@@ -484,6 +484,12 @@ var (
 		Value:    ethconfig.Defaults.FramePool.MaxVerifyGas,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolMaxRevalidationGasFlag = &cli.Uint64Flag{
+		Name:     "framepool.maxrevalidationgas",
+		Usage:    "Maximum declared frame validation gas minus retained pre-watershed precompile gas (G-c)",
+		Value:    ethconfig.Defaults.FramePool.MaxRevalidationGas,
+		Category: flags.TxPoolCategory,
+	}
 	FramePoolMaxStateDependentVerifyGasFlag = &cli.Uint64Flag{
 		Name:     "framepool.maxstatedependentverifygas",
 		Usage:    "Maximum frame validation gas remaining after the first mutable read (0 = maxverifygas)",
@@ -492,7 +498,7 @@ var (
 	}
 	FramePoolCacheValidationPrecompilesFlag = &cli.BoolFlag{
 		Name:     "framepool.cachevalidationprecompiles",
-		Usage:    "Cache pure precompile outputs per frame transaction for reset revalidation (research A/B)",
+		Usage:    "Cache eligible precompile results per frame transaction for reset revalidation",
 		Value:    ethconfig.Defaults.FramePool.CacheValidationPrecompiles,
 		Category: flags.TxPoolCategory,
 	}
@@ -1848,6 +1854,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(FramePoolMaxStateDependentVerifyGasFlag.Name) {
 		cfg.FramePool.MaxStateDependentVerifyGas = ctx.Uint64(FramePoolMaxStateDependentVerifyGasFlag.Name)
 	}
+	if ctx.IsSet(FramePoolMaxRevalidationGasFlag.Name) {
+		cfg.FramePool.MaxRevalidationGas = ctx.Uint64(FramePoolMaxRevalidationGasFlag.Name)
+	}
 	if ctx.IsSet(FramePoolCacheValidationPrecompilesFlag.Name) {
 		cfg.FramePool.CacheValidationPrecompiles = ctx.Bool(FramePoolCacheValidationPrecompilesFlag.Name)
 	}
@@ -1869,6 +1878,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(FramePoolMaxStateDependentVerifyGasFlag.Name) && cfg.FramePool.MaxStateDependentVerifyGas > cfg.FramePool.MaxVerifyGas {
 		Fatalf("--%s must not exceed --%s", FramePoolMaxStateDependentVerifyGasFlag.Name, FramePoolMaxVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolMaxRevalidationGasFlag.Name) && cfg.FramePool.MaxRevalidationGas > cfg.FramePool.MaxVerifyGas {
+		Fatalf("--%s must not exceed --%s", FramePoolMaxRevalidationGasFlag.Name, FramePoolMaxVerifyGasFlag.Name)
 	}
 	if ctx.IsSet(FramePoolMaxPendingPerSenderFlag.Name) {
 		value := ctx.Int(FramePoolMaxPendingPerSenderFlag.Name)

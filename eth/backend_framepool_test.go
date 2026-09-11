@@ -32,6 +32,7 @@ func TestValidateFramePoolNetworkPolicy(t *testing.T) {
 	}
 	for _, mutate := range []func(*framepool.Config){
 		func(config *framepool.Config) { config.MaxVerifyGas++ },
+		func(config *framepool.Config) { config.MaxRevalidationGas++ },
 		func(config *framepool.Config) { config.MaxPendingPerSender++ },
 		func(config *framepool.Config) { config.MaxPendingPerNonCanonicalPaymaster++ },
 	} {

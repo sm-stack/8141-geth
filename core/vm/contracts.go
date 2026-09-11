@@ -287,16 +287,19 @@ func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address comm
 	// Gas accounting and state touching above are identical on hit and miss,
 	// only the recomputation is skipped.
 	if cache != nil {
-		if key, ok := precompileCacheKey(p, input); ok {
+		if key, ok := cache.invocationKey(p, input, gasCost); ok {
 			scope := precompileCacheScope{activePrecompiledContracts(rules), address}
 			if output, cachedErr, ok := cache.loadResult(scope, key); ok {
 				cache.recordCachedGas(gasCost)
+				cache.recordReusableValidationGas(gasCost)
 				return output, gas, cachedErr
 			}
 			cache.recordActualRun()
 			output, err := p.Run(input)
 			if len(output) <= maxCacheablePrecompileOutput && (err == nil || cache.validation != nil) {
-				cache.storeResult(scope, key, output, err)
+				if cache.storeResult(scope, key, output, err) {
+					cache.recordReusableValidationGas(gasCost)
+				}
 			} else {
 				cache.recordUncacheable()
 			}
