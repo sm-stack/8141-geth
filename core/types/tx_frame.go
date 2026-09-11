@@ -355,6 +355,15 @@ func (tx *FrameTx) encode(b *bytes.Buffer) error {
 	}
 }
 
+// EncodeRLP encodes the canonical transaction payload layout. Reflection-based
+// hashing (Transaction.Hash, sigHash) must produce the same bytes as the typed
+// envelope written by MarshalBinary; without this, the fee fields would be
+// encoded flat instead of as the nested [tip, fee, blob_fee] list and the
+// transaction hash would not match the hash of its wire encoding.
+func (tx *FrameTx) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, tx.rlpPayload())
+}
+
 func (tx *FrameTx) rlpPayload() *frameTxRLP {
 	return &frameTxRLP{
 		ChainID: tx.ChainID, NonceKeys: tx.NonceKeys, NonceSeq: tx.NonceSeq, Sender: tx.Sender,
