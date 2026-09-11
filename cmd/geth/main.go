@@ -76,6 +76,7 @@ var (
 		utils.FramePoolMaxVerifyGasFlag,
 		utils.FramePoolMaxRevalidationGasFlag,
 		utils.FramePoolMaxStateDependentVerifyGasFlag,
+		utils.FramePoolMaxVerifyStateGasFlag,
 		utils.FramePoolCacheValidationPrecompilesFlag,
 		utils.FramePoolRejectIncompleteValidationMemoFlag,
 		utils.FramePoolValidationMemoMaxEntriesFlag,

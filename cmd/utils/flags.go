@@ -496,6 +496,12 @@ var (
 		Value:    ethconfig.Defaults.FramePool.MaxStateDependentVerifyGas,
 		Category: flags.TxPoolCategory,
 	}
+	FramePoolMaxVerifyStateGasFlag = &cli.Uint64Flag{
+		Name:     "framepool.maxverifystategas",
+		Usage:    "Maximum declared validation-prefix state gas (EIP-8037) admitted to the public frame pool",
+		Value:    ethconfig.Defaults.FramePool.MaxVerifyStateGas,
+		Category: flags.TxPoolCategory,
+	}
 	FramePoolCacheValidationPrecompilesFlag = &cli.BoolFlag{
 		Name:     "framepool.cachevalidationprecompiles",
 		Usage:    "Cache eligible precompile results per frame transaction for reset revalidation",
@@ -1853,6 +1859,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(FramePoolMaxStateDependentVerifyGasFlag.Name) {
 		cfg.FramePool.MaxStateDependentVerifyGas = ctx.Uint64(FramePoolMaxStateDependentVerifyGasFlag.Name)
+	}
+	if ctx.IsSet(FramePoolMaxVerifyStateGasFlag.Name) {
+		cfg.FramePool.MaxVerifyStateGas = ctx.Uint64(FramePoolMaxVerifyStateGasFlag.Name)
 	}
 	if ctx.IsSet(FramePoolMaxRevalidationGasFlag.Name) {
 		cfg.FramePool.MaxRevalidationGas = ctx.Uint64(FramePoolMaxRevalidationGasFlag.Name)

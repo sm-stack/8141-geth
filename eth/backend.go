@@ -206,6 +206,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		"maxVerifyGas", config.FramePool.MaxVerifyGas,
 		"maxRevalidationGas", config.FramePool.MaxRevalidationGas,
 		"maxStateDependentVerifyGas", config.FramePool.MaxStateDependentVerifyGas,
+		"maxVerifyStateGas", config.FramePool.MaxVerifyStateGas,
 		"cacheValidationPrecompiles", config.FramePool.CacheValidationPrecompiles,
 		"rejectIncompleteValidationMemo", config.FramePool.RejectIncompleteValidationMemo,
 		"validationMemoMaxEntries", config.FramePool.ValidationMemoMaxEntries,
@@ -443,6 +444,9 @@ func raisedFramePoolPolicy(config framepool.Config) []string {
 	}
 	if config.MaxRevalidationGas > framepool.PublicMaxRevalidationGas {
 		raised = append(raised, fmt.Sprintf("G-c=%d", config.MaxRevalidationGas))
+	}
+	if config.MaxVerifyStateGas > params.FrameTxMaxVerifyStateGas {
+		raised = append(raised, fmt.Sprintf("Gs=%d", config.MaxVerifyStateGas))
 	}
 	if config.MaxPendingPerSender > framepool.PublicMaxPendingPerSender {
 		raised = append(raised, fmt.Sprintf("S=%d", config.MaxPendingPerSender))

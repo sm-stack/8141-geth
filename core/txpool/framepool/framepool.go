@@ -91,6 +91,7 @@ type Config struct {
 	MaxVerifyGas                       uint64
 	MaxRevalidationGas                 uint64
 	MaxStateDependentVerifyGas         uint64
+	MaxVerifyStateGas                  uint64
 	CacheValidationPrecompiles         bool
 	RejectIncompleteValidationMemo     bool
 	ValidationMemoMaxEntries           int
@@ -111,6 +112,7 @@ var DefaultConfig = Config{
 	MaxVerifyGas:                       maxVerifyGas,
 	MaxRevalidationGas:                 PublicMaxRevalidationGas,
 	MaxStateDependentVerifyGas:         maxVerifyGas,
+	MaxVerifyStateGas:                  params.FrameTxMaxVerifyStateGas,
 	CacheValidationPrecompiles:         true,
 	RejectIncompleteValidationMemo:     false,
 	ValidationMemoMaxEntries:           defaultValidationMemoMaxEntries,
@@ -140,6 +142,9 @@ func (config Config) Sanitized() Config {
 	}
 	if config.MaxStateDependentVerifyGas > config.MaxVerifyGas {
 		config.MaxStateDependentVerifyGas = config.MaxVerifyGas
+	}
+	if config.MaxVerifyStateGas == 0 {
+		config.MaxVerifyStateGas = params.FrameTxMaxVerifyStateGas
 	}
 	if config.RejectIncompleteValidationMemo {
 		config.CacheValidationPrecompiles = true
@@ -205,6 +210,7 @@ type FramePool struct {
 	verifyGasCap                   uint64
 	revalidationGasCap             uint64
 	stateDependentVerifyGasCap     uint64
+	verifyStateGasCap              uint64
 	cacheValidationPrecompiles     bool
 	rejectIncompleteValidationMemo bool
 	validationMemoLimits           vm.ValidationPrecompileMemoLimits
@@ -467,6 +473,7 @@ func NewWithConfig(config Config, chain BlockChain) *FramePool {
 		verifyGasCap:                   config.MaxVerifyGas,
 		revalidationGasCap:             config.MaxRevalidationGas,
 		stateDependentVerifyGasCap:     config.MaxStateDependentVerifyGas,
+		verifyStateGasCap:              config.MaxVerifyStateGas,
 		cacheValidationPrecompiles:     config.CacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: config.RejectIncompleteValidationMemo,
 		validationMemoLimits: vm.ValidationPrecompileMemoLimits{
@@ -623,6 +630,7 @@ func (p *FramePool) Reset(oldHead, newHead *types.Header) {
 		verifyGasCap:                   p.verifyGasCap,
 		revalidationGasCap:             p.revalidationGasCap,
 		stateDependentVerifyGasCap:     p.stateDependentVerifyGasCap,
+		verifyStateGasCap:              p.verifyStateGasCap,
 		cacheValidationPrecompiles:     p.cacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: p.rejectIncompleteValidationMemo,
 		validationMemoLimits:           p.validationMemoLimits,
@@ -1397,7 +1405,7 @@ func (p *FramePool) checkAdmissionCheap(tx *types.Transaction, meterPreflight bo
 	if err != nil {
 		return check, err
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap, p.verifyStateGasCap); err != nil {
 		return check, err
 	}
 	if p.all[tx.Hash()] != nil {
@@ -1643,6 +1651,7 @@ func (p *FramePool) validationViewWithStateLocked(statedb *state.StateDB) *Frame
 		slotProvider:                   p.slotProvider,
 		verifyGasCap:                   p.verifyGasCap,
 		stateDependentVerifyGasCap:     p.stateDependentVerifyGasCap,
+		verifyStateGasCap:              p.verifyStateGasCap,
 		revalidationGasCap:             p.revalidationGasCap,
 		cacheValidationPrecompiles:     p.cacheValidationPrecompiles,
 		rejectIncompleteValidationMemo: p.rejectIncompleteValidationMemo,
@@ -1819,7 +1828,7 @@ func (p *FramePool) simulateVerifyFramesWithSignatureGasOutcomeAndArtifacts(tx *
 	if err != nil {
 		return frameTxMeta{}, verifyResult{}, err
 	}
-	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap); err != nil {
+	if err := validatePrefixGasBudget(frameTx, plan, signatureGas, true, p.verifyGasCap, p.verifyStateGasCap); err != nil {
 		return frameTxMeta{}, verifyResult{}, err
 	}
 	// Validation views are caller-owned. Reuse their StateDB read caches across
@@ -2198,7 +2207,10 @@ func validateExpiryVerifierFrame(statedb *state.StateDB, index int, frame types.
 	return nil
 }
 
-func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, signatureGas uint64, includePay bool, gasCap uint64) error {
+func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, signatureGas uint64, includePay bool, gasCap, stateGasCap uint64) error {
+	if stateGasCap == 0 {
+		stateGasCap = params.FrameTxMaxVerifyStateGas
+	}
 	total := signatureGas
 	var stateTotal uint64
 	indices := []int{plan.expiryIndex, plan.deployIndex, plan.senderVerifyIndex}
@@ -2219,8 +2231,8 @@ func validatePrefixGasBudget(frameTx *types.FrameTx, plan validationPrefixPlan, 
 			return fmt.Errorf("validation prefix gas %d exceeds cap %d", total, gasCap)
 		}
 		stateTotal, overflow = commonmath.SafeAdd(stateTotal, frame.StateGasLimit)
-		if overflow || stateTotal > params.FrameTxMaxVerifyStateGas {
-			return fmt.Errorf("validation prefix state gas %d exceeds cap %d", stateTotal, params.FrameTxMaxVerifyStateGas)
+		if overflow || stateTotal > stateGasCap {
+			return fmt.Errorf("validation prefix state gas %d exceeds cap %d", stateTotal, stateGasCap)
 		}
 	}
 	return nil
